@@ -127,11 +127,22 @@ pub(super) fn end_drag_label(hwnd: HWND) {
 
 /// A press on a row's body or an Open Editors row arms a drag of `source` (tree drag spec §3.1,
 /// open editors spec §4.3), unless an inline edit is still open.
-pub(super) fn arm_drag(hwnd: HWND, source: DragSource, x: i32, y: i32) {
+/// `notebook` is the dragged row's notebook; `None` (a tab) drops into the default notebook.
+pub(super) fn arm_drag(
+    hwnd: HWND,
+    notebook: Option<NotebookId>,
+    source: DragSource,
+    x: i32,
+    y: i32,
+) {
     if crate::window::inline_name::is_open(hwnd) {
         return;
     }
-    with_view(hwnd, |view| view.drag = Drag::armed(source, x, y));
+    let default = crate::window::library_host::default_notebook(hwnd);
+    with_view(hwnd, |view| {
+        view.drag = Drag::armed(source, x, y);
+        view.drag_notebook = notebook.or(default);
+    });
 }
 
 /// `WM_MOUSEMOVE` with a drag armed or under way (tree drag spec §3.1, §3.2). False leaves the
@@ -251,9 +262,15 @@ pub(super) fn open_drop_at(
 /// Opens the tree note `relative` in the group `action` names, splitting a new one for an edge.
 /// The press that began the drag already opened the note as a preview in the active group: that
 /// tab moves with the drop instead of leaving a second view behind.
-fn open_note_in_group(hwnd: HWND, relative: &Path, action: crate::window::group_drop::Action) {
+fn open_note_in_group(
+    hwnd: HWND,
+    notebook: Option<NotebookId>,
+    relative: &Path,
+    action: crate::window::group_drop::Action,
+) {
     use crate::window::group_drop::Action;
-    let Some(root) = crate::window::library_host::folder(hwnd) else {
+    let Some(root) = notebook.and_then(|id| crate::window::library_host::notebook_folder(hwnd, id))
+    else {
         return;
     };
     let path = root.join(relative);
@@ -293,12 +310,12 @@ fn open_note_in_group(hwnd: HWND, relative: &Path, action: crate::window::group_
 }
 
 pub(super) fn drag_release(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) -> bool {
-    let Some((drag, panel)) = with_view(hwnd, |view| {
+    let Some((drag, panel, notebook)) = with_view(hwnd, |view| {
         if view.drag.as_ref().is_some_and(|drag| drag.started) {
             view.drag_to(x, y, Instant::now());
             view.invalidate();
         }
-        (view.drag.take(), view.panel)
+        (view.drag.take(), view.panel, view.drag_notebook)
     }) else {
         return false;
     };
@@ -322,17 +339,24 @@ pub(super) fn drag_release(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) -> bool 
         crate::window::tab_drag::apply(hwnd, from, action);
     }
     if let (Some(action), DragSource::Row(RowKind::Note(relative))) = (open_drop, &drag.source) {
-        open_note_in_group(hwnd, relative, action);
+        open_note_in_group(hwnd, notebook, relative, action);
     }
     if let Some(folder) = drag.target {
         match &drag.source {
-            DragSource::Row(kind) => crate::window::tree_move::drop_into(hwnd, kind, &folder),
+            DragSource::Row(kind) => {
+                if let Some(id) = notebook {
+                    crate::window::tree_move::drop_into_of(hwnd, id, kind, &folder);
+                }
+            }
             DragSource::Tab {
                 id,
                 path: Some(path),
                 ..
             } => {
-                crate::window::copy_host::copy_tab_into(hwnd, *id, path, &folder);
+                // The notebook the drop landed in.
+                if let Some(dest) = notebook {
+                    crate::window::copy_host::copy_tab_into_of(hwnd, dest, *id, path, &folder);
+                }
             }
             DragSource::Tab { path: None, .. } | DragSource::GroupTab { .. } => {}
             DragSource::Files(_) => {}
@@ -410,7 +434,10 @@ pub(crate) fn drag_tick(hwnd: HWND, now: Instant) {
         let drag = view.drag.as_ref().filter(|drag| drag.started)?;
         let pointer = drag.pointer;
         let external = is_external(&drag.source);
-        let expand = tree_drag::expand_due(drag.resting.as_ref(), now);
+        // The resting folder is the drag's own notebook's.
+        let expand = tree_drag::expand_due(drag.resting.as_ref(), now)
+            .zip(view.drag_notebook)
+            .map(|(folder, id)| (id, folder));
         let list = view.list_rect(view.client());
         let lines = tree_drag::scroll_step(pointer.1, list.top, list.bottom, view.list.row_height);
         let scrolled = lines != 0 && view.list.scroll_lines(lines, height(list));
@@ -422,13 +449,13 @@ pub(crate) fn drag_tick(hwnd: HWND, now: Instant) {
     .flatten() else {
         return;
     };
-    if let Some(folder) = &expand {
+    if let Some((id, folder)) = &expand {
         with_view(hwnd, |view| {
             if let Some(drag) = view.drag.as_mut() {
                 drag.resting = None;
             }
         });
-        set_folder_expanded(hwnd, folder, true);
+        set_folder_expanded(hwnd, *id, folder, true);
     }
     if scrolled || expand.is_some() {
         let accepted =
@@ -455,12 +482,14 @@ pub(crate) fn external_over(hwnd: HWND, x: i32, y: i32, paths: &[PathBuf]) -> bo
         external_leave(hwnd);
         return true;
     }
+    let default = crate::window::library_host::default_notebook(hwnd);
     let started = with_view(hwnd, |view| {
         if !view
             .drag
             .as_ref()
             .is_some_and(|drag| is_external(&drag.source))
         {
+            view.drag_notebook = default;
             view.drag = Drag::armed(DragSource::Files(paths.to_vec()), x, y).map(|mut drag| {
                 drag.started = true;
                 drag
@@ -504,23 +533,25 @@ pub(crate) fn external_drop(hwnd: HWND, x: i32, y: i32, paths: Vec<PathBuf>) -> 
         return false;
     }
     let opens = with_view(hwnd, |view| view.opens_at(x, y)).unwrap_or(false);
-    let folder = if opens {
+    // The folder, in the notebook under the pointer, the files go into.
+    let place = if opens {
         None
     } else {
         with_view(hwnd, |view| view.drag_to(x, y, Instant::now()))
             .filter(|&accepted| accepted)
             .and_then(|_| {
                 with_view(hwnd, |view| {
-                    view.drag.as_ref().and_then(|drag| drag.target.clone())
+                    let folder = view.drag.as_ref().and_then(|drag| drag.target.clone())?;
+                    Some((view.drag_notebook?, folder))
                 })
                 .flatten()
             })
     };
     external_leave(hwnd);
-    if !opens && folder.is_none() {
+    if !opens && place.is_none() {
         return false;
     }
-    crate::window::copy_host::post_panel_drop(hwnd, paths, folder)
+    crate::window::copy_host::post_panel_drop(hwnd, paths, place)
 }
 
 /// Screen point `point` in the panel's client coordinates, when it is over the panel.
@@ -556,6 +587,7 @@ pub(crate) fn strip_tab_over(hwnd: HWND, point: POINT, id: DocumentId, path: &Pa
         strip_tab_leave(hwnd);
         return false;
     }
+    let default = crate::window::library_host::default_notebook(hwnd);
     let started = with_view(hwnd, |view| {
         if !view
             .drag
@@ -566,6 +598,7 @@ pub(crate) fn strip_tab_over(hwnd: HWND, point: POINT, id: DocumentId, path: &Pa
                 id,
                 path: path.to_path_buf(),
             };
+            view.drag_notebook = default;
             view.drag = Drag::armed(source, x, y).map(|mut drag| {
                 drag.started = true;
                 drag
@@ -600,7 +633,8 @@ pub(crate) fn strip_tab_leave(hwnd: HWND) {
     }
 }
 
-/// A strip tab dropped at screen point `point`: the folder under it that takes its file, if any.
+/// A strip tab dropped at screen point `point`: the folder under it, and its notebook, that takes
+/// its file, if any.
 /// The tree's band goes either way; the caller ends its drag before it copies, so a "Replace?"
 /// question never opens under the drag.
 pub(crate) fn strip_tab_drop_folder(
@@ -608,16 +642,17 @@ pub(crate) fn strip_tab_drop_folder(
     point: POINT,
     id: DocumentId,
     path: &Path,
-) -> Option<PathBuf> {
+) -> Option<(NotebookId, PathBuf)> {
     let accepted = strip_tab_over(hwnd, point, id, path);
-    let folder = accepted
+    let place = accepted
         .then(|| {
             with_view(hwnd, |view| {
-                view.drag.as_ref().and_then(|drag| drag.target.clone())
+                let folder = view.drag.as_ref().and_then(|drag| drag.target.clone())?;
+                Some((view.drag_notebook?, folder))
             })
         })
         .flatten()
         .flatten();
     strip_tab_leave(hwnd);
-    folder
+    place
 }

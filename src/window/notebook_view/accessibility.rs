@@ -1,8 +1,7 @@
 //! What the MSAA provider reads of the Notebook view: the flat accessible index over push
-//! buttons, the Open Editors section, the root row and the tree or RECENT rows.
+//! buttons, the Open Editors section and the tree (root rows among its rows) or RECENT rows.
 
 use super::*;
-use crate::library::tree::TreeRow;
 use crate::window::notebook_layout;
 use crate::window::panel_cursor::Cursor;
 use crate::window::row_list::RowListState;
@@ -10,7 +9,7 @@ use windows_sys::Win32::Foundation::{POINT, RECT};
 
 /// What the MSAA provider reads of the view.
 impl NotebookView {
-    pub(crate) fn rows(&self) -> &[TreeRow] {
+    pub(crate) fn rows(&self) -> &[ViewRow] {
         &self.rows
     }
 
@@ -19,16 +18,15 @@ impl NotebookView {
         self.rows.len() - usize::from(self.inline.draft_at().is_some())
     }
 
-    /// The children after the push buttons, in order: the Open Editors header, its rows, the
-    /// root row, then the RECENT notebooks or the tree rows.
-    pub(super) fn accessible_parts(&self) -> (usize, usize, usize) {
+    /// The children after the push buttons, in order: the Open Editors header and its rows, then
+    /// the RECENT notebooks or the tree rows, root rows among them.
+    pub(super) fn accessible_parts(&self) -> (usize, usize) {
         let editors = if self.editors_expanded {
             self.editors.rows.len()
         } else {
             0
         };
-        let root = usize::from(self.mode != Mode::NoNotebook);
-        (1, editors, root)
+        (1, editors)
     }
 
     /// The tree rows screen readers see: `accessible_rows`, while the tree shows.
@@ -65,48 +63,42 @@ impl NotebookView {
         &mut self.list
     }
 
-    /// Every push button painted, in paint order, with its accessible name: the header's star,
-    /// New note and "…" (not in the no-notebook state), then the state's own button.
-    /// The folders toggle's name, which follows what a press would do.
-    pub(super) fn toggle_folders_name(&self) -> &'static str {
-        if self.folders_open {
-            "Collapse all"
-        } else {
-            "Expand all"
-        }
-    }
-
+    /// Every push button painted, in paint order, with its accessible name: the buttons of each
+    /// root row that shows them (hovered or selected, multi-root notebooks spec §4.2), or the
+    /// no-notebook state's own buttons.
     pub(crate) fn buttons(&self, client: RECT, dpi: u32) -> Vec<(String, RECT)> {
         let mut buttons = Vec::new();
-        if self.mode != Mode::NoNotebook {
-            let root = self.layout(client, dpi).root;
-            for (button, rect) in notebook_layout::root_parts(root, dpi).shown() {
-                let name = match button {
-                    HeaderButton::Favorite if self.favorite => "Remove from favorites",
-                    HeaderButton::Favorite => "Add to favorites",
-                    HeaderButton::NewNote => "New note",
-                    HeaderButton::NewFolder => "New folder",
-                    HeaderButton::Refresh => "Refresh",
-                    HeaderButton::ToggleFolders => self.toggle_folders_name(),
-                    HeaderButton::More => "More actions",
-                };
-                buttons.push((name.to_owned(), rect));
-            }
-        }
-        let state = state_layout(self.layout(client, dpi).body, dpi);
         match self.mode {
-            // The states under a collapsed root are not painted.
-            Mode::Empty | Mode::Failed if !self.root_expanded => {}
+            Mode::Tree => {
+                let list = self.list_area(client, dpi);
+                for (index, row) in self.rows.iter().enumerate() {
+                    if row.kind != RowKind::Root || !self.buttons_shown(index) {
+                        continue;
+                    }
+                    let (Some(root), Some(top)) =
+                        (self.root(row.notebook), self.list.row_top(index))
+                    else {
+                        continue;
+                    };
+                    let rect = RECT {
+                        left: list.left,
+                        top: list.top + top,
+                        right: list.right,
+                        bottom: list.top + top + self.list.row_height,
+                    };
+                    if rect.bottom > list.bottom {
+                        continue;
+                    }
+                    for (button, rect) in notebook_layout::root_parts(rect, dpi).shown() {
+                        buttons.push((paint::button_name(button, root).to_owned(), rect));
+                    }
+                }
+            }
             Mode::NoNotebook => {
+                let state = state_layout(self.layout(client, dpi).body, dpi);
                 buttons.push(("Open notebook…".to_owned(), state.button));
                 buttons.push(("New notebook…".to_owned(), state.second));
             }
-            Mode::Empty => buttons.push(("New note".to_owned(), state.button)),
-            Mode::Failed => {
-                buttons.push(("Retry".to_owned(), state.button));
-                buttons.push(("Open notebook…".to_owned(), state.second));
-            }
-            Mode::Loading | Mode::Tree => {}
         }
         buttons
     }
@@ -122,14 +114,13 @@ impl NotebookView {
 }
 
 impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
-    /// Push buttons first, then the Open Editors header and its rows, the notebook's root row,
-    /// then the RECENT notebooks (no-notebook state) or the tree rows, the draft row left out.
+    /// Push buttons first, then the Open Editors header and its rows, then the RECENT notebooks
+    /// (no-notebook state) or the tree rows, root rows among them, the draft row left out.
     fn accessible_count(&self, client: RECT, dpi: u32) -> usize {
-        let (header, editors, root) = self.accessible_parts();
+        let (header, editors) = self.accessible_parts();
         self.buttons(client, dpi).len()
             + header
             + editors
-            + root
             + self.recent.len()
             + self.accessible_tree_rows()
     }
@@ -149,7 +140,7 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
             return Some(button_item(name, false, false, *rect));
         }
         let layout = self.layout(client, dpi);
-        let (header, editors, root) = self.accessible_parts();
+        let (header, editors) = self.accessible_parts();
         let index = index - buttons.len();
         if index < header {
             return Some(section_item(
@@ -192,16 +183,6 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
             ));
         }
         let index = index - editors;
-        if index < root {
-            return Some(section_item(
-                &self.name,
-                self.root_expanded,
-                self.cursor == Cursor::Root,
-                focused,
-                layout.root,
-            ));
-        }
-        let index = index - root;
         // The list's selection has the focus only while the keyboard selection is in it.
         let focused = focused && self.cursor == Cursor::Tree;
         if index < self.recent.len() {
@@ -222,13 +203,28 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
         let index = self.row_of_accessible(index);
         let row = self.rows().get(index)?;
         let (rect, visible) = row_rect(self.list_area(client, dpi), self.list(), index);
-        Some(tree_item(
+        // A placeholder is a plain text item (multi-root notebooks spec §4.4).
+        if matches!(row.kind, RowKind::Placeholder(_)) {
+            return Some(crate::window::sidebar_accessibility::text_item(
+                &row.name, rect,
+            ));
+        }
+        let mut item = tree_item(
             row,
             self.list().selected == Some(index),
             focused,
             rect,
             visible,
-        ))
+        );
+        // The default root is named so, as the marker after its name says it by sight.
+        if row.kind == RowKind::Root
+            && self
+                .root(row.notebook)
+                .is_some_and(|root| root.label.marker.is_some())
+        {
+            item.name.push_str(" (default)");
+        }
+        Some(item)
     }
 
     fn accessible_hit(&self, point: POINT, client: RECT, dpi: u32) -> Option<usize> {
@@ -238,7 +234,7 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
             return Some(index);
         }
         let layout = self.layout(client, dpi);
-        let (header, editors, root) = self.accessible_parts();
+        let (header, editors) = self.accessible_parts();
         let start = buttons.len();
         if inside(&layout.editors_header) {
             return Some(start);
@@ -250,15 +246,12 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
                 .row_at(point.y - layout.editors_list.top)?;
             return (row < editors).then_some(start + header + row);
         }
-        if inside(&layout.root) {
-            return (root == 1).then_some(start + header + editors);
-        }
         let area = self.list_area(client, dpi);
         if !inside(&area) {
             return None;
         }
         let row = self.list().row_at(point.y - area.top)?;
-        let rows = start + header + editors + root;
+        let rows = start + header + editors;
         if self.mode == Mode::NoNotebook {
             (row < self.recent.len()).then_some(rows + row)
         } else {
@@ -271,14 +264,13 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
 
     fn accessible_current(&self, client: RECT, dpi: u32) -> Option<usize> {
         let start = self.buttons(client, dpi).len();
-        let (header, editors, root) = self.accessible_parts();
+        let (header, editors) = self.accessible_parts();
         match self.cursor {
             Cursor::EditorsHeader => return Some(start),
             Cursor::Editor(index) => return (index < editors).then_some(start + header + index),
-            Cursor::Root => return (root == 1).then_some(start + header + editors),
             Cursor::Tree => {}
         }
-        let rows = start + header + editors + root;
+        let rows = start + header + editors;
         let selected = self.list().selected?;
         // In the no-notebook state the list's selection is a RECENT row, not a tree row.
         if self.mode == Mode::NoNotebook {
@@ -292,7 +284,7 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
     }
 
     fn accessible_select(&mut self, index: usize, client: RECT, dpi: u32) {
-        let (header, editors, root) = self.accessible_parts();
+        let (header, editors) = self.accessible_parts();
         let Some(index) = index.checked_sub(self.buttons(client, dpi).len()) else {
             return;
         };
@@ -308,11 +300,6 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
             return;
         }
         let index = index - editors;
-        if index < root {
-            self.cursor = Cursor::Root;
-            return;
-        }
-        let index = index - root;
         let (offset, rows) = if self.mode == Mode::NoNotebook {
             (0, self.recent.len())
         } else {
@@ -333,7 +320,7 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
 
     fn accessible_identity(&self, index: usize, client: RECT, dpi: u32) -> Option<u64> {
         use crate::window::sidebar_accessibility::identity_of;
-        let (header, editors, root) = self.accessible_parts();
+        let (header, editors) = self.accessible_parts();
         let index = index.checked_sub(self.buttons(client, dpi).len())?;
         if index < header {
             return Some(identity_of(&"open-editors"));
@@ -351,15 +338,11 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
                     identity_of(&"pinned-notes")
                 }
                 crate::window::open_editors::EditorEntry::Pinned(row) => {
-                    identity_of(&("pinned-note", &row.path))
+                    identity_of(&("pinned-note", row.notebook.0, &row.path))
                 }
             });
         }
         let index = index - editors;
-        if index < root {
-            return Some(identity_of(&"notebook-root"));
-        }
-        let index = index - root;
         if let Some(folder) = self.recent.get(index) {
             return Some(identity_of(folder));
         }
@@ -368,7 +351,7 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
             return None;
         }
         let row = self.rows().get(self.row_of_accessible(index))?;
-        Some(identity_of(&row.kind))
+        Some(identity_of(&(row.notebook.0, &row.kind)))
     }
 
     fn accessible_generation(&self) -> u64 {

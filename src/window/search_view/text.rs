@@ -14,6 +14,18 @@ pub(crate) fn placeholder(notebook: Option<&Path>) -> String {
         .unwrap_or_else(|| "Search text".to_owned())
 }
 
+/// The title band's text: "Searching <name>" for the notebook the view searches (multi-root
+/// notebooks spec §5.3), else "Search".
+pub(crate) fn header_text(notebook_name: Option<&str>) -> String {
+    notebook_name.map_or_else(|| TITLE.to_owned(), |name| format!("Searching {name}"))
+}
+
+impl SearchView {
+    pub(crate) fn header(&self) -> String {
+        header_text(self.notebook_name.as_deref())
+    }
+}
+
 /// The search's progress, as the summary and status lines read it.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) enum SearchState {

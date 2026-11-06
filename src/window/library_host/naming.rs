@@ -132,9 +132,20 @@ pub(crate) fn name_box_submit(hwnd: HWND) {
     };
     match purpose {
         NamePurpose::FirstSave(id) => submit_first_save(hwnd, id, &text),
-        NamePurpose::RenameNote(_) if !ready_library(hwnd) => close_name_box(hwnd),
+        NamePurpose::RenameNote(id) if !ready_library_of(hwnd, rename_notebook(hwnd, id)) => {
+            close_name_box(hwnd);
+        }
         NamePurpose::RenameNote(id) => submit_rename(hwnd, id, &text),
     }
+}
+
+/// The notebook a rename of tab `id`'s file is organized in: the one that owns the file, else
+/// the default notebook, as for a file outside every notebook.
+fn rename_notebook(hwnd: HWND, id: crate::document::DocumentId) -> Option<NotebookId> {
+    unsafe { app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.tabs.document(id)?.path.clone())
+        .and_then(|path| notebook_of(hwnd, &path))
+        .or_else(|| default_notebook(hwnd))
 }
 
 pub(super) fn submit_first_save(hwnd: HWND, id: crate::document::DocumentId, text: &str) {
@@ -251,7 +262,11 @@ pub(super) fn submit_rename(hwnd: HWND, id: crate::document::DocumentId, text: &
         name_box_error(hwnd, "Another tab already has that file open.".to_owned());
         return;
     }
-    with_state(hwnd, |state| state.rename_note(&old, &new));
+    // The note keeps its folder, so the notebook that owned it owns it still.
+    let owner = notebook_of(hwnd, &old);
+    if let Some(id) = owner {
+        with_notebook(hwnd, id, |state| state.rename_note(&old, &new));
+    }
     schedule_write(hwnd);
     close_name_box(hwnd);
     crate::window::main_window::invalidate_title_strip(hwnd);
@@ -262,14 +277,15 @@ pub(super) fn submit_rename(hwnd: HWND, id: crate::document::DocumentId, text: &
         PostMessageW(hwnd, crate::window::WM_FASTPAD_APPLY_LANGUAGE, 0, 0);
     }
     // Links that would no longer reach the renamed note (second brain phase 1 spec §7.6).
-    if let Some(root) = folder(hwnd)
+    if let Some(id) = owner
+        && let Some(root) = notebook_folder(hwnd, id)
         && library::is_inside(&root, &new)
     {
         let moved = (
             library::record_path(&root, &old),
             library::record_path(&root, &new),
         );
-        notes_moved(hwnd, &[moved]);
+        notes_moved_of(hwnd, id, &[moved]);
     }
 }
 

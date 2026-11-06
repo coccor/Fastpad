@@ -190,7 +190,7 @@ impl SearchView {
             let title = Self::title_rect(client, dpi);
             draw_text(
                 paint.hdc,
-                TITLE,
+                &self.header(),
                 RECT {
                     left: title.left + scale(TITLE_INSET_AT_96_DPI, dpi),
                     ..title

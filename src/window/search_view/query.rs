@@ -74,13 +74,16 @@ pub(super) fn clear_search(hwnd: HWND) {
     }
 }
 
-/// Part of `side_panel::refresh`. A new notebook cancels the search and clears the query and the
-/// results. The same notebook runs the query again if its notes changed, or, while the view is
-/// hidden, checks once it shows again.
+/// Part of `side_panel::refresh`. The view searches the target notebook (multi-root notebooks
+/// spec §5.3). A new target cancels the search and clears the query and the results. The same
+/// notebook runs the query again if its notes changed, or, while the view is hidden, checks once
+/// it shows again.
 pub(crate) fn library_changed(hwnd: HWND) {
-    let notebook = library_host::folder(hwnd);
-    let loaded = library_host::with_state(hwnd, |_| ()).is_some();
-    let failed = library_host::load_failed(hwnd);
+    let target = shown_target(hwnd);
+    let notebook = target.and_then(|id| library_host::notebook_folder(hwnd, id));
+    let name = target.and_then(|id| library_host::notebook_display_name(hwnd, id));
+    let loaded = target.is_some_and(|id| library_host::with_notebook(hwnd, id, |_| ()).is_some());
+    let failed = target.is_some_and(|id| library_host::load_failed_of(hwnd, id));
     let Some((edit, changed)) = with_view(hwnd, |view| {
         let changed = match (&view.notebook, &notebook) {
             (Some(old), Some(new)) => !same_path(old, new),
@@ -89,6 +92,11 @@ pub(crate) fn library_changed(hwnd: HWND) {
         };
         view.loaded = loaded;
         view.failed = failed;
+        if view.notebook_name != name {
+            // The header names the notebook ("Searching <name>").
+            view.notebook_name = name;
+            invalidate(view.panel);
+        }
         if changed {
             view.notebook = notebook.clone();
             view.placeholder = placeholder(notebook.as_deref());
@@ -117,6 +125,45 @@ pub(crate) fn library_changed(hwnd: HWND) {
     } else {
         with_view(hwnd, |view| view.stale = true);
     }
+}
+
+/// The target notebook may have changed (another tab came to the front, the view showed): the
+/// view catches up only when it now names another notebook, as `library_changed` does.
+pub(crate) fn target_changed(hwnd: HWND) {
+    let notebook = shown_target(hwnd).and_then(|id| library_host::notebook_folder(hwnd, id));
+    let moved = with_view(hwnd, |view| match (&view.notebook, &notebook) {
+        (Some(old), Some(new)) => !same_path(old, new),
+        (None, None) => false,
+        _ => true,
+    })
+    .unwrap_or(false);
+    if moved {
+        library_changed(hwnd);
+    }
+}
+
+/// The notebook the view should show: the target notebook, except while a replace runs, when
+/// the view keeps the notebook it started in (while that is still open) so the replace is not
+/// cancelled by a tab switch; `text_search_host::finish_replace` catches the view up.
+fn shown_target(hwnd: HWND) -> Option<library_host::NotebookId> {
+    // A hidden view keeps its notebook, and its query, while that notebook is open: a refresh
+    // while another view shows (where a stale tree row can move the target) must not clear
+    // it. `shown` catches the view up when it shows again.
+    let hidden =
+        crate::window::side_panel::current_view(hwnd) != crate::config::SidebarView::Search;
+    if (hidden || text_search_host::replacing(hwnd))
+        && let Some(kept) = notebook(hwnd)
+        && let Some(id) = library_host::notebook_of(hwnd, &kept)
+        && library_host::notebook_folder(hwnd, id).is_some_and(|open| same_path(&open, &kept))
+    {
+        return Some(id);
+    }
+    library_host::target_notebook(hwnd)
+}
+
+/// The folder of the notebook the view searches and its results come from.
+pub(crate) fn notebook(hwnd: HWND) -> Option<std::path::PathBuf> {
+    with_view(hwnd, |view| view.notebook.clone()).flatten()
 }
 
 /// The box's text and the options, or `None` before the box exists.

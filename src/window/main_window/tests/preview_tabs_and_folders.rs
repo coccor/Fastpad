@@ -211,7 +211,7 @@ fn a_preview_tab_is_kept_by_the_session_and_comes_back_as_a_normal_tab() {
 }
 
 #[test]
-fn opening_another_folder_flushes_the_old_one_remembers_the_new_one_and_keeps_tabs() {
+fn opening_another_folder_adds_it_and_closing_the_old_one_flushes_it_and_keeps_tabs() {
     let _scintilla = load_native_scintilla();
     let first = LibraryScratch::new("switch-a");
     let second = LibraryScratch::new("switch-b");
@@ -237,6 +237,16 @@ fn opening_another_folder_flushes_the_old_one_remembers_the_new_one_and_keeps_ta
         move |_| Some(folder)
     });
     execute_command(window.hwnd, CommandId::OpenFolder);
+    let first_id = crate::window::library_host::default_notebook(window.hwnd).unwrap();
+    assert_eq!(
+        crate::window::library_host::notebooks(window.hwnd).len(),
+        2,
+        "opening adds a root"
+    );
+    assert!(crate::window::library_host::close_notebook_of(
+        window.hwnd,
+        first_id
+    ));
 
     assert!(
         crate::library::store::library_file(&first.folder()).exists(),
@@ -254,7 +264,9 @@ fn opening_another_folder_flushes_the_old_one_remembers_the_new_one_and_keeps_ta
         1,
         "open tabs stay open"
     );
-    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+    pump_until(window.hwnd, || {
+        app_mut(window.hwnd).library.default_state().is_some()
+    });
 }
 
 #[test]
@@ -274,12 +286,11 @@ fn opening_a_path_that_is_not_a_folder_explains_why() {
 }
 
 #[test]
-fn a_failed_flush_keeps_the_current_folder_open() {
-    // Break caught: switching folders after library.ini could not be written, which drops
+fn a_failed_flush_keeps_the_notebook_being_closed_open() {
+    // Break caught: closing a notebook after library.ini could not be written, which drops
     // the unsaved pins with the old state.
     let _scintilla = load_native_scintilla();
     let first = LibraryScratch::new("flushfail-a");
-    let second = LibraryScratch::new("flushfail-b");
     let a = first.note("a.md", "a");
     let window = ProductionWindow::new(make_app());
     let _editor = install_test_editor(&window);
@@ -298,13 +309,17 @@ fn a_failed_flush_keeps_the_current_folder_open() {
     // A file where the .fastpad directory belongs makes the write fail.
     std::fs::write(first.folder().join(".fastpad"), "not a directory").unwrap();
 
-    crate::window::library_host::open_folder(window.hwnd, &second.folder());
+    let first_id = crate::window::library_host::default_notebook(window.hwnd).unwrap();
+    assert!(!crate::window::library_host::close_notebook_of(
+        window.hwnd,
+        first_id
+    ));
 
     assert_eq!(
         crate::window::library_host::folder(window.hwnd),
         Some(first.folder())
     );
-    assert!(app_mut(window.hwnd).library.state.is_some());
+    assert!(app_mut(window.hwnd).library.default_state().is_some());
     assert!(
         notices(window.hwnd)
             .iter()
@@ -312,9 +327,9 @@ fn a_failed_flush_keeps_the_current_folder_open() {
         "{:?}",
         notices(window.hwnd)
     );
-    let recent =
+    let open =
         crate::library::local::read_folders(&crate::library::local::folders_file(&first.data()));
-    assert!(!recent.folders.contains(&second.folder()));
+    assert!(!open.closed, "the notebook stays recorded as open");
 }
 
 #[test]
@@ -351,7 +366,9 @@ fn a_recent_folder_pick_opens_the_row_that_was_shown() {
     pump_until(window.hwnd, || {
         crate::window::library_host::folder(window.hwnd) == Some(first.folder())
     });
-    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+    pump_until(window.hwnd, || {
+        app_mut(window.hwnd).library.default_state().is_some()
+    });
 }
 
 #[test]
@@ -419,12 +436,13 @@ fn the_library_step_loads_the_remembered_folder_on_a_worker_thread() {
         crate::window::library_host::folder(window.hwnd),
         Some(scratch.folder())
     );
-    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+    pump_until(window.hwnd, || {
+        app_mut(window.hwnd).library.default_state().is_some()
+    });
     assert_eq!(
         app_mut(window.hwnd)
             .library
-            .state
-            .as_ref()
+            .default_state()
             .unwrap()
             .notes
             .len(),
@@ -441,7 +459,7 @@ fn with_notes_mode_off_the_library_step_does_nothing() {
     app_mut(window.hwnd).library.data_dir = Some(scratch.data());
     crate::window::library_host::open_library_step(window.hwnd);
     assert_eq!(crate::window::library_host::folder(window.hwnd), None);
-    assert!(!app_mut(window.hwnd).library.scanning);
+    assert!(!app_mut(window.hwnd).library.scanning());
 }
 
 #[test]
@@ -454,11 +472,16 @@ fn a_stale_ready_message_is_dropped_and_writes_are_flushed_on_demand() {
     let _editor = install_test_editor(&window);
     scratch.install(window.hwnd);
     let stale = crate::window::library_host::test_ready_payload(
-        app_mut(window.hwnd).library.generation.wrapping_sub(1),
+        app_mut(window.hwnd)
+            .library
+            .default_slot()
+            .unwrap()
+            .generation
+            .wrapping_sub(1),
         Err("old".into()),
     );
     crate::window::library_host::library_ready(window.hwnd, stale);
-    assert!(app_mut(window.hwnd).library.state.is_some());
+    assert!(app_mut(window.hwnd).library.default_state().is_some());
     assert!(notices(window.hwnd).iter().all(|n| !n.contains("old")));
 
     crate::window::library_host::with_state(window.hwnd, |state| {

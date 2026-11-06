@@ -948,3 +948,44 @@ fn with_no_notebook_the_search_view_says_to_open_one() {
         Some(crate::window::search_view::NO_NOTEBOOK)
     );
 }
+
+#[test]
+fn search_covers_the_target_notebook_and_names_it() {
+    // Break caught: Search reading the default notebook while a note of another notebook is in
+    // front, or not saying which notebook it searches (multi-root notebooks spec §5.3).
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("search-target", "alpha needle", "beta needle");
+    let hwnd = ab.window.hwnd;
+    super::super::open_path(hwnd, &ab.b.join("b.md")).unwrap();
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Search, true);
+
+    search_for(hwnd, "needle");
+    let rows = search_rows(hwnd);
+    assert_eq!(
+        rows.iter()
+            .map(|(_, snippet)| snippet.as_str())
+            .collect::<Vec<_>>(),
+        ["beta needle"],
+        "{rows:?}"
+    );
+    assert_eq!(
+        crate::window::search_view::shown_header(hwnd),
+        "Searching B"
+    );
+
+    // Another notebook's note in front: the view now searches that notebook.
+    super::super::open_path(hwnd, &ab.a.join("a.md")).unwrap();
+    assert_eq!(
+        crate::window::search_view::shown_header(hwnd),
+        "Searching A"
+    );
+    search_for(hwnd, "needle");
+    let rows = search_rows(hwnd);
+    assert_eq!(
+        rows.iter()
+            .map(|(_, snippet)| snippet.as_str())
+            .collect::<Vec<_>>(),
+        ["alpha needle"],
+        "{rows:?}"
+    );
+}

@@ -20,9 +20,11 @@ pub(crate) fn notes_mode_notice(enabled: bool) -> &'static str {
 pub(super) const READ_ONLY: &str = "This notebook's .fastpad\\library.ini can't be read, so pins are off until it is fixed or removed.";
 pub(super) const BUSY: &str = "This notebook's .fastpad\\library.ini is in use by another program. FastPad reads it again when you come back to the window.";
 
-/// True when organizing can proceed; otherwise explains why not.
-pub(crate) fn ready_library(hwnd: HWND) -> bool {
-    match host(hwnd, |host| host.state.as_ref().map(|state| state.metadata)).flatten() {
+/// True when organizing the notebook `id` can proceed; otherwise explains why not. `None` names
+/// no open notebook.
+pub(crate) fn ready_library_of(hwnd: HWND, id: Option<NotebookId>) -> bool {
+    let metadata = id.and_then(|id| with_notebook(hwnd, id, |state| state.metadata));
+    match metadata {
         Some(Metadata::Ready) => true,
         Some(Metadata::Unreadable) => {
             push_notice(hwnd, READ_ONLY.to_owned());
@@ -33,7 +35,7 @@ pub(crate) fn ready_library(hwnd: HWND) -> bool {
             false
         }
         None => {
-            let notice = if folder(hwnd).is_some() {
+            let notice = if id.is_some_and(|id| notebook_folder(hwnd, id).is_some()) {
                 "Loading notebook…"
             } else {
                 "Open a notebook first."
@@ -54,15 +56,18 @@ pub(crate) fn active_file(hwnd: HWND) -> Option<PathBuf> {
     path
 }
 
-/// Applies one operation built from the host's ID source, then schedules the write. The model
-/// validates before the operation is recorded, so a failed one leaves nothing pending.
-pub(super) fn apply_op(
+/// Applies one operation on the notebook `id`, built from the host's ID source, then schedules
+/// the write. The model validates before the operation is recorded, so a failed one leaves
+/// nothing pending.
+pub(super) fn apply_op_of(
     hwnd: HWND,
+    id: NotebookId,
     build: impl FnOnce(&mut LibraryState, &mut IdSource) -> Option<PendingOp>,
 ) -> Result<(), LibraryError> {
     let result = host(hwnd, |host| {
-        let LibraryHost { state, ids, .. } = host;
-        let state = state.as_mut()?;
+        let LibraryHost { notebooks, ids, .. } = host;
+        let slot = notebooks.iter_mut().find(|slot| slot.id == id)?;
+        let state = slot.state.as_mut()?;
         let op = build(state, ids)?;
         Some(state.apply(op))
     })
@@ -88,21 +93,31 @@ pub(crate) fn confirmed(hwnd: HWND, question: &str, action: &str) -> bool {
     crate::window::modal::confirm(hwnd, question, action) && identity.is_live_for(hwnd)
 }
 
-/// Pins or unpins `path`. Only a note inside the open notebook can be pinned: version 2 of
-/// `library.ini` has no records for files outside it.
+/// Pins or unpins `path` in the notebook that owns it (multi-root notebooks spec §5.2). Only a
+/// note inside an open notebook can be pinned: version 2 of `library.ini` has no records for
+/// files outside it.
 pub(crate) fn toggle_pin(hwnd: HWND, path: &Path) {
-    if !ready_library(hwnd) {
+    let owner = notebook_of(hwnd, path).filter(|id| {
+        notebook_folder(hwnd, *id).is_some_and(|folder| library::is_inside(&folder, path))
+    });
+    // A file outside every open notebook is refused as such, whatever state the notebooks are
+    // in: "Loading notebook…" would suggest the pin works once one has loaded.
+    let Some(id) = owner else {
+        if notebooks(hwnd).is_empty() {
+            ready_library_of(hwnd, None);
+        } else {
+            push_notice(
+                hwnd,
+                "Only notes in an open notebook can be pinned.".to_owned(),
+            );
+        }
         return;
-    }
-    if !folder(hwnd).is_some_and(|folder| library::is_inside(&folder, path)) {
-        push_notice(
-            hwnd,
-            "Only notes in the open notebook can be pinned.".to_owned(),
-        );
+    };
+    if !ready_library_of(hwnd, Some(id)) {
         return;
     }
     let mut now_on = false;
-    let result = apply_op(hwnd, |state, ids| {
+    let result = apply_op_of(hwnd, id, |state, ids| {
         now_on = !state.is_pinned(path);
         Some(PendingOp::SetPinned {
             note: state.note_ref(ids, path),
@@ -120,10 +135,10 @@ pub(crate) fn toggle_pin(hwnd: HWND, path: &Path) {
     crate::window::side_panel::refresh(hwnd);
 }
 
-/// The open notebook's pinned notes that are still listed, as paths relative to it; empty while
-/// no notebook state is loaded.
-pub(crate) fn pinned_notes(hwnd: HWND) -> Vec<PathBuf> {
-    with_state(hwnd, |state| {
+/// The pinned notes of the notebook `id` that are still listed, as paths relative to it; empty
+/// while its state is not loaded.
+pub(crate) fn pinned_notes_of(hwnd: HWND, id: NotebookId) -> Vec<PathBuf> {
+    with_notebook(hwnd, id, |state| {
         library::pinned_paths(&state.library)
             .into_iter()
             .filter(|path| state.is_listed(path))

@@ -140,11 +140,20 @@ fn open_editors_and_the_root_collapse_and_stay_so() {
     mouse(panel, WM_LBUTTONUP, 0, centre(header));
     assert!(!super::super::open_editors_expanded(window.hwnd));
     let root = notebook_view(window.hwnd).root_rect();
+    mouse(
+        panel,
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE,
+        0,
+        centre(root),
+    );
     let chevron = crate::window::notebook_layout::root_parts(root, 96).chevron;
     mouse(panel, WM_LBUTTONDOWN, 1, centre(chevron));
     mouse(panel, WM_LBUTTONUP, 0, centre(chevron));
     assert!(!crate::window::library_host::root_expanded(window.hwnd));
-    assert!(!notebook_view(window.hwnd).tree_shown());
+    assert_eq!(
+        view_rows(window.hwnd),
+        [(first_id(window.hwnd), RowKind::Root)]
+    );
     let local = crate::library::local::local_file(&scratch.data(), &scratch.folder());
     assert!(
         std::fs::read_to_string(local)
@@ -237,6 +246,12 @@ fn the_root_rows_new_note_button_still_makes_the_note_in_the_selected_folder() {
     select_row(window.hwnd, &RowKind::Folder("sub".into()));
     let panel = sidebar_windows(window.hwnd).1;
     let root = notebook_view(window.hwnd).root_rect();
+    mouse(
+        panel,
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE,
+        0,
+        centre(root),
+    );
     let (_, new_note) = crate::window::notebook_layout::root_parts(root, 96)
         .buttons
         .into_iter()
@@ -360,8 +375,9 @@ fn screen_readers_see_the_sections_and_the_tab_rows() {
     assert_eq!(outline("Open editors, 1"), "0");
     assert_eq!(outline("a.md, open editor, modified"), "1");
     let notebook = crate::window::library_host::notebook_name(&scratch.folder());
-    assert_eq!(outline(&notebook), "0");
-    assert_eq!(outline("a.md, Markdown"), "1", "a top-level tree row");
+    // A root row is a tree row at level 1 (multi-root notebooks spec §4.4), its rows under it.
+    assert_eq!(outline(&format!("{notebook} (default)")), "1");
+    assert_eq!(outline("a.md, Markdown"), "2", "a top-level tree row");
 }
 
 #[test]
@@ -373,7 +389,11 @@ fn a_folder_rename_selects_the_whole_name_even_with_a_dot() {
     std::fs::create_dir_all(scratch.folder().join("v1.2")).unwrap();
     let (window, _editor) = notebook_window(&scratch);
 
-    crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("v1.2".into()));
+    crate::window::inline_name::rename(
+        window.hwnd,
+        first_id(window.hwnd),
+        &RowKind::Folder("v1.2".into()),
+    );
 
     assert_eq!(field_text(window.hwnd), "v1.2");
     assert_eq!(field_selection(window.hwnd), (0, 4));
@@ -393,16 +413,20 @@ fn a_folder_renamed_while_a_rescan_runs_keeps_its_new_name_once_the_rescan_lands
     app_mut(window.hwnd).library.data_dir = Some(scratch.data());
     scratch.install(window.hwnd);
     crate::window::library_host::request_rescan(window.hwnd);
-    assert!(app_mut(window.hwnd).library.scanning);
+    assert!(app_mut(window.hwnd).library.scanning());
 
     crate::window::notebook_view::rebuild(window.hwnd);
-    crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+    crate::window::inline_name::rename(
+        window.hwnd,
+        first_id(window.hwnd),
+        &RowKind::Folder("sub".into()),
+    );
     type_into_field(window.hwnd, "Moved");
     field_key(
         window.hwnd,
         windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN,
     );
-    pump_until(window.hwnd, || !app_mut(window.hwnd).library.scanning);
+    pump_until(window.hwnd, || !app_mut(window.hwnd).library.scanning());
 
     crate::window::library_host::with_state(window.hwnd, |state| {
         assert!(state.is_folder(std::path::Path::new("Moved")));
@@ -510,7 +534,7 @@ fn deleting_a_folder_that_holds_the_only_tab_and_the_draft_target_warns_and_canc
     execute_command(window.hwnd, CommandId::ToggleFolderAutosave);
     editor.set_text("unsaved").unwrap();
     crate::window::notebook_view::rebuild(window.hwnd);
-    crate::window::inline_name::new_folder(window.hwnd, Some("sub".into()));
+    crate::window::inline_name::new_folder(window.hwnd, in_first(window.hwnd, "sub".into()));
     assert!(inline_open(window.hwnd));
     select_row(window.hwnd, &RowKind::Folder("sub".into()));
     crate::window::modal::take_last_confirm();
@@ -588,10 +612,14 @@ fn folder_commands_on_an_empty_or_escaping_path_touch_no_disk() {
     crate::window::library_host::delete_folder(window.hwnd, std::path::Path::new(""));
     crate::window::library_host::delete_folder(window.hwnd, std::path::Path::new(".."));
     for bad in ["", ".."] {
-        crate::window::inline_name::rename(window.hwnd, &RowKind::Folder(bad.into()));
+        crate::window::inline_name::rename(
+            window.hwnd,
+            first_id(window.hwnd),
+            &RowKind::Folder(bad.into()),
+        );
         assert!(!inline_open(window.hwnd), "{bad:?} has no row");
     }
-    crate::window::inline_name::new_folder(window.hwnd, Some("..".into()));
+    crate::window::inline_name::new_folder(window.hwnd, in_first(window.hwnd, "..".into()));
     assert!(!inline_open(window.hwnd), "no draft outside the notebook");
     // The commits' own guards, reached with purposes no row gives.
     use crate::window::inline_name::Purpose;
@@ -651,7 +679,11 @@ fn a_new_note_made_in_a_folder_saves_into_it_after_the_folder_is_renamed() {
     let at_root = app_mut(window.hwnd).tabs.active().unwrap().id;
 
     crate::window::notebook_view::rebuild(window.hwnd);
-    crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+    crate::window::inline_name::rename(
+        window.hwnd,
+        first_id(window.hwnd),
+        &RowKind::Folder("sub".into()),
+    );
     type_into_field(window.hwnd, "Moved");
     field_key(
         window.hwnd,
@@ -755,7 +787,11 @@ fn a_folder_rename_that_cannot_be_undone_stands_and_names_the_tab_left_behind() 
     crate::window::library_host::fail_next_folder_rename_back();
 
     crate::window::notebook_view::rebuild(window.hwnd);
-    crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+    crate::window::inline_name::rename(
+        window.hwnd,
+        first_id(window.hwnd),
+        &RowKind::Folder("sub".into()),
+    );
     type_into_field(window.hwnd, "Moved");
     field_key(
         window.hwnd,
@@ -858,7 +894,10 @@ fn focus_moving_to_the_editor_commits_and_a_taken_name_closes_with_a_notice() {
     assert!(scratch.folder().join("Plans").is_dir());
 
     // At the root: with the new folder's row selected, None would draft inside it.
-    crate::window::inline_name::new_folder(window.hwnd, Some(std::path::PathBuf::new()));
+    crate::window::inline_name::new_folder(
+        window.hwnd,
+        in_first(window.hwnd, std::path::PathBuf::new()),
+    );
     type_into_field(window.hwnd, "plans");
     assert!(crate::window::inline_name::problem(window.hwnd).is_some());
     unsafe { SetFocus(editor.hwnd()) };
@@ -942,7 +981,7 @@ fn a_click_on_a_row_below_a_draft_commits_first_and_acts_on_that_row() {
     };
 
     crate::window::inline_name::new_note(window.hwnd, None);
-    assert_eq!(draft_row(window.hwnd), Some((0, 0)), "first at the root");
+    assert_eq!(draft_row(window.hwnd), Some((1, 1)), "first at the root");
     click(row_lparam(window.hwnd, &RowKind::Note("b.md".into())));
     assert!(!inline_open(window.hwnd));
     assert_eq!(
@@ -954,7 +993,11 @@ fn a_click_on_a_row_below_a_draft_commits_first_and_acts_on_that_row() {
         Some(scratch.folder().join("b.md"))
     );
 
-    crate::window::inline_name::rename(window.hwnd, &RowKind::Note("c.md".into()));
+    crate::window::inline_name::rename(
+        window.hwnd,
+        first_id(window.hwnd),
+        &RowKind::Note("c.md".into()),
+    );
     type_into_field(window.hwnd, "d");
     click(row_lparam(window.hwnd, &RowKind::Note("a.md".into())));
     assert!(scratch.folder().join("d.md").exists(), "committed first");
@@ -979,6 +1022,7 @@ fn starting_an_edit_while_one_is_open_commits_the_open_one_first() {
 
     crate::window::notebook_view::header_clicked(
         window.hwnd,
+        first_id(window.hwnd),
         crate::window::notebook_view::HeaderButton::NewFolder,
     );
 
@@ -1004,7 +1048,11 @@ fn switching_the_sidebar_view_or_hiding_it_cancels_the_edit() {
         crate::config::SidebarView::Search,
         crate::config::SidebarView::Hidden,
     ] {
-        crate::window::inline_name::rename(window.hwnd, &RowKind::Note("a.md".into()));
+        crate::window::inline_name::rename(
+            window.hwnd,
+            first_id(window.hwnd),
+            &RowKind::Note("a.md".into()),
+        );
         type_into_field(window.hwnd, "zzz");
         crate::window::side_panel::show_view(window.hwnd, view, false);
         pump_posted_messages(window.hwnd);
@@ -1099,7 +1147,11 @@ fn pressing_the_scroll_thumb_keeps_the_edit_open_and_the_field_focused() {
     }
     let (window, _editor) = notebook_window(&scratch);
     let panel = sidebar_windows(window.hwnd).1;
-    crate::window::inline_name::rename(window.hwnd, &RowKind::Note("n00.md".into()));
+    crate::window::inline_name::rename(
+        window.hwnd,
+        first_id(window.hwnd),
+        &RowKind::Note("n00.md".into()),
+    );
     type_into_field(window.hwnd, "half");
     let (x, y) = notebook_view(window.hwnd)
         .thumb_point()
@@ -1158,5 +1210,62 @@ fn a_pinned_note_gets_a_pinned_part_under_the_open_editors_and_unpinning_removes
             .editors
             .rows
             .contains(&EditorEntry::PinnedHeader)
+    );
+}
+
+#[test]
+fn pinned_editors_list_every_notebooks_pins_with_their_names() {
+    // Break caught: the Pinned part showing only the default notebook's pins, or naming the
+    // notebook when only one is open (multi-root notebooks spec §4.6).
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("pins-all", "a", "b");
+    let hwnd = ab.window.hwnd;
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, false);
+    let pinned = |hwnd| {
+        notebook_view(hwnd)
+            .editors
+            .rows
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .pinned()
+                    .map(|row| (row.name.clone(), row.notebook_name.clone()))
+            })
+            .collect::<Vec<_>>()
+    };
+    crate::window::library_host::toggle_pin(hwnd, &ab.a.join("a.md"));
+    crate::window::library_host::toggle_pin(hwnd, &ab.b.join("b.md"));
+    crate::window::notebook_view::rebuild(hwnd);
+    assert_eq!(
+        pinned(hwnd),
+        [
+            ("a.md".to_owned(), Some("A".to_owned())),
+            ("b.md".to_owned(), Some("B".to_owned())),
+        ]
+    );
+    // Opening B's pin opens B's file.
+    let index = notebook_view(hwnd)
+        .editors
+        .rows
+        .iter()
+        .position(|entry| entry.pinned().is_some_and(|row| row.name == "b.md"))
+        .unwrap();
+    let rect = notebook_view(hwnd).editor_rect_at(index).unwrap();
+    click(
+        sidebar_windows(hwnd).1,
+        (rect.left + rect.right) / 2,
+        (rect.top + rect.bottom) / 2,
+    );
+    assert_eq!(
+        app_mut(hwnd).tabs.active().unwrap().path.as_deref(),
+        Some(ab.b.join("b.md").as_path())
+    );
+
+    crate::window::library_host::close_notebook_of(hwnd, ab.b_id);
+    crate::window::notebook_view::rebuild(hwnd);
+    assert_eq!(
+        pinned(hwnd),
+        [("a.md".to_owned(), None)],
+        "one notebook open: no secondary text"
     );
 }

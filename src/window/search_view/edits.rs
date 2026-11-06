@@ -398,6 +398,8 @@ pub(super) fn hide_box(edit: HWND) {
 /// with no notebook: its toggles set the options (spec §4). `focus` puts the caret in the box. A
 /// library change while the view was hidden runs the query again now, if the notes changed.
 pub(crate) fn shown(hwnd: HWND, focus: bool) {
+    // The Notebook view no longer shows, so the target may be another notebook now.
+    super::target_changed(hwnd);
     ensure_edit(hwnd);
     layout(hwnd);
     if with_view(hwnd, |view| std::mem::take(&mut view.stale)).unwrap_or(false) {

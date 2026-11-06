@@ -21,7 +21,7 @@ fn outline(rows: &[TreeRow]) -> Vec<String> {
         .map(|row| {
             let marker = match (&row.kind, row.pinned) {
                 (RowKind::Folder(_), _) => "/",
-                (RowKind::Draft, _) => "+",
+                (RowKind::Draft | RowKind::Root | RowKind::Placeholder(_), _) => "+",
                 (RowKind::Note(_), true) => "*",
                 (RowKind::Note(_), false) => "",
             };

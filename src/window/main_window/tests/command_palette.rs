@@ -119,7 +119,8 @@ fn the_status_bar_pickers_start_on_the_current_value_and_save_with_an_encoding()
     super::super::open_path(window.hwnd, &path).unwrap();
     pump_posted_messages(window.hwnd);
     let selected = || with_command_palette(window.hwnd, |p| p.selected_choice()).flatten();
-    let placeholder = || with_command_palette(window.hwnd, |p| p.placeholder()).flatten();
+    let placeholder =
+        || with_command_palette(window.hwnd, |p| p.placeholder().map(str::to_owned)).flatten();
 
     super::super::open_language_picker(window.hwnd);
     let plain_text = crate::languages::LANGUAGES
@@ -127,12 +128,12 @@ fn the_status_bar_pickers_start_on_the_current_value_and_save_with_an_encoding()
         .position(|spec| spec.language == crate::document::Language::PlainText)
         .unwrap();
     assert_eq!(selected(), Some(PickerChoice::Item(plain_text)));
-    assert_eq!(placeholder(), Some(LANGUAGE_PLACEHOLDER));
+    assert_eq!(placeholder().as_deref(), Some(LANGUAGE_PLACEHOLDER));
     super::super::close_command_palette(window.hwnd, true);
 
     super::super::open_encoding_picker(window.hwnd);
     assert_eq!(selected(), Some(PickerChoice::Item(0)), "UTF-8, as read");
-    assert_eq!(placeholder(), Some(ENCODING_PLACEHOLDER));
+    assert_eq!(placeholder().as_deref(), Some(ENCODING_PLACEHOLDER));
     super::super::move_command_palette_selection(window.hwnd, 2);
     super::super::run_command_palette_selection(window.hwnd);
     let document = app_mut(window.hwnd).tabs.active().unwrap();
@@ -693,4 +694,80 @@ fn quick_open_rows_carry_their_text_for_screen_readers_and_draw_their_hits_in_bo
     palette().draw_item(&item);
     unsafe { DeleteDC(dc) };
     assert!(palette().has_bold_font());
+}
+
+#[test]
+fn the_target_is_the_selected_row_then_the_active_tab_then_the_default() {
+    // Break caught: a command meant for "the notebook" acting on the default notebook while a
+    // note of another notebook is in front, or on nothing for an untitled tab (multi-root
+    // notebooks spec §5.1). The selected-row branch is checked once rows carry their notebook.
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("target-order", "a", "b");
+    let hwnd = ab.window.hwnd;
+    let target = || crate::window::library_host::target_notebook(hwnd);
+    assert_eq!(target(), Some(ab.a_id), "no tab: the default");
+
+    super::super::open_path(hwnd, &ab.b.join("b.md")).unwrap();
+    super::super::focus_content(hwnd);
+    assert_eq!(
+        target(),
+        Some(ab.b_id),
+        "a note of B in front, the focus in the editor"
+    );
+    assert_eq!(
+        crate::window::library_host::notebook_display_name(hwnd, ab.b_id).as_deref(),
+        Some("B")
+    );
+
+    super::super::create_new_document(hwnd).unwrap();
+    // Opening b.md selected its row, which still stands for B while the Notebook view shows.
+    assert_eq!(target(), Some(ab.b_id), "the selected B row comes first");
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Search, false);
+    assert_eq!(target(), Some(ab.a_id), "an untitled tab: the default");
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, false);
+
+    // The palette's Favorite and Close act on the target.
+    super::super::open_path(hwnd, &ab.b.join("b.md")).unwrap();
+    execute_command(hwnd, CommandId::ToggleNotebookFavorite);
+    let favorites = crate::window::library_host::favorites(hwnd);
+    assert!(
+        favorites
+            .iter()
+            .any(|folder| crate::library::model::same_path(folder, &ab.b)),
+        "{favorites:?}"
+    );
+    assert!(
+        !favorites
+            .iter()
+            .any(|folder| crate::library::model::same_path(folder, &ab.a))
+    );
+    execute_command(hwnd, CommandId::CloseNotebook);
+    let open: Vec<_> = crate::window::library_host::notebooks(hwnd)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(open, [ab.a_id], "B closed, A stays open");
+}
+
+#[test]
+fn quick_open_lists_the_target_notebook_and_names_it() {
+    // Break caught: Quick Open listing the default notebook's notes while a note of another
+    // notebook is in front, or not saying which notebook it searches.
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("quick-open-target", "a", "b");
+    let hwnd = ab.window.hwnd;
+    super::super::open_path(hwnd, &ab.b.join("b.md")).unwrap();
+
+    execute_command(hwnd, CommandId::QuickOpen);
+    assert_eq!(
+        with_command_palette(hwnd, |p| p.placeholder().map(str::to_owned)).flatten(),
+        Some("Search notes in B".to_owned())
+    );
+    assert_eq!(
+        quick_open_names(hwnd),
+        ["b.md"],
+        "the open tab, a note of B"
+    );
+    type_query(hwnd, "md");
+    assert_eq!(quick_open_names(hwnd), ["b.md"]);
 }

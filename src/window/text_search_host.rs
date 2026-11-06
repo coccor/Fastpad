@@ -102,6 +102,9 @@ pub(crate) struct TextSearchHost {
     /// The write workers not known to have ended. `WM_DESTROY` joins them (`join_writers`), so
     /// the note being written when the window closes is finished, never left half written.
     writers: Vec<JoinHandle<()>>,
+    /// The notebook the replace in hand started in, and its folder: its report lands there,
+    /// whatever the Search view shows by then.
+    replace_notebook: Option<(library_host::NotebookId, PathBuf)>,
 }
 
 fn with_host<R>(hwnd: HWND, f: impl FnOnce(&mut TextSearchHost) -> R) -> Option<R> {
@@ -163,6 +166,15 @@ fn narrows(previous: &Narrowing, query: &str, options: MatchOptions, overlays: u
         && previous.overlays == overlays
 }
 
+/// The notebook the Search view searches (multi-root notebooks spec §5.3), and its folder: the
+/// view's notebook, while it is still open.
+fn searched(hwnd: HWND) -> Option<(library_host::NotebookId, PathBuf)> {
+    let folder = search_view::notebook(hwnd)?;
+    let id = library_host::notebook_of(hwnd, &folder)?;
+    let root = library_host::notebook_folder(hwnd, id)?;
+    same_path(&root, &folder).then_some((id, root))
+}
+
 /// A keystroke in the box: cancels any running search and restarts the debounce.
 pub(crate) fn schedule(hwnd: HWND) {
     cancel(hwnd);
@@ -213,10 +225,10 @@ pub(crate) fn run_now(hwnd: HWND) {
             return;
         }
     };
-    let Some(notebook) = library_host::folder(hwnd) else {
+    let Some((id, notebook)) = searched(hwnd) else {
         return;
     };
-    if library_host::with_state(hwnd, |_| ()).is_none() {
+    if library_host::with_notebook(hwnd, id, |_| ()).is_none() {
         return;
     }
     // Read with nothing of the App borrowed: a background dirty tab is swapped into the editor.
@@ -225,7 +237,7 @@ pub(crate) fn run_now(hwnd: HWND) {
     let candidate = with_host(hwnd, |host| host.previous.clone())
         .flatten()
         .filter(|previous| narrows(previous, &query, options, overlays_mark));
-    let Some((notes, list, marked)) = library_host::with_state(hwnd, |state| {
+    let Some((notes, list, marked)) = library_host::with_notebook(hwnd, id, |state| {
         let list = list_mark(&state.notes);
         let marked = note_mark(&state.notes);
         let keep: Option<HashSet<String>> = candidate
@@ -441,7 +453,9 @@ pub(crate) fn library_changed(hwnd: HWND) {
     if !searchable(&query) {
         return;
     }
-    let Some(list) = library_host::with_state(hwnd, |state| list_mark(&state.notes)) else {
+    let Some(list) = searched(hwnd)
+        .and_then(|(id, _)| library_host::with_notebook(hwnd, id, |state| list_mark(&state.notes)))
+    else {
         return;
     };
     if with_host(hwnd, |host| host.list) == Some(Some(list)) {
@@ -492,6 +506,7 @@ pub(crate) struct Candidate {
 /// What a replace is for, carried from the start through the count to the write.
 #[derive(Debug)]
 pub(crate) struct ReplacePlan {
+    notebook_id: library_host::NotebookId,
     notebook: PathBuf,
     /// The results' query and options the plan was made for. The plan is dropped when the
     /// Search view no longer shows them (`plan_current`).
@@ -614,7 +629,7 @@ fn prepare(
     // The results' query and options, not the box's text, which may be newer.
     let (query, options) = search_view::run_query(hwnd)?;
     let matcher = Matcher::new(&query, options).ok()?;
-    let notebook = library_host::folder(hwnd)?;
+    let (notebook_id, notebook) = searched(hwnd)?;
     let template = search_view::replace_text(hwnd);
     // Read with nothing of the App borrowed: a background tab is swapped into the editor.
     let overlays = target_overlays(hwnd, &notebook, &candidates);
@@ -635,6 +650,7 @@ fn prepare(
         overlays,
         targets,
         ReplacePlan {
+            notebook_id,
             notebook,
             query,
             options,
@@ -823,6 +839,7 @@ fn confirm_and_apply(hwnd: HWND, counted: ReplaceCounted) {
 /// question said that notes that aren't open are saved; without it no file is written.
 fn apply_plan(hwnd: HWND, generation: u64, plan: ReplacePlan, warned: bool) {
     let ReplacePlan {
+        notebook_id,
         notebook,
         matcher,
         template,
@@ -830,7 +847,10 @@ fn apply_plan(hwnd: HWND, generation: u64, plan: ReplacePlan, warned: bool) {
         unread,
         ..
     } = plan;
-    with_host(hwnd, |host| host.applying = true);
+    with_host(hwnd, |host| {
+        host.applying = true;
+        host.replace_notebook = Some((notebook_id, notebook.clone()));
+    });
     let open = open_notes(hwnd, &notebook);
     let mut tab_matches = 0;
     let mut tab_notes = 0;
@@ -993,7 +1013,13 @@ pub(crate) fn replace_written(hwnd: HWND, lparam: LPARAM) {
 /// outside FastPad. Then the report is pushed and the query runs again, so the results show
 /// what still matches.
 fn report_written(hwnd: HWND, report: ReplaceReport, tab_matches: usize, tab_notes: usize) {
-    if let Some(notebook) = library_host::folder(hwnd) {
+    // The notebook the replace started in, not whatever the view shows now. Its own-write marks
+    // end by absolute path even if it closed meanwhile; its list and tabs change only while it
+    // is still open.
+    let started = with_host(hwnd, |host| host.replace_notebook.take())
+        .flatten()
+        .or_else(|| searched(hwnd));
+    if let Some((_, notebook)) = &started {
         let done = report
             .written
             .iter()
@@ -1004,13 +1030,16 @@ fn report_written(hwnd: HWND, report: ReplaceReport, tab_matches: usize, tab_not
             .collect::<Vec<_>>();
         library_host::end_own_writes(hwnd, done.iter().map(PathBuf::as_path));
     }
-    if !report.written.is_empty() {
-        library_host::with_state(hwnd, |state| state.record_written_all(&report.written));
-        if let Some(notebook) = library_host::folder(hwnd) {
-            let reloads = clean_tabs_on(hwnd, &notebook, &report.written);
-            if !reloads.is_empty() {
-                spawn_reload(hwnd, reloads);
-            }
+    let still_open = started.filter(|(id, notebook)| {
+        library_host::notebook_folder(hwnd, *id).is_some_and(|open| same_path(&open, notebook))
+    });
+    if !report.written.is_empty()
+        && let Some((id, notebook)) = &still_open
+    {
+        library_host::with_notebook(hwnd, *id, |state| state.record_written_all(&report.written));
+        let reloads = clean_tabs_on(hwnd, notebook, &report.written);
+        if !reloads.is_empty() {
+            spawn_reload(hwnd, reloads);
         }
     }
     let changed = report
@@ -1134,8 +1163,11 @@ fn finish_replace(hwnd: HWND) {
         host.replacing = false;
         host.applying = false;
         host.replace_cancel = None;
+        host.replace_notebook = None;
     });
     search_view::set_replacing(hwnd, false);
+    // The view kept its notebook while the replace ran: it follows the target again.
+    search_view::target_changed(hwnd);
 }
 
 /// Stops a replace: a count or write still running stops before its next note (a note being
@@ -1149,6 +1181,7 @@ pub(crate) fn cancel_replace(hwnd: HWND) {
         host.replace_generation = host.replace_generation.wrapping_add(1);
         host.replacing = false;
         host.applying = false;
+        host.replace_notebook = None;
         host.held = None;
         host.held_written = None;
         !host.held_reloads.is_empty()
@@ -1367,8 +1400,7 @@ pub(crate) mod writer_hooks {
     }
 }
 
-/// A replace is between its start and its report.
-#[cfg(test)]
+/// A replace is between its start and its report: the Search view keeps its notebook meanwhile.
 pub(crate) fn replacing(hwnd: HWND) -> bool {
     with_host(hwnd, |host| host.replacing).unwrap_or(false)
 }

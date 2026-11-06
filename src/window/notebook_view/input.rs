@@ -6,7 +6,6 @@ use crate::library::tree::{self, RowKind, TreeRow};
 use crate::window::commands::CommandId;
 use crate::window::main_window::OpenMode;
 use crate::window::menus::MenuEntry;
-use crate::window::notebook_layout;
 use crate::window::panel_cursor::{self, Cursor};
 use crate::window::row_list::{self, ListKey};
 use crate::window::side_panel::point_of;
@@ -206,6 +205,10 @@ pub(super) fn mouse_move(hwnd: HWND, x: i32, y: i32) {
         let hit = view.hit_test(x, y);
         let (row, pin) = match hit {
             Hit::Row { index, part } => (Some(index), part == RowPart::Pin),
+            // A root row under the pointer is the hovered row: its buttons show.
+            Hit::Root(id) | Hit::Header(id, _) => {
+                (view_row_index(&view.rows, id, &RowKind::Root), false)
+            }
             _ => (None, false),
         };
         let (editor, close) = match hit {
@@ -214,7 +217,11 @@ pub(super) fn mouse_move(hwnd: HWND, x: i32, y: i32) {
         };
         let hot = matches!(
             hit,
-            Hit::Header(_) | Hit::StateButton | Hit::SecondButton | Hit::EditorsHeader | Hit::Root
+            Hit::Header(..)
+                | Hit::StateButton
+                | Hit::SecondButton
+                | Hit::EditorsHeader
+                | Hit::Root(_)
         )
         .then_some(hit);
         let row_changed = view.list.set_hover(row);
@@ -300,15 +307,17 @@ pub(super) fn hit_after_commit(hwnd: HWND, x: i32, y: i32) -> Option<Hit> {
     }
     let clicked = match hit {
         Hit::Row { index, .. } => with_view(hwnd, |view| {
-            view.rows.get(index).map(|row| row.kind.clone())
+            view.rows
+                .get(index)
+                .map(|row| (row.notebook, row.kind.clone()))
         })
         .flatten(),
         _ => None,
     };
     crate::window::inline_name::commit(hwnd, crate::window::inline_name::How::FocusLeft);
     match (hit, clicked) {
-        (Hit::Row { part, .. }, Some(kind)) => {
-            let index = with_view(hwnd, |view| tree::row_index(&view.rows, &kind)).flatten()?;
+        (Hit::Row { part, .. }, Some((id, kind))) => {
+            let index = with_view(hwnd, |view| view_row_index(&view.rows, id, &kind)).flatten()?;
             Some(Hit::Row { index, part })
         }
         (Hit::Row { .. }, None) => None,
@@ -341,11 +350,10 @@ pub(super) fn left_down(hwnd: HWND, x: i32, y: i32) {
     let cursor = match hit {
         Hit::EditorsHeader => Some(Cursor::EditorsHeader),
         Hit::Editor { index, .. } => Some(Cursor::Editor(index)),
-        Hit::Root => Some(Cursor::Root),
-        Hit::Row { .. } => Some(Cursor::Tree),
+        Hit::Root(_) | Hit::Row { .. } => Some(Cursor::Tree),
         // A root row button acts as the header's did (open editors spec §3.3): New note and New
-        // folder still go to the tree's selected folder.
-        Hit::Header(_) | Hit::StateButton | Hit::SecondButton | Hit::Thumb(_) | Hit::Empty => None,
+        // folder still go to the tree's selected folder, when it is in the button's notebook.
+        Hit::Header(..) | Hit::StateButton | Hit::SecondButton | Hit::Thumb(_) | Hit::Empty => None,
     };
     if let Some(cursor) = cursor {
         with_view(hwnd, |view| {
@@ -361,8 +369,8 @@ pub(super) fn left_down(hwnd: HWND, x: i32, y: i32) {
         }
         Hit::Editor { index, close } => {
             // The Pinned part's note opens as a click on its tree row does.
-            if let Some(path) = pinned_at(hwnd, index) {
-                open_pinned(hwnd, &path, Activation::Click);
+            if let Some((id, path)) = pinned_at(hwnd, index) {
+                open_pinned(hwnd, id, &path, Activation::Click);
                 return;
             }
             // A header row does nothing.
@@ -379,6 +387,7 @@ pub(super) fn left_down(hwnd: HWND, x: i32, y: i32) {
                 // editors spec §4.3). An untitled tab drags onto groups only.
                 arm_drag(
                     hwnd,
+                    None,
                     DragSource::Tab {
                         id: row.id,
                         group: row.group,
@@ -390,12 +399,17 @@ pub(super) fn left_down(hwnd: HWND, x: i32, y: i32) {
                 );
             }
         }
-        Hit::Root => {
-            let expanded = crate::window::library_host::root_expanded(hwnd);
-            crate::window::library_host::set_root_expanded(hwnd, !expanded);
-            rebuild(hwnd);
+        // A click on a root row, off its buttons, selects it and toggles its notebook.
+        Hit::Root(id) => {
+            with_view(hwnd, |view| {
+                if let Some(index) = view_row_index(&view.rows, id, &RowKind::Root) {
+                    view.select(index);
+                }
+            });
+            let expanded = crate::window::library_host::root_expanded_of(hwnd, id);
+            set_root_expanded(hwnd, id, !expanded);
         }
-        Hit::Header(button) => header_clicked(hwnd, button),
+        Hit::Header(id, button) => header_clicked(hwnd, id, button),
         Hit::StateButton => state_button(hwnd),
         Hit::SecondButton => second_button(hwnd),
         Hit::Thumb(grab) => {
@@ -416,14 +430,16 @@ pub(super) fn left_down(hwnd: HWND, x: i32, y: i32) {
             let source = (part == RowPart::Body)
                 .then(|| {
                     with_view(hwnd, |view| {
-                        view.rows.get(index).map(|row| row.kind.clone())
+                        view.rows
+                            .get(index)
+                            .map(|row| (row.notebook, row.kind.clone()))
                     })
                 })
                 .flatten()
                 .flatten();
             row_clicked(hwnd, index, part, false);
-            if let Some(source) = source {
-                arm_drag(hwnd, DragSource::Row(source), x, y);
+            if let Some((id, source)) = source {
+                arm_drag(hwnd, Some(id), DragSource::Row(source), x, y);
             }
         }
         Hit::Empty => {}
@@ -433,8 +449,8 @@ pub(super) fn left_down(hwnd: HWND, x: i32, y: i32) {
 /// `WM_LBUTTONDBLCLK`: a row's second press opens it as a normal tab, which also promotes its
 /// preview (spec §6.4). Anywhere else it is one more click.
 /// Opens the pinned note `relative` the way activating its tree row would.
-fn open_pinned(hwnd: HWND, relative: &Path, how: Activation) {
-    let Some(root) = crate::window::library_host::folder(hwnd) else {
+fn open_pinned(hwnd: HWND, id: NotebookId, relative: &Path, how: Activation) {
+    let Some(root) = crate::window::library_host::notebook_folder(hwnd, id) else {
         return;
     };
     let path = root.join(relative);
@@ -448,13 +464,13 @@ fn open_pinned(hwnd: HWND, relative: &Path, how: Activation) {
 }
 
 /// The pinned note at Open Editors entry `index`, if that entry is one.
-fn pinned_at(hwnd: HWND, index: usize) -> Option<PathBuf> {
+fn pinned_at(hwnd: HWND, index: usize) -> Option<(NotebookId, PathBuf)> {
     with_view(hwnd, |view| {
         view.editors
             .rows
             .get(index)?
             .pinned()
-            .map(|row| row.path.clone())
+            .map(|row| (row.notebook, row.path.clone()))
     })
     .flatten()
 }
@@ -462,9 +478,11 @@ fn pinned_at(hwnd: HWND, index: usize) -> Option<PathBuf> {
 pub(super) fn double_click(hwnd: HWND, x: i32, y: i32) {
     match with_view(hwnd, |view| view.hit_test(x, y)) {
         Some(Hit::Row { index, part }) => row_clicked(hwnd, index, part, true),
+        // The first press already toggled the root, as on a folder row.
+        Some(Hit::Root(_)) => {}
         Some(Hit::Editor { index, .. }) if pinned_at(hwnd, index).is_some() => {
-            if let Some(path) = pinned_at(hwnd, index) {
-                open_pinned(hwnd, &path, Activation::Permanent);
+            if let Some((id, path)) = pinned_at(hwnd, index) {
+                open_pinned(hwnd, id, &path, Activation::Permanent);
             }
         }
         Some(_) => left_down(hwnd, x, y),
@@ -479,18 +497,25 @@ pub(super) fn row_clicked(hwnd: HWND, index: usize, part: RowPart, double: bool)
         return;
     };
     match target {
-        Target::Row(TreeRow {
-            kind: RowKind::Note(relative),
-            ..
-        }) if part == RowPart::Pin => {
-            if !double && let Some(root) = crate::window::library_host::folder(hwnd) {
+        Target::Row(
+            id,
+            TreeRow {
+                kind: RowKind::Note(relative),
+                ..
+            },
+        ) if part == RowPart::Pin => {
+            if !double && let Some(root) = crate::window::library_host::notebook_folder(hwnd, id) {
                 crate::window::library_host::toggle_pin(hwnd, &root.join(relative));
             }
         }
-        Target::Row(TreeRow {
-            kind: RowKind::Folder(_),
-            ..
-        })
+        // A double-click's first press already toggled the folder or root, or retried.
+        Target::Row(
+            _,
+            TreeRow {
+                kind: RowKind::Folder(_) | RowKind::Root | RowKind::Placeholder(_),
+                ..
+            },
+        )
         | Target::Recent(_)
             if double => {}
         _ => activate(
@@ -505,8 +530,14 @@ pub(super) fn row_clicked(hwnd: HWND, index: usize, part: RowPart, double: bool)
     }
 }
 
-pub(super) fn set_folder_expanded(hwnd: HWND, relative: &Path, expanded: bool) {
-    crate::window::library_host::set_expanded(hwnd, relative, expanded);
+pub(super) fn set_folder_expanded(hwnd: HWND, id: NotebookId, relative: &Path, expanded: bool) {
+    crate::window::library_host::set_expanded_of(hwnd, id, relative, expanded);
+    rebuild(hwnd);
+}
+
+/// Expands or collapses the root row of the notebook `id` (multi-root notebooks spec §4.2).
+pub(crate) fn set_root_expanded(hwnd: HWND, id: NotebookId, expanded: bool) {
+    crate::window::library_host::set_root_expanded_of(hwnd, id, expanded);
     rebuild(hwnd);
 }
 
@@ -518,10 +549,15 @@ pub(crate) fn activate(hwnd: HWND, index: usize, how: Activation) {
     };
     match target {
         Target::Recent(folder) => crate::window::library_host::open_listed_notebook(hwnd, &folder),
-        Target::Row(row) => match row.kind {
-            RowKind::Folder(relative) => set_folder_expanded(hwnd, &relative, !row.expanded),
+        Target::Row(id, row) => match row.kind {
+            RowKind::Folder(relative) => set_folder_expanded(hwnd, id, &relative, !row.expanded),
+            RowKind::Root => set_root_expanded(hwnd, id, !row.expanded),
+            // "Couldn't load. Retry" loads that notebook again, and no other (spec §4.3).
+            RowKind::Placeholder(tree::Placeholder::Failed) => {
+                crate::window::library_host::retry_load_of(hwnd, id);
+            }
             RowKind::Note(relative) => {
-                let Some(root) = crate::window::library_host::folder(hwnd) else {
+                let Some(root) = crate::window::library_host::notebook_folder(hwnd, id) else {
                     return;
                 };
                 let path = root.join(relative);
@@ -536,63 +572,84 @@ pub(crate) fn activate(hwnd: HWND, index: usize, how: Activation) {
                     crate::window::main_window::report_open_failure(hwnd, &path, &error);
                 }
             }
-            RowKind::Draft => {}
+            RowKind::Draft | RowKind::Placeholder(_) => {}
         },
         Target::Truncated | Target::Nothing => {}
     }
 }
 
-/// The header's buttons (spec §6.5).
-pub(crate) fn header_clicked(hwnd: HWND, button: HeaderButton) {
+/// The buttons of the root row of the notebook `id` (spec §6.5, multi-root notebooks spec
+/// §4.2): each acts on that notebook.
+pub(crate) fn header_clicked(hwnd: HWND, id: NotebookId, button: HeaderButton) {
     match button {
-        HeaderButton::Favorite => crate::window::library_host::toggle_notebook_favorite(hwnd),
-        HeaderButton::NewNote => run(hwnd, CommandId::NoteNew),
-        HeaderButton::NewFolder => run(hwnd, CommandId::NoteNewFolder),
-        HeaderButton::Refresh => crate::window::library_host::request_rescan(hwnd),
-        HeaderButton::ToggleFolders => toggle_folders(hwnd),
-        HeaderButton::More => more_menu(hwnd),
+        HeaderButton::NewNote => {
+            crate::window::inline_name::new_note(hwnd, Some(new_item_place(hwnd, id)));
+        }
+        HeaderButton::NewFolder => {
+            crate::window::inline_name::new_folder(hwnd, Some(new_item_place(hwnd, id)));
+        }
+        HeaderButton::Refresh => crate::window::library_host::request_rescan_of(hwnd, id),
+        HeaderButton::ToggleFolders => toggle_folders(hwnd, id),
+        HeaderButton::More => root_menu(hwnd, id, None),
     }
 }
 
-/// Collapse all or Expand all, whichever the button offers: collapsing closes every folder and
-/// leaves the root row and the selection where they are; expanding opens every folder.
-pub(crate) fn toggle_folders(hwnd: HWND) {
-    let collapse = crate::window::library_host::any_folder_expanded(hwnd);
-    crate::window::library_host::set_all_expanded(hwnd, !collapse);
+/// Where a root row's New note or New folder puts the item: the selected row's folder while
+/// that row is in the same notebook, else the notebook's root.
+fn new_item_place(hwnd: HWND, id: NotebookId) -> (NotebookId, PathBuf) {
+    let folder = selected_place(hwnd)
+        .filter(|(selected, _)| *selected == id)
+        .map(|(_, folder)| folder)
+        .unwrap_or_default();
+    (id, folder)
+}
+
+/// Collapse all or Expand all on the notebook `id`, whichever its button offers: collapsing
+/// closes every folder and leaves the root row and the selection where they are; expanding
+/// opens every folder.
+pub(crate) fn toggle_folders(hwnd: HWND, id: NotebookId) {
+    let collapse = crate::window::library_host::any_folder_expanded_of(hwnd, id);
+    crate::window::library_host::set_all_expanded_of(hwnd, id, !collapse);
     rebuild(hwnd);
 }
 
-/// "…": the notebook's own actions, after the buttons a narrow panel left out.
-pub(super) fn more_menu(hwnd: HWND) {
+/// The "…" menu of the root row of the notebook `id`, and that row's context menu, at `at`
+/// (main-window client coordinates) or under its "…" button (multi-root notebooks spec §4.2):
+/// the buttons a narrow panel left out, the notebook's own actions, its favorite, "Set as
+/// default notebook" (not on the default) and "Close notebook". The root row is selected first,
+/// so the commands that act on the target notebook act on this one.
+pub(super) fn root_menu(hwnd: HWND, id: NotebookId, at: Option<POINT>) {
     let Some((at, hidden)) = with_view(hwnd, |view| {
-        let dpi = view.dpi();
-        let root = view.layout(view.client(), dpi).root;
-        let parts = notebook_layout::root_parts(root, dpi);
-        let rect = parts.buttons[5].1;
-        let at = view.to_main(POINT {
-            x: rect.left,
-            y: rect.bottom,
+        let index = view_row_index(&view.rows, id, &RowKind::Root)?;
+        view.cursor = Cursor::Tree;
+        view.select(index);
+        let parts = view.root_parts_of(id)?;
+        let more = parts.more();
+        let at = at.unwrap_or_else(|| {
+            view.to_main(POINT {
+                x: more.left,
+                y: more.bottom,
+            })
         });
-        (at, parts.hidden().collect::<Vec<_>>())
-    }) else {
+        Some((at, parts.hidden().collect::<Vec<_>>()))
+    })
+    .flatten() else {
         return;
     };
-    let favorite = if crate::window::library_host::is_favorite(hwnd) {
-        "Remove from favorites"
-    } else {
-        "Add to favorites"
+    let Some(folder) = crate::window::library_host::notebook_folder(hwnd, id) else {
+        return;
     };
+    let favorite = if crate::window::library_host::is_favorite_folder(hwnd, &folder) {
+        "Remove from Favorites"
+    } else {
+        "Add to Favorites"
+    };
+    let is_default = crate::window::library_host::default_notebook(hwnd) == Some(id);
     let mut entries = Vec::new();
     for button in hidden {
         match button {
-            HeaderButton::Favorite => {
-                entries.push(MenuEntry::command(
-                    favorite,
-                    CommandId::ToggleNotebookFavorite,
-                ));
-            }
             HeaderButton::NewNote => {
-                entries.push(MenuEntry::command("New note", CommandId::NoteNew))
+                entries.push(MenuEntry::command("New note", CommandId::NoteNew));
             }
             HeaderButton::NewFolder => {
                 entries.push(MenuEntry::command("New folder", CommandId::NoteNewFolder));
@@ -607,42 +664,58 @@ pub(super) fn more_menu(hwnd: HWND) {
     entries.extend([
         MenuEntry::command("Today's note", CommandId::NotesToday),
         MenuEntry::command(
-            "New note from template{2026}",
+            "New note from template\u{2026}",
             CommandId::NotesNewFromTemplate,
         ),
         MenuEntry::Separator,
         MenuEntry::command("Reveal in Explorer", CommandId::NoteRevealInExplorer),
-        MenuEntry::command("Close notebook", CommandId::CloseNotebook),
+        MenuEntry::Separator,
+        MenuEntry::command(favorite, CommandId::ToggleNotebookFavorite),
     ]);
+    if !is_default {
+        entries.push(MenuEntry::local(
+            "Set as default notebook",
+            ROOT_MENU_SET_DEFAULT,
+        ));
+    }
+    entries.push(MenuEntry::command(
+        "Close notebook",
+        CommandId::CloseNotebook,
+    ));
+    let root = || Some((id, PathBuf::new()));
     match crate::window::menus::track_popup(hwnd, &entries, at) {
-        Some(CommandId::NoteRevealInExplorer) => {
-            if let Some(root) = crate::window::library_host::folder(hwnd) {
-                crate::window::library_host::reveal(hwnd, &root);
-            }
+        Some(CommandId::NoteNew) => crate::window::inline_name::new_note(hwnd, root()),
+        Some(CommandId::NoteNewFolder) => crate::window::inline_name::new_folder(hwnd, root()),
+        Some(CommandId::NotesNewFromTemplate) => {
+            crate::window::library_host::new_note_from_template(hwnd, root());
         }
+        Some(CommandId::NoteRevealInExplorer) => {
+            crate::window::library_host::reveal(hwnd, &folder);
+        }
+        Some(CommandId::ToggleNotebookFavorite) => {
+            crate::window::library_host::toggle_notebook_favorite_of(hwnd, id);
+        }
+        Some(ROOT_MENU_SET_DEFAULT) => crate::window::library_host::set_default_notebook(hwnd, id),
+        Some(CommandId::CloseNotebook) => {
+            crate::window::library_host::close_notebook_of(hwnd, id);
+        }
+        // Today's note: its root row is selected, so the target notebook is this one.
         Some(command) => run(hwnd, command),
         None => {}
     }
 }
 
-/// `pub(crate)` for the tests that click the state button directly.
+/// "Open notebook…" with no notebook open. `pub(crate)` for the tests that click it directly.
 pub(crate) fn state_button(hwnd: HWND) {
-    match with_view(hwnd, |view| view.mode) {
-        Some(Mode::NoNotebook) => crate::window::library_host::choose_and_open_folder(hwnd),
-        // The empty notebook's own "New note" puts a draft row in the tree, not an untitled tab
-        // (inline naming spec §3.1): there is no tree yet, but `apply` makes one for a draft.
-        Some(Mode::Empty) => run(hwnd, CommandId::NoteNew),
-        Some(Mode::Failed) => crate::window::library_host::retry_load(hwnd),
-        _ => {}
+    if with_view(hwnd, |view| view.mode) == Some(Mode::NoNotebook) {
+        crate::window::library_host::choose_and_open_folder(hwnd);
     }
 }
 
-/// "New notebook…" with no notebook open, "Open notebook…" after a failed load.
+/// "New notebook…" with no notebook open.
 pub(crate) fn second_button(hwnd: HWND) {
-    match with_view(hwnd, |view| view.mode) {
-        Some(Mode::NoNotebook) => crate::window::library_host::create_and_open_notebook(hwnd),
-        Some(Mode::Failed) => crate::window::library_host::choose_and_open_folder(hwnd),
-        _ => {}
+    if with_view(hwnd, |view| view.mode) == Some(Mode::NoNotebook) {
+        crate::window::library_host::create_and_open_notebook(hwnd);
     }
 }
 
@@ -712,15 +785,11 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
         });
         return true;
     }
-    let (cursor, hidden) =
-        with_view(hwnd, |view| (view.cursor, view.tree_hidden())).unwrap_or((Cursor::Tree, false));
+    let cursor = with_view(hwnd, |view| view.cursor).unwrap_or(Cursor::Tree);
     if cursor != Cursor::Tree {
         return section_key(hwnd, cursor, key);
     }
-    // A row the collapsed root hides is not acted on.
-    let selected = with_view(hwnd, |view| view.list.selected)
-        .flatten()
-        .filter(|_| !hidden);
+    let selected = with_view(hwnd, |view| view.list.selected).flatten();
     let Some(selected) = selected else {
         return matches!(key, VK_RETURN | VK_LEFT | VK_RIGHT | VK_F2 | VK_DELETE);
     };
@@ -739,27 +808,27 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
             true
         }
         VK_F2 | VK_DELETE => {
-            let kind = with_view(hwnd, |view| match view.target(selected) {
-                Target::Row(row) => Some(row.kind),
+            let Some((id, kind)) = with_view(hwnd, |view| match view.target(selected) {
+                Target::Row(id, row) => Some((id, row.kind)),
                 _ => None,
             })
-            .flatten();
-            let Some(root) = crate::window::library_host::folder(hwnd) else {
+            .flatten() else {
                 return true;
             };
+            let Some(root) = crate::window::library_host::notebook_folder(hwnd, id) else {
+                return true;
+            };
+            // The row's own notebook must be ready (multi-root notebooks spec §5.2).
+            let ready = || crate::window::library_host::ready_library_of(hwnd, Some(id));
             match kind {
-                Some(kind @ (RowKind::Note(_) | RowKind::Folder(_))) if key == VK_F2 => {
-                    crate::window::inline_name::rename(hwnd, &kind);
+                kind @ (RowKind::Note(_) | RowKind::Folder(_)) if key == VK_F2 => {
+                    crate::window::inline_name::rename(hwnd, id, &kind);
                 }
-                Some(RowKind::Note(relative))
-                    if crate::window::library_host::ready_library(hwnd) =>
-                {
+                RowKind::Note(relative) if ready() => {
                     crate::window::library_host::delete_file(hwnd, &root.join(relative));
                 }
-                Some(RowKind::Folder(relative))
-                    if crate::window::library_host::ready_library(hwnd) =>
-                {
-                    crate::window::library_host::delete_folder(hwnd, &relative);
+                RowKind::Folder(relative) if ready() => {
+                    crate::window::library_host::delete_folder_of(hwnd, id, &relative);
                 }
                 _ => {}
             }
@@ -774,8 +843,8 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
 pub(super) fn section_key(hwnd: HWND, cursor: Cursor, key: u16) -> bool {
     match (cursor, key) {
         (Cursor::Editor(index), VK_RETURN) if pinned_at(hwnd, index).is_some() => {
-            if let Some(path) = pinned_at(hwnd, index) {
-                open_pinned(hwnd, &path, Activation::Permanent);
+            if let Some((id, path)) = pinned_at(hwnd, index) {
+                open_pinned(hwnd, id, &path, Activation::Permanent);
             }
         }
         (Cursor::Editor(index), VK_RETURN) => {
@@ -793,17 +862,6 @@ pub(super) fn section_key(hwnd: HWND, cursor: Cursor, key: u16) -> bool {
             let wanted = expanded_after(key, expanded);
             if wanted != expanded {
                 crate::window::main_window::set_open_editors_expanded(hwnd, wanted);
-                rebuild(hwnd);
-            }
-        }
-        (Cursor::Root, VK_RETURN | VK_LEFT | VK_RIGHT) => {
-            if crate::window::library_host::folder(hwnd).is_none() {
-                return true;
-            }
-            let expanded = crate::window::library_host::root_expanded(hwnd);
-            let wanted = expanded_after(key, expanded);
-            if wanted != expanded {
-                crate::window::library_host::set_root_expanded(hwnd, wanted);
                 rebuild(hwnd);
             }
         }
@@ -825,14 +883,31 @@ pub(super) fn expanded_after(key: u16, expanded: bool) -> bool {
 
 /// Right expands a folder, or moves into an expanded one.
 pub(super) fn right(hwnd: HWND, index: usize) {
-    let Some(Target::Row(row)) = with_view(hwnd, |view| view.target(index)) else {
+    let Some(Target::Row(id, row)) = with_view(hwnd, |view| view.target(index)) else {
         return;
     };
+    // A root row expands, then moves to its first child (multi-root notebooks spec §4.4).
+    if row.kind == RowKind::Root {
+        if !row.expanded {
+            set_root_expanded(hwnd, id, true);
+        }
+        with_view(hwnd, |view| {
+            let first = view_row_index(&view.rows, id, &RowKind::Root).map(|root| root + 1);
+            if let Some(first) = first
+                && view.rows.get(first).is_some_and(|child| {
+                    child.notebook == id && !matches!(child.kind, RowKind::Placeholder(_))
+                })
+            {
+                view.select(first);
+            }
+        });
+        return;
+    }
     let RowKind::Folder(relative) = &row.kind else {
         return;
     };
     if !row.expanded {
-        set_folder_expanded(hwnd, relative, true);
+        set_folder_expanded(hwnd, id, relative, true);
         return;
     }
     with_view(hwnd, |view| {
@@ -848,24 +923,26 @@ pub(super) fn right(hwnd: HWND, index: usize) {
 
 /// Left collapses an expanded folder, or moves to the parent folder.
 pub(super) fn left(hwnd: HWND, index: usize) {
-    let Some(Target::Row(row)) = with_view(hwnd, |view| view.target(index)) else {
+    let Some(Target::Row(id, row)) = with_view(hwnd, |view| view.target(index)) else {
         return;
     };
+    // A root row collapses, and stays where it is once collapsed.
+    if row.kind == RowKind::Root {
+        if row.expanded {
+            set_root_expanded(hwnd, id, false);
+        }
+        return;
+    }
     if let RowKind::Folder(relative) = &row.kind
         && row.expanded
     {
-        set_folder_expanded(hwnd, relative, false);
+        set_folder_expanded(hwnd, id, relative, false);
         return;
     }
+    // A top-level row's parent is its notebook's root row (open editors spec §3.5).
     with_view(hwnd, |view| {
-        match tree::parent_index(&view.rows, index) {
-            Some(parent) => view.select(parent),
-            // A top-level row: the notebook's root row is its parent (open editors spec §3.5).
-            None if view.mode == Mode::Tree => {
-                view.cursor = Cursor::Root;
-                view.invalidate();
-            }
-            None => {}
+        if let Some(parent) = tree::parent_index(&view.rows, index) {
+            view.select(parent);
         }
     });
 }

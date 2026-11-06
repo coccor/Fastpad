@@ -695,7 +695,11 @@ fn tree_drag_a_press_during_a_refused_edit_ends_the_edit_before_the_drag() {
     let (window, _editor) = notebook_window(&scratch);
     let panel = sidebar_windows(window.hwnd).1;
 
-    crate::window::inline_name::rename(window.hwnd, &RowKind::Folder("sub".into()));
+    crate::window::inline_name::rename(
+        window.hwnd,
+        first_id(window.hwnd),
+        &RowKind::Folder("sub".into()),
+    );
     type_into_field(window.hwnd, "other");
     assert_eq!(
         crate::window::inline_name::problem(window.hwnd).as_deref(),
@@ -1051,4 +1055,104 @@ fn tree_drag_a_note_dropped_on_a_groups_middle_opens_there_and_on_an_edge_splits
     assert_eq!(app_mut(window.hwnd).tabs.group_ids().len(), groups + 1);
     let new = app_mut(window.hwnd).tabs.active_group();
     assert!(holds(new, &b), "opened in the group split off the edge");
+}
+
+/// The notebooks A and B with the Notebook view shown and its rows built.
+fn drag_ab(label: &str) -> NotebooksAB {
+    let ab = notebooks_a_and_b(label, "a", "b");
+    crate::window::side_panel::show_view(
+        ab.window.hwnd,
+        crate::config::SidebarView::Notebook,
+        false,
+    );
+    crate::window::notebook_view::rebuild(ab.window.hwnd);
+    ab
+}
+
+/// The middle of the row of notebook `id` showing `kind`, as a panel `lParam`.
+fn row_lparam_in(
+    hwnd: HWND,
+    id: crate::window::library_host::NotebookId,
+    kind: &RowKind,
+) -> super::super::LPARAM {
+    centre(
+        notebook_view(hwnd)
+            .row_rect_at(row_in(hwnd, id, kind))
+            .unwrap(),
+    )
+}
+
+/// B gets a folder `sub`, rescanned into the view.
+fn b_with_sub(ab: &NotebooksAB) {
+    let hwnd = ab.window.hwnd;
+    std::fs::create_dir_all(ab.b.join("sub")).unwrap();
+    crate::window::library_host::request_rescan_of(hwnd, ab.b_id);
+    pump_until(hwnd, || {
+        crate::window::notebook_view::view_row_index(
+            &notebook_view(hwnd).rows,
+            ab.b_id,
+            &RowKind::Folder("sub".into()),
+        )
+        .is_some()
+    });
+}
+
+#[test]
+fn dragging_a_note_onto_another_root_is_refused_with_a_hint() {
+    // Break caught: a drop onto another notebook moving the file (or showing the arrow), and a
+    // refusal with no word on why (multi-root notebooks spec §4.5).
+    use windows_sys::Win32::UI::WindowsAndMessaging::IDC_NO;
+    let _scintilla = load_native_scintilla();
+    let ab = drag_ab("drag-cross-root");
+    let hwnd = ab.window.hwnd;
+    b_with_sub(&ab);
+    let panel = sidebar_windows(hwnd).1;
+    let hint = "Moving between notebooks isn't supported yet";
+
+    start_drag(hwnd, panel, &RowKind::Note("a.md".into()));
+    assert_eq!(
+        notebook_view(hwnd).drag_hint(),
+        None,
+        "no hint at the start"
+    );
+    let sub = row_lparam_in(hwnd, ab.b_id, &RowKind::Folder("sub".into()));
+    for over in [row_lparam_in(hwnd, ab.b_id, &RowKind::Root), sub] {
+        drag_over(panel, over);
+        assert_eq!(notebook_view(hwnd).drag.as_ref().unwrap().target, None);
+        assert!(drag_cursor_is(IDC_NO));
+        assert_eq!(notebook_view(hwnd).drag_hint(), Some(hint));
+    }
+    // Over its own root the hint goes with the refusal.
+    drag_over(panel, row_lparam_in(hwnd, ab.a_id, &RowKind::Root));
+    assert_eq!(notebook_view(hwnd).drag_hint(), None);
+    drag_over(panel, sub);
+    drop_at(panel, sub);
+    assert!(ab.a.join("a.md").exists(), "the note stayed in A");
+    assert!(!ab.b.join("sub").join("a.md").exists());
+    assert!(!ab.b.join("a.md").exists());
+}
+
+#[test]
+fn dragging_within_a_root_still_moves() {
+    // Break caught: the notebook check refusing a drag inside the notebook it started in.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_MOUSEMOVE};
+    let _scintilla = load_native_scintilla();
+    let ab = drag_ab("drag-same-root");
+    let hwnd = ab.window.hwnd;
+    b_with_sub(&ab);
+    let panel = sidebar_windows(hwnd).1;
+    let press = row_lparam_in(hwnd, ab.b_id, &RowKind::Note("b.md".into()));
+    mouse(panel, WM_LBUTTONDOWN, 1, press);
+    let (x, y) = ((press & 0xffff) as i32, (press >> 16) as i32);
+    mouse(panel, WM_MOUSEMOVE, 1, client_lparam(x + 30, y));
+    let sub = row_lparam_in(hwnd, ab.b_id, &RowKind::Folder("sub".into()));
+    drag_over(panel, sub);
+    assert_eq!(
+        notebook_view(hwnd).drag.as_ref().unwrap().target,
+        Some(PathBuf::from("sub"))
+    );
+    assert_eq!(notebook_view(hwnd).drag_hint(), None);
+    drop_at(panel, sub);
+    assert!(ab.b.join("sub").join("b.md").exists());
+    assert!(!ab.b.join("b.md").exists());
 }

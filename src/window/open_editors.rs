@@ -8,6 +8,7 @@ use crate::window::design::metrics::scale;
 use crate::window::file_icons::{NoteKind, note_kind};
 use crate::window::icon_sets::TreeItem;
 use crate::window::icon_sets::images::IconImages;
+use crate::window::library_host::NotebookId;
 use crate::window::main_window::app_ptr;
 use crate::window::notebook_view::draw_item_icon;
 use crate::window::row_list::{RowListState, RowLook, row_foreground};
@@ -59,6 +60,10 @@ pub(crate) fn unsaved_label(document: &Document) -> String {
 /// A pinned note as the section's Pinned part shows it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PinnedRow {
+    /// The notebook the note is in.
+    pub notebook: NotebookId,
+    /// The notebook's name, shown dim after the note's; only with more than one notebook open.
+    pub notebook_name: Option<String>,
     /// The note's path relative to the notebook.
     pub path: PathBuf,
     /// The file name with its extension.
@@ -82,7 +87,7 @@ pub(crate) enum EntryKey {
     Header(usize),
     View(GroupId, DocumentId),
     PinnedHeader,
-    Pinned(PathBuf),
+    Pinned(NotebookId, PathBuf),
 }
 
 impl EditorEntry {
@@ -106,7 +111,7 @@ impl EditorEntry {
             Self::Header(number) => EntryKey::Header(*number),
             Self::View(row) => EntryKey::View(row.group, row.id),
             Self::PinnedHeader => EntryKey::PinnedHeader,
-            Self::Pinned(row) => EntryKey::Pinned(row.path.clone()),
+            Self::Pinned(row) => EntryKey::Pinned(row.notebook, row.path.clone()),
         }
     }
 }
@@ -133,25 +138,62 @@ fn editor_row(
     }
 }
 
-/// The Pinned part's rows for the notes in `pinned` (paths relative to the notebook), by name;
-/// empty without a pinned note.
-pub(crate) fn pinned_entries(mut pinned: Vec<PathBuf>) -> Vec<EditorEntry> {
-    if pinned.is_empty() {
-        return Vec::new();
-    }
+/// One notebook's pinned notes (paths relative to it) for the Pinned part, with the name to show
+/// beside them (`None` to show none).
+pub(crate) struct NotebookPins {
+    pub notebook: NotebookId,
+    pub name: Option<String>,
+    pub pinned: Vec<PathBuf>,
+}
+
+/// The Pinned part's rows: the notebooks' pins in the order given (sidebar order), each
+/// notebook's by name; empty without a pinned note.
+pub(crate) fn pinned_entries(notebooks: Vec<NotebookPins>) -> Vec<EditorEntry> {
     let name = |path: &PathBuf| {
         path.file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default()
     };
-    pinned.sort_by_key(|path| (name(path).to_lowercase(), path.clone()));
-    std::iter::once(EditorEntry::PinnedHeader)
-        .chain(pinned.into_iter().map(|path| {
+    let mut rows = Vec::new();
+    for NotebookPins {
+        notebook,
+        name: notebook_name,
+        mut pinned,
+    } in notebooks
+    {
+        pinned.sort_by_key(|path| (name(path).to_lowercase(), path.clone()));
+        rows.extend(pinned.into_iter().map(|path| {
             EditorEntry::Pinned(PinnedRow {
+                notebook,
+                notebook_name: notebook_name.clone(),
                 name: name(&path),
                 path,
             })
-        }))
+        }));
+    }
+    if rows.is_empty() {
+        return rows;
+    }
+    rows.insert(0, EditorEntry::PinnedHeader);
+    rows
+}
+
+/// Every open notebook's pins, in sidebar order. A notebook's name goes with its pins only
+/// while more than one notebook is open.
+fn notebook_pins(hwnd: HWND) -> Vec<NotebookPins> {
+    use crate::window::library_host as host;
+    let open = host::notebooks(hwnd);
+    let several = open.len() > 1;
+    open.into_iter()
+        .map(|(id, _)| NotebookPins {
+            notebook: id,
+            name: if several {
+                host::notebook_display_name(hwnd, id)
+            } else {
+                None
+            },
+            pinned: host::pinned_notes_of(hwnd, id),
+        })
         .collect()
 }
 
@@ -191,9 +233,7 @@ pub(crate) fn snapshot(hwnd: HWND) -> Vec<EditorEntry> {
         })
         .unwrap_or_default()
         .into_iter()
-        .chain(pinned_entries(crate::window::library_host::pinned_notes(
-            hwnd,
-        )))
+        .chain(pinned_entries(notebook_pins(hwnd)))
         .collect()
 }
 
@@ -211,7 +251,10 @@ pub(crate) fn accessible_name(row: &EditorRow) -> String {
 
 /// What screen readers hear for a pinned note's row.
 pub(crate) fn pinned_accessible_name(row: &PinnedRow) -> String {
-    format!("{}, pinned note", row.name)
+    match &row.notebook_name {
+        Some(notebook) => format!("{}, pinned note, {notebook}", row.name),
+        None => format!("{}, pinned note", row.name),
+    }
 }
 
 /// A row's tooltip: the file's full path, or an untitled tab's label.
@@ -362,6 +405,15 @@ pub(crate) fn draw_pinned_row(
         ..rect
     };
     unsafe { draw_text(dc, &row.name, name, paint.fonts.text, foreground, LINE) };
+    // The notebook's name, dim, after the note's.
+    if let Some(notebook) = &row.notebook_name {
+        let used = crate::window::notebook_view::text_extent(dc, &row.name, paint.fonts.text);
+        let secondary = RECT {
+            left: (name.left + used + scale(GAP, dpi)).min(rect.right),
+            ..rect
+        };
+        unsafe { draw_text(dc, notebook, secondary, paint.fonts.text, muted, LINE) };
+    }
 }
 
 /// Paints one row: the icon, the name, and at the right the dot of a dirty tab or, on hover or
@@ -555,11 +607,15 @@ mod tests {
         // Break caught: pinned notes listed in a hash or disk order, a header with nothing under
         // it, or a pinned note counted as an open tab.
         assert!(pinned_entries(Vec::new()).is_empty());
-        let rows = pinned_entries(vec![
-            PathBuf::from(r"notes\zeta.md"),
-            PathBuf::from("Alpha.md"),
-            PathBuf::from(r"b\beta.md"),
-        ]);
+        let rows = pinned_entries(vec![NotebookPins {
+            notebook: NotebookId(1),
+            name: None,
+            pinned: vec![
+                PathBuf::from(r"notes\zeta.md"),
+                PathBuf::from("Alpha.md"),
+                PathBuf::from(r"b\beta.md"),
+            ],
+        }]);
         assert_eq!(rows[0], EditorEntry::PinnedHeader);
         let names: Vec<_> = rows
             .iter()

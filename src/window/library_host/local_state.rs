@@ -21,8 +21,8 @@ pub(super) struct LocalWrite {
 /// It also carries the scan cache (about 1 MB for 10,000 notes), so it is encoded and written on
 /// a one-off writer thread from a snapshot: cloning the state is cheap next to encoding it and
 /// syncing the write. `local::write_in_order` keeps an older snapshot from landing last.
-pub(super) fn save_local(hwnd: HWND, how: LocalWrite) {
-    let job = with_state(hwnd, |state| {
+pub(super) fn save_local_of(hwnd: HWND, id: NotebookId, how: LocalWrite) {
+    let job = with_notebook(hwnd, id, |state| {
         let local = library::take_local_changes(state)
             .or_else(|| how.force.then(|| state.local.clone()))?;
         Some((state.local_path.clone(), local))
@@ -31,9 +31,9 @@ pub(super) fn save_local(hwnd: HWND, how: LocalWrite) {
     let Some((path, local)) = job else {
         return;
     };
-    host(hwnd, |host| {
-        if host.scanning {
-            host.local_written_during_scan = true;
+    slot(hwnd, id, |slot| {
+        if slot.scanning {
+            slot.local_written_during_scan = true;
         }
     });
     let order = library::local::next_write();
@@ -47,10 +47,12 @@ pub(super) fn save_local(hwnd: HWND, how: LocalWrite) {
     }
 }
 
-/// `save_local` on a writer thread, for a change the user just made (a folder rename).
-pub(crate) fn save_local_soon(hwnd: HWND) {
-    save_local(
+/// `save_local` for the notebook `id` on a writer thread, for a change the user just made (a
+/// folder rename).
+pub(crate) fn save_local_soon_of(hwnd: HWND, id: NotebookId) {
+    save_local_of(
         hwnd,
+        id,
         LocalWrite {
             wait: false,
             force: false,
@@ -60,8 +62,16 @@ pub(crate) fn save_local_soon(hwnd: HWND) {
 
 /// Expands or collapses `path`, a folder relative to the open notebook, and remembers it in the
 /// per-PC file. The write happens on a writer thread, and only when the set changed.
+#[cfg(test)]
 pub(crate) fn set_expanded(hwnd: HWND, path: &Path, expanded: bool) {
-    let changed = with_state(hwnd, |state| {
+    if let Some(id) = default_notebook(hwnd) {
+        set_expanded_of(hwnd, id, path, expanded);
+    }
+}
+
+/// `set_expanded` for a folder of the notebook `id`.
+pub(crate) fn set_expanded_of(hwnd: HWND, id: NotebookId, path: &Path, expanded: bool) {
+    let changed = with_notebook(hwnd, id, |state| {
         let was = state.local.is_expanded(path);
         state.local.set_expanded(path, expanded);
         was != expanded
@@ -71,20 +81,14 @@ pub(crate) fn set_expanded(hwnd: HWND, path: &Path, expanded: bool) {
         host(hwnd, |host| {
             host.expansion_revision = host.expansion_revision.wrapping_add(1);
         });
-        save_local(
-            hwnd,
-            LocalWrite {
-                wait: false,
-                force: false,
-            },
-        );
+        save_local_soon_of(hwnd, id);
     }
 }
 
-/// Collapses every folder (the root row stays as it is), or expands all of them, and remembers
-/// it in the per-PC file, the way `set_expanded` does for one folder.
-pub(crate) fn set_all_expanded(hwnd: HWND, expanded: bool) {
-    let changed = with_state(hwnd, |state| {
+/// Collapses every folder of the notebook `id` (its root row stays as it is), or expands all of
+/// them, and remembers it in the per-PC file, the way `set_expanded_of` does for one folder.
+pub(crate) fn set_all_expanded_of(hwnd: HWND, id: NotebookId, expanded: bool) {
+    let changed = with_notebook(hwnd, id, |state| {
         let folders = if expanded {
             state.tree.folder_paths()
         } else {
@@ -97,14 +101,14 @@ pub(crate) fn set_all_expanded(hwnd: HWND, expanded: bool) {
         host(hwnd, |host| {
             host.expansion_revision = host.expansion_revision.wrapping_add(1);
         });
-        save_local_soon(hwnd);
+        save_local_soon_of(hwnd, id);
     }
 }
 
-/// Whether any folder of the open notebook is expanded: what the Collapse all / Expand all
+/// Whether any folder of the notebook `id` is expanded: what its Collapse all / Expand all
 /// button offers.
-pub(crate) fn any_folder_expanded(hwnd: HWND) -> bool {
-    with_state(hwnd, |state| !state.local.expanded.is_empty()).unwrap_or(false)
+pub(crate) fn any_folder_expanded_of(hwnd: HWND, id: NotebookId) -> bool {
+    with_notebook(hwnd, id, |state| !state.local.expanded.is_empty()).unwrap_or(false)
 }
 
 /// Changes whenever a folder is expanded or collapsed.
@@ -114,14 +118,31 @@ pub(crate) fn expansion_revision(hwnd: HWND) -> u64 {
 
 /// Whether the open notebook's root row is expanded (open editors spec §3.3). True while no
 /// notebook state is loaded, so the loading and failed states show under it.
+#[cfg(test)]
 pub(crate) fn root_expanded(hwnd: HWND) -> bool {
-    with_state(hwnd, |state| !state.local.root_collapsed).unwrap_or(true)
+    match default_notebook(hwnd) {
+        Some(id) => root_expanded_of(hwnd, id),
+        None => true,
+    }
+}
+
+/// Whether the notebook `id`'s root row is expanded; true while its state has not loaded.
+pub(crate) fn root_expanded_of(hwnd: HWND, id: NotebookId) -> bool {
+    with_notebook(hwnd, id, |state| !state.local.root_collapsed).unwrap_or(true)
 }
 
 /// Expands or collapses the notebook's root row and remembers it in the per-PC file, the way
 /// `set_expanded` does for a folder.
+#[cfg(test)]
 pub(crate) fn set_root_expanded(hwnd: HWND, expanded: bool) {
-    let changed = with_state(hwnd, |state| {
+    if let Some(id) = default_notebook(hwnd) {
+        set_root_expanded_of(hwnd, id, expanded);
+    }
+}
+
+/// `set_root_expanded` for the notebook `id`.
+pub(crate) fn set_root_expanded_of(hwnd: HWND, id: NotebookId, expanded: bool) {
+    let changed = with_notebook(hwnd, id, |state| {
         let changed = state.local.root_collapsed == expanded;
         state.local.root_collapsed = !expanded;
         changed
@@ -131,14 +152,22 @@ pub(crate) fn set_root_expanded(hwnd: HWND, expanded: bool) {
         host(hwnd, |host| {
             host.expansion_revision = host.expansion_revision.wrapping_add(1);
         });
-        save_local_soon(hwnd);
+        save_local_soon_of(hwnd, id);
     }
 }
 
-/// The open notebook's expanded folders, relative to it.
+/// The default notebook's expanded folders, relative to it.
 #[cfg_attr(not(test), expect(dead_code, reason = "read by the window tests"))]
 pub(crate) fn expanded(hwnd: HWND) -> Vec<PathBuf> {
-    with_state(hwnd, |state| state.local.expanded.clone()).unwrap_or_default()
+    default_notebook(hwnd)
+        .map(|id| expanded_of(hwnd, id))
+        .unwrap_or_default()
+}
+
+/// The notebook `id`'s expanded folders, relative to it.
+#[cfg_attr(not(test), expect(dead_code, reason = "read by the window tests"))]
+pub(crate) fn expanded_of(hwnd: HWND, id: NotebookId) -> Vec<PathBuf> {
+    with_notebook(hwnd, id, |state| state.local.expanded.clone()).unwrap_or_default()
 }
 
 /// A note moved outside FastPad (or was moved/renamed by FastPad itself): an open tab for it
@@ -185,16 +214,25 @@ pub(crate) fn rebind_open_tab(hwnd: HWND, old: &Path, new: PathBuf) -> Result<bo
     }
 }
 
+/// Rescans the default notebook (a shim until every caller names its notebook).
+#[cfg(test)]
 pub(crate) fn request_rescan(hwnd: HWND) {
-    let scanning = host(hwnd, |host| {
-        if host.scanning {
-            host.rescan_requested = true;
+    if let Some(id) = default_notebook(hwnd) {
+        request_rescan_of(hwnd, id);
+    }
+}
+
+/// Rescans the notebook `id` now, or once the scan running for it lands.
+pub(crate) fn request_rescan_of(hwnd: HWND, id: NotebookId) {
+    let scanning = slot(hwnd, id, |slot| {
+        if slot.scanning {
+            slot.rescan_requested = true;
         }
-        host.scanning
+        slot.scanning
     })
     .unwrap_or(true);
-    if !scanning && folder(hwnd).is_some() {
-        start_load(hwnd);
+    if !scanning {
+        start_load_of(hwnd, id);
     }
 }
 
@@ -212,8 +250,12 @@ pub(crate) fn activation_changed(hwnd: HWND, active: bool) {
             .is_some_and(|since| since.elapsed() >= RESCAN_AFTER)
     })
     .unwrap_or(false);
-    if long_enough && notes_mode(hwnd) && !watching(hwnd) {
-        request_rescan(hwnd);
+    if long_enough && notes_mode(hwnd) {
+        for (id, _) in notebooks(hwnd) {
+            if !watching_of(hwnd, id) {
+                request_rescan_of(hwnd, id);
+            }
+        }
     }
 }
 
@@ -231,48 +273,76 @@ pub(crate) fn flush_now(hwnd: HWND) {
 /// Writes pending metadata and the local file on this thread, before the window closes. A
 /// `library.ini` held open by a sync gets a few short retries, since there is no later.
 pub(crate) fn flush_before_close(hwnd: HWND) {
-    for _ in 0..CLOSE_BUSY_RETRIES {
-        if !matches!(try_flush(hwnd, true), Ok(library::Flushed::Busy)) {
-            break;
+    unsafe {
+        KillTimer(hwnd, LIBRARY_WRITE_TIMER_ID);
+    }
+    // Each notebook has its own retries: one held open does not use up another's.
+    for (id, _) in notebooks(hwnd) {
+        for attempt in 0..CLOSE_BUSY_RETRIES {
+            if !matches!(try_flush_of(hwnd, id, true), Ok(library::Flushed::Busy)) {
+                break;
+            }
+            if attempt + 1 < CLOSE_BUSY_RETRIES {
+                std::thread::sleep(Duration::from_millis(100));
+            }
         }
-        std::thread::sleep(Duration::from_millis(100));
     }
     flush_reporting(hwnd, true);
     // FastPad's own saves since the last scan, so the next start doesn't mark them as changed
     // outside FastPad (second brain phase 1 spec §5.5).
-    if with_state(hwnd, LibraryState::sync_cache_from_notes).unwrap_or(false) {
-        save_local(
-            hwnd,
-            LocalWrite {
-                wait: true,
-                force: true,
-            },
-        );
-    }
-}
-
-pub(super) fn flush_reporting(hwnd: HWND, wait: bool) {
-    match try_flush(hwnd, wait) {
-        Ok(library::Flushed::Busy) => {
-            // OneDrive (or another PC's FastPad) has library.ini open: keep the operations and
-            // try again shortly, without a notice for what is usually a brief sync.
-            unsafe {
-                SetTimer(hwnd, LIBRARY_WRITE_TIMER_ID, BUSY_RETRY_MS, None);
-            }
+    for (id, _) in notebooks(hwnd) {
+        if with_notebook(hwnd, id, LibraryState::sync_cache_from_notes).unwrap_or(false) {
+            save_local_of(
+                hwnd,
+                id,
+                LocalWrite {
+                    wait: true,
+                    force: true,
+                },
+            );
         }
-        Ok(_) => {}
-        Err(error) => push_notice(
-            hwnd,
-            format!("FastPad could not save this notebook's pins: {error}"),
-        ),
     }
 }
 
-pub(super) fn try_flush(hwnd: HWND, wait: bool) -> crate::Result<library::Flushed> {
+/// Writes every open notebook's pending metadata. A failure in one is reported for it and does
+/// not stop the others.
+pub(super) fn flush_reporting(hwnd: HWND, wait: bool) {
     unsafe {
         KillTimer(hwnd, LIBRARY_WRITE_TIMER_ID);
     }
-    let result = with_state(hwnd, library::flush).unwrap_or(Ok(library::Flushed::Nothing));
-    save_local(hwnd, LocalWrite { wait, force: false });
+    for (id, _) in notebooks(hwnd) {
+        match try_flush_of(hwnd, id, wait) {
+            Ok(library::Flushed::Busy) => {
+                // OneDrive (or another PC's FastPad) has library.ini open: keep the operations
+                // and try again shortly, without a notice for what is usually a brief sync.
+                unsafe {
+                    SetTimer(hwnd, LIBRARY_WRITE_TIMER_ID, BUSY_RETRY_MS, None);
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                // With several notebooks open, the notice says whose pins were not saved.
+                let folder = notebook_folder(hwnd, id).unwrap_or_default();
+                push_notice(
+                    hwnd,
+                    format!(
+                        "FastPad could not save the pins of the notebook {}: {error}",
+                        folder.display()
+                    ),
+                );
+            }
+        }
+    }
+}
+
+/// Writes the notebook `id`'s pending metadata and its local file. The caller has stopped the
+/// window's write timer.
+pub(super) fn try_flush_of(
+    hwnd: HWND,
+    id: NotebookId,
+    wait: bool,
+) -> crate::Result<library::Flushed> {
+    let result = with_notebook(hwnd, id, library::flush).unwrap_or(Ok(library::Flushed::Nothing));
+    save_local_of(hwnd, id, LocalWrite { wait, force: false });
     result
 }

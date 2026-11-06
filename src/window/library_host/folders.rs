@@ -20,15 +20,6 @@ pub(crate) fn hidden_folder_error(name: &str) -> String {
     format!("FastPad hides folders named \u{201c}{name}\u{201d}. Choose another name.")
 }
 
-/// `folder` (absolute, inside the notebook `root`) relative to it; empty for the root itself.
-pub(crate) fn relative_folder(root: &Path, folder: &Path) -> PathBuf {
-    if library::model::same_path(root, folder) {
-        PathBuf::new()
-    } else {
-        library::record_path(root, folder)
-    }
-}
-
 /// After a folder rename on disk from `old` to `new` (both absolute): the untitled tabs whose
 /// first save was to go at or under `old` go at the same place under `new`.
 pub(crate) fn reroot_save_folders(hwnd: HWND, old: &Path, new: &Path) {
@@ -189,8 +180,16 @@ pub(super) fn delete_folder_question(name: &str, notes: usize, dirty: usize) -> 
 /// Del or Delete… on a folder row (spec §4.3): after a confirm, sends the folder and everything
 /// in it to the Recycle Bin, closes the tabs under it without asking, and drops its notes, their
 /// records flagged deleted. A failure changes nothing in the library.
+#[cfg(test)]
 pub(crate) fn delete_folder(hwnd: HWND, relative: &Path) {
-    let Some(root) = folder(hwnd) else {
+    if let Some(id) = default_notebook(hwnd) {
+        delete_folder_of(hwnd, id, relative);
+    }
+}
+
+/// `delete_folder` for a folder of the notebook `id`.
+pub(crate) fn delete_folder_of(hwnd: HWND, notebook: NotebookId, relative: &Path) {
+    let Some(root) = notebook_folder(hwnd, notebook) else {
         return;
     };
     // Defence in depth: an empty or escaping path would recycle the notebook root or a folder
@@ -199,7 +198,7 @@ pub(crate) fn delete_folder(hwnd: HWND, relative: &Path) {
         return;
     }
     let absolute = root.join(relative);
-    let notes = with_state(hwnd, |state| state.notes_under(relative)).unwrap_or(0);
+    let notes = with_notebook(hwnd, notebook, |state| state.notes_under(relative)).unwrap_or(0);
     let tabs = tabs_under(hwnd, &absolute);
     let dirty = tabs.iter().filter(|(_, _, dirty)| *dirty).count();
     let name = relative.file_name().unwrap_or_default().to_string_lossy();
@@ -210,6 +209,7 @@ pub(crate) fn delete_folder(hwnd: HWND, relative: &Path) {
     // can expand other folders above it and shift the indexes.
     let place = crate::window::notebook_view::row_in_place_of(
         hwnd,
+        notebook,
         &RowKind::Folder(relative.to_path_buf()),
     );
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
@@ -240,11 +240,12 @@ pub(crate) fn delete_folder(hwnd: HWND, relative: &Path) {
     for (id, _, _) in tabs {
         crate::window::main_window::close_document_without_prompt(hwnd, id);
     }
-    with_state(hwnd, |state| {
+    with_notebook(hwnd, notebook, |state| {
         state.remove_folder(relative, library::now_unix())
     });
-    save_local(
+    save_local_of(
         hwnd,
+        notebook,
         LocalWrite {
             wait: false,
             force: false,
@@ -257,7 +258,8 @@ pub(crate) fn delete_folder(hwnd: HWND, relative: &Path) {
         // The row that took the folder's place: the next one after its subtree, or the previous
         // at the end; by index only when that row went too.
         if let Some((index, kind)) = place
-            && !kind.is_some_and(|kind| crate::window::notebook_view::select_row(hwnd, &kind))
+            && !kind
+                .is_some_and(|(id, kind)| crate::window::notebook_view::select_row(hwnd, id, &kind))
         {
             crate::window::notebook_view::select_index(hwnd, index);
         }

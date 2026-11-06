@@ -570,6 +570,11 @@ fn show_view_now(hwnd: HWND, view: SidebarView, focus: bool) {
     if view == SidebarView::Links {
         crate::window::links_view::refresh(hwnd, panel);
     }
+    // The Tags view lists the target notebook, which can differ now that the Notebook view no
+    // longer shows: it catches up as it opens, as Search does.
+    if view == SidebarView::Tags {
+        crate::window::tags_view::target_changed(hwnd, panel);
+    }
     layout_editor_and_find_bar(hwnd);
     invalidate_title_strip(hwnd);
     if focus && view != SidebarView::Hidden && is_shown(panel) {
@@ -637,6 +642,10 @@ fn active_tab_changed_now(hwnd: HWND) {
     if current_view(hwnd) == SidebarView::Links {
         crate::window::links_view::refresh(hwnd, panel);
     }
+    // Search and Tags cover the target notebook, which may be another one now (multi-root
+    // notebooks spec §5.3).
+    crate::window::search_view::target_changed(hwnd);
+    crate::window::tags_view::target_changed(hwnd, panel);
     unsafe { InvalidateRect(panel, std::ptr::null(), 0) };
 }
 
@@ -731,9 +740,7 @@ fn update_tools(hwnd: HWND) {
     let mut client = RECT::default();
     unsafe { GetClientRect(bar, &mut client) };
     let rects = activity_bar::button_rects(client, unsafe { GetDpiForWindow(bar) }.max(96));
-    let name = crate::window::library_host::folder(hwnd)
-        .map(|folder| crate::window::library_host::notebook_name(&folder));
-    let notebook = activity_bar::notebook_label(name.as_deref());
+    let notebook = activity_bar::notebook_label(hwnd);
     for button in ActivityButton::ALL {
         let text = if button == ActivityButton::Notebook {
             notebook.as_str()
@@ -793,12 +800,7 @@ fn accessible_container(panel: HWND) -> (String, u32) {
     match current_view(main) {
         SidebarView::Notebook => {
             // The same "Notebook: <name>" the activity bar's Notebook button reads.
-            let name = super::library_host::folder(main)
-                .map(|folder| super::library_host::notebook_name(&folder));
-            (
-                activity_bar::notebook_label(name.as_deref()),
-                ROLE_SYSTEM_OUTLINE,
-            )
+            (activity_bar::notebook_label(main), ROLE_SYSTEM_OUTLINE)
         }
         SidebarView::Search => ("Search results".to_owned(), ROLE_SYSTEM_LIST),
         SidebarView::Favorites => ("Favorite notebooks".to_owned(), ROLE_SYSTEM_LIST),

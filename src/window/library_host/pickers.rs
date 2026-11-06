@@ -72,12 +72,13 @@ pub(crate) fn picked(hwnd: HWND, kind: PickerKind, choice: PickerChoice) {
         }
         (PickerKind::QuickOpen, PickerChoice::View { path, group }) => {
             // The tab listed, in the group listed: never a new view (split editors spec §7).
-            let id = folder(hwnd).and_then(|folder| {
-                let app = unsafe { app_ptr(hwnd) }?;
-                unsafe { app.as_ref() }
-                    .tabs
-                    .find_stored_path(&folder.join(&path))
-            });
+            let id =
+                crate::window::main_window::quick_open_notebook(hwnd).and_then(|(_, folder)| {
+                    let app = unsafe { app_ptr(hwnd) }?;
+                    unsafe { app.as_ref() }
+                        .tabs
+                        .find_stored_path(&folder.join(&path))
+                });
             match id {
                 Some(id) if crate::window::main_window::focus_view(hwnd, group, id) => {
                     crate::window::main_window::focus_content(hwnd);

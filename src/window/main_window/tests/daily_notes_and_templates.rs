@@ -151,7 +151,11 @@ fn a_bad_notebook_ini_line_is_named_and_its_default_used() {
             .contains(&"notebook.ini line 2: invalid value for daily_format: \"MM-DD\"".to_owned())
     );
     assert_eq!(
-        crate::window::library_host::notebook_settings(window.hwnd).daily_format,
+        crate::window::library_host::notebook_settings_of(
+            window.hwnd,
+            crate::window::library_host::default_notebook(window.hwnd).unwrap()
+        )
+        .daily_format,
         "YYYY-MM-DD"
     );
     app_mut(window.hwnd).notifications.dismiss_all();
@@ -199,7 +203,10 @@ fn a_new_note_from_a_template_fills_it_in_where_the_folder_menu_asked() {
     });
     friday(&window);
 
-    crate::window::library_host::new_note_from_template(window.hwnd, Some("people".into()));
+    crate::window::library_host::new_note_from_template(
+        window.hwnd,
+        in_first(window.hwnd, "people".into()),
+    );
     let shown = app_mut(window.hwnd)
         .library
         .shown_templates
@@ -237,4 +244,34 @@ fn an_empty_templates_folder_says_where_templates_go() {
         notices(window.hwnd),
         ["No templates in .fastpad\\templates. Add .md files there to use them."]
     );
+}
+
+#[test]
+fn todays_daily_note_goes_to_the_target_notebook() {
+    // Break caught: today's note made in the default notebook while a note of another notebook
+    // is in front, or listed in the wrong notebook (multi-root notebooks spec §5.1).
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("daily-target", "a", "b");
+    let hwnd = ab.window.hwnd;
+    friday(&ab.window);
+    super::super::open_path(hwnd, &ab.b.join("b.md")).unwrap();
+
+    execute_command(hwnd, CommandId::NotesToday);
+
+    let today = ab.b.join(r"journal\2026-10-16.md");
+    assert!(today.exists(), "made under B's daily folder");
+    assert!(!ab.a.join("journal").exists(), "nothing made in A");
+    assert_eq!(active_path(hwnd).as_deref(), Some(today.as_path()));
+    assert_eq!(
+        crate::window::library_host::with_notebook(hwnd, ab.b_id, |state| {
+            state.is_listed(std::path::Path::new(r"journal\2026-10-16.md"))
+        }),
+        Some(true)
+    );
+
+    // Edit notebook settings opens the target's notebook.ini.
+    execute_command(hwnd, CommandId::NotesEditNotebookSettings);
+    let ini = crate::library::notebook_ini::notebook_file(&ab.b);
+    assert_eq!(active_path(hwnd).as_deref(), Some(ini.as_path()));
+    assert!(!crate::library::notebook_ini::notebook_file(&ab.a).exists());
 }

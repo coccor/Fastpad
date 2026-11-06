@@ -360,7 +360,8 @@ pub(crate) fn tree_item(
         });
     }
     let mut state = row_state(selected, focused, visible);
-    if matches!(row.kind, RowKind::Folder(_)) {
+    // A root row expands and collapses as a folder row does (multi-root notebooks spec §4.4).
+    if matches!(row.kind, RowKind::Folder(_) | RowKind::Root) {
         state |= if row.expanded {
             STATE_EXPANDED
         } else {

@@ -17,8 +17,7 @@ fn toggling_a_pin_applies_to_the_active_note_and_persists() {
     assert!(
         app_mut(hwnd)
             .library
-            .state
-            .as_ref()
+            .default_state()
             .unwrap()
             .is_pinned(&path)
     );
@@ -56,11 +55,60 @@ fn pinning_a_file_outside_the_open_notebook_is_refused() {
     assert!(
         notices(window.hwnd)
             .iter()
-            .any(|n| n == "Only notes in the open notebook can be pinned.")
+            .any(|n| n == "Only notes in an open notebook can be pinned.")
     );
-    let state = app_mut(window.hwnd).library.state.as_ref().unwrap();
+    let state = app_mut(window.hwnd).library.default_state().unwrap();
     assert!(state.pending.is_empty());
     assert!(state.library.notes.is_empty());
+}
+
+#[test]
+fn a_failed_pin_write_names_the_notebook_it_failed_for() {
+    // Break caught: with two notebooks open, "could not save this notebook's pins" not saying
+    // which notebook's pins were lost (multi-root notebooks spec §3.4, §7).
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("pins-flush-fail", "a", "b");
+    let hwnd = ab.window.hwnd;
+    super::super::open_path(hwnd, &ab.a.join("a.md")).unwrap();
+    execute_command(hwnd, CommandId::NoteTogglePin);
+    super::super::open_path(hwnd, &ab.b.join("b.md")).unwrap();
+    execute_command(hwnd, CommandId::NoteTogglePin);
+    app_mut(hwnd).notifications.dismiss_all();
+    // B's library.ini replaced by bytes FastPad cannot read: its write fails, A's does not.
+    let ini = crate::library::store::library_file(&ab.b);
+    std::fs::create_dir_all(ini.parent().unwrap()).unwrap();
+    std::fs::write(&ini, [0xff, 0xfe, 0x00, 0x01]).unwrap();
+
+    crate::window::library_host::flush_now(hwnd);
+
+    let failures: Vec<String> = notices(hwnd)
+        .into_iter()
+        .filter(|notice| notice.contains("could not save"))
+        .collect();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+        failures[0].contains(&ab.b.display().to_string()),
+        "{failures:?}"
+    );
+}
+
+#[test]
+fn pinning_a_file_outside_every_notebook_does_not_say_loading() {
+    // Break caught: a file outside every open notebook reporting "Loading notebook…" while the
+    // default notebook loads, as if the pin would work once it has.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("pin-outside-loading");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.assume_folder(scratch.folder());
+    let outside = scratch.root.join("outside.md");
+    std::fs::write(&outside, "x").unwrap();
+    super::super::open_path(window.hwnd, &outside).unwrap();
+    execute_command(window.hwnd, CommandId::NoteTogglePin);
+    assert_eq!(
+        notices(window.hwnd),
+        ["Only notes in an open notebook can be pinned."]
+    );
 }
 
 #[test]
@@ -123,7 +171,7 @@ fn renaming_a_note_renames_its_file_and_keeps_its_metadata() {
         app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
         Some(new.as_path())
     );
-    let state = app_mut(window.hwnd).library.state.as_ref().unwrap();
+    let state = app_mut(window.hwnd).library.default_state().unwrap();
     assert!(state.is_pinned(&new));
 }
 
@@ -204,7 +252,7 @@ fn deleting_a_note_asks_then_recycles_it_and_keeps_its_record_hidden() {
     execute_command(window.hwnd, CommandId::NoteDelete);
     assert!(!path.exists());
     assert_eq!(super::super::tab_count(window.hwnd), 0);
-    let state = app_mut(window.hwnd).library.state.as_ref().unwrap();
+    let state = app_mut(window.hwnd).library.default_state().unwrap();
     let record = state.record_for(&path).unwrap();
     assert!(record.deleted);
     assert!(state.local.missing_since(record.id).is_some());
@@ -243,7 +291,7 @@ fn a_note_renamed_outside_fastpad_moves_its_open_tab_and_autosave_resumes() {
     );
     assert_eq!(std::fs::read_to_string(&new).unwrap(), "edited");
     assert!(!old.exists(), "the old name is not re-created");
-    let state = app_mut(window.hwnd).library.state.as_ref().unwrap();
+    let state = app_mut(window.hwnd).library.default_state().unwrap();
     assert!(state.record_for(&new).unwrap().pinned);
 }
 
@@ -467,7 +515,7 @@ fn a_metadata_flush_leaves_the_local_file_alone_and_an_expansion_change_writes_i
 }
 
 #[test]
-fn the_library_step_checks_no_folder_on_the_ui_thread_and_the_worker_falls_back() {
+fn the_library_step_checks_no_folder_on_the_ui_thread_and_a_missing_one_is_skipped() {
     // Break caught: the startup existence check on a remembered folder on an offline mapped
     // drive stalling the UI thread for an SMB timeout.
     let _scintilla = load_native_scintilla();
@@ -489,17 +537,13 @@ fn the_library_step_checks_no_folder_on_the_ui_thread_and_the_worker_falls_back(
     assert_eq!(crate::library::folder_checks(), before, "no stat here");
     assert_eq!(crate::window::library_host::folder(window.hwnd), Some(gone));
 
-    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
-    let fallback =
-        crate::library::normalize_folder(&crate::platform::paths::default_notes_folder().unwrap());
-    assert_eq!(
-        crate::window::library_host::folder(window.hwnd),
-        Some(fallback)
-    );
+    pump_until(window.hwnd, || {
+        crate::window::library_host::folder(window.hwnd).is_none()
+    });
     assert!(
         notices(window.hwnd)
             .iter()
-            .any(|n| n.contains("could not find the notebook")),
+            .any(|n| n.contains("is not available")),
         "{:?}",
         notices(window.hwnd)
     );
@@ -527,7 +571,7 @@ fn a_session_that_ended_with_no_notebook_open_opens_none_at_startup() {
     crate::window::library_host::open_library_step(window.hwnd);
     assert_eq!(crate::library::folder_checks(), before);
     assert_eq!(crate::window::library_host::folder(window.hwnd), None);
-    assert!(!app_mut(window.hwnd).library.scanning, "no worker starts");
+    assert!(!app_mut(window.hwnd).library.scanning(), "no worker starts");
 }
 
 #[test]
@@ -554,7 +598,7 @@ fn turning_notes_mode_off_says_so_when_metadata_cannot_be_written_and_closes_the
 
     assert!(!name_box_visible(window.hwnd));
     assert!(
-        app_mut(window.hwnd).library.state.is_none(),
+        app_mut(window.hwnd).library.default_state().is_none(),
         "the setting applies"
     );
     let expected = format!(
@@ -604,7 +648,7 @@ fn deleting_a_note_with_unsaved_edits_says_they_are_discarded() {
 }
 
 #[test]
-fn opening_another_folder_autosaves_the_old_folders_notes_and_normalizes_the_new_path() {
+fn closing_a_notebook_autosaves_its_notes_and_opening_normalizes_the_new_path() {
     // Break caught: a dirty note in the old folder left unsaved (and no longer autosaved)
     // after a switch, or a folder spelled with a trailing separator becoming a second
     // recent folder.
@@ -623,6 +667,13 @@ fn opening_another_folder_autosaves_the_old_folders_notes_and_normalizes_the_new
     let spelled = std::path::PathBuf::from(format!("{}\\", second.folder().display()));
     crate::window::library_host::open_folder(window.hwnd, &spelled);
 
+    // Opening another notebook leaves the first one alone; closing it saves its dirty notes.
+    assert_eq!(std::fs::read_to_string(&a).unwrap(), "one");
+    let first_id = crate::window::library_host::default_notebook(window.hwnd).unwrap();
+    assert!(crate::window::library_host::close_notebook_of(
+        window.hwnd,
+        first_id
+    ));
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "two");
     assert_eq!(
         crate::window::library_host::folder(window.hwnd),
@@ -631,7 +682,9 @@ fn opening_another_folder_autosaves_the_old_folders_notes_and_normalizes_the_new
     let recent =
         crate::library::local::read_folders(&crate::library::local::folders_file(&first.data()));
     assert_eq!(recent.folders.first(), Some(&second.folder()));
-    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
+    pump_until(window.hwnd, || {
+        app_mut(window.hwnd).library.default_state().is_some()
+    });
 }
 
 #[test]
@@ -661,11 +714,55 @@ fn a_library_file_held_open_by_a_sync_keeps_the_operations_and_retries_without_a
         before,
         "no notice for a brief sync"
     );
-    let state = app_mut(window.hwnd).library.state.as_ref().unwrap();
+    let state = app_mut(window.hwnd).library.default_state().unwrap();
     assert_eq!(state.metadata, crate::library::Metadata::Ready);
     assert_eq!(state.pending.len(), 1);
 
     crate::window::library_host::flush_now(window.hwnd);
     let reloaded = crate::library::load(&scratch.folder(), &scratch.root.join("x.ini"), 0).unwrap();
     assert!(reloaded.is_pinned(&a));
+}
+
+#[test]
+fn move_to_notebook_lists_open_notebooks_first_and_updates_an_open_destination() {
+    // Break caught: the other open notebooks buried under the recent ones, or an open
+    // destination not listing the moved note until its watcher reports it (spec §5.3).
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("move-open-first", "a", "b");
+    let hwnd = ab.window.hwnd;
+    let c = ab.scratch.root.join("C");
+    std::fs::create_dir_all(&c).unwrap();
+    let c_id = open_and_load_folder(&ab.window, &c);
+    assert!(crate::window::library_host::close_notebook_of(hwnd, c_id));
+    // D is a favorite, more recent than C, and not open.
+    let d = ab.scratch.root.join("D");
+    std::fs::create_dir_all(&d).unwrap();
+    let d_id = open_and_load_folder(&ab.window, &d);
+    crate::window::library_host::toggle_notebook_favorite_of(hwnd, d_id);
+    assert!(crate::window::library_host::close_notebook_of(hwnd, d_id));
+
+    let note = ab.a.join("a.md");
+    crate::window::library_host::move_to_notebook(hwnd, &note);
+    let items = with_command_palette(hwnd, |p| p.picker().map(|picker| picker.items.clone()))
+        .flatten()
+        .unwrap();
+    assert_eq!(
+        items,
+        ["B", "D", "C", "Browse…"],
+        "open, then favorites, then recent"
+    );
+
+    crate::window::library_host::picked(
+        hwnd,
+        crate::window::command_palette::PickerKind::MoveToNotebook,
+        crate::window::command_palette::PickerChoice::Item(0),
+    );
+    assert!(ab.b.join("a.md").exists());
+    let listed = |id| {
+        crate::window::library_host::with_notebook(hwnd, id, |state| {
+            state.is_listed(std::path::Path::new("a.md"))
+        })
+    };
+    assert_eq!(listed(ab.b_id), Some(true), "listed in B without a rescan");
+    assert_eq!(listed(ab.a_id), Some(false));
 }

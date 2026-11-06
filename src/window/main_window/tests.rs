@@ -59,6 +59,7 @@ mod new_notebook;
 mod note_attachments;
 mod note_operations;
 mod notebook_tree;
+mod notebook_tree_roots;
 mod open_editors_and_folder_commands;
 mod preview_tabs_and_folders;
 mod quick_capture;
@@ -70,6 +71,7 @@ mod session_restore;
 mod settings_shortcuts_page;
 mod sidebar_layout;
 mod split_groups;
+mod startup_notebooks;
 mod tab_drag;
 mod tree_and_open_editors_drag;
 mod window_basics;
@@ -345,6 +347,75 @@ pub(super) fn pump_until(hwnd: HWND, done: impl Fn() -> bool) {
     }
 }
 
+/// Opens `scratch`'s notebook with `open_folder` and waits until it has loaded and is watched.
+pub(super) fn open_and_load(
+    window: &ProductionWindow,
+    scratch: &LibraryScratch,
+) -> crate::window::library_host::NotebookId {
+    open_and_load_folder(window, &scratch.folder())
+}
+
+/// Opens the notebook `folder` with `open_folder` and waits until it has loaded and is watched.
+pub(super) fn open_and_load_folder(
+    window: &ProductionWindow,
+    folder: &std::path::Path,
+) -> crate::window::library_host::NotebookId {
+    crate::window::library_host::open_folder(window.hwnd, folder);
+    let id = crate::window::library_host::notebooks(window.hwnd)
+        .into_iter()
+        .find(|(_, open)| crate::library::model::same_path(open, folder))
+        .map(|(id, _)| id)
+        .expect("the notebook was added");
+    pump_until(window.hwnd, || {
+        crate::window::library_host::with_notebook(window.hwnd, id, |_| ()).is_some()
+            && crate::window::library_host::watching_of(window.hwnd, id)
+    });
+    id
+}
+
+/// Two open notebooks with the sidebar shown: A (folder "A", the default, opened first) holding
+/// `a.md`, and B (folder "B") holding `b.md`. Nothing is open in a tab and no row is selected.
+pub(super) struct NotebooksAB {
+    pub(super) scratch: LibraryScratch,
+    pub(super) window: ProductionWindow,
+    /// Kept so the window keeps its test editor.
+    pub(super) _editor: crate::editor::Editor,
+    pub(super) a: std::path::PathBuf,
+    pub(super) b: std::path::PathBuf,
+    pub(super) a_id: crate::window::library_host::NotebookId,
+    pub(super) b_id: crate::window::library_host::NotebookId,
+}
+
+pub(super) fn notebooks_a_and_b(label: &str, a_note: &str, b_note: &str) -> NotebooksAB {
+    let scratch = LibraryScratch::new(label);
+    let (a, b) = (scratch.root.join("A"), scratch.root.join("B"));
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    std::fs::write(a.join("a.md"), a_note).unwrap();
+    std::fs::write(b.join("b.md"), b_note).unwrap();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    ensure_sidebar(window.hwnd);
+    let a_id = open_and_load_folder(&window, &a);
+    let b_id = open_and_load_folder(&window, &b);
+    assert_eq!(
+        crate::window::library_host::default_notebook(window.hwnd),
+        Some(a_id),
+        "A is the default"
+    );
+    app_mut(window.hwnd).notifications.dismiss_all();
+    NotebooksAB {
+        scratch,
+        window,
+        _editor: editor,
+        a,
+        b,
+        a_id,
+        b_id,
+    }
+}
+
 pub(super) fn tab_paths(hwnd: HWND) -> Vec<Option<std::path::PathBuf>> {
     app_mut(hwnd)
         .tabs
@@ -399,7 +470,7 @@ pub(super) fn open_note(
 }
 
 pub(super) fn library(hwnd: HWND) -> &'static crate::library::model::Library {
-    &app_mut(hwnd).library.state.as_ref().unwrap().library
+    &app_mut(hwnd).library.default_state().unwrap().library
 }
 
 /// Task 6 creates the sidebar with the window when notes mode is on; this makes sure of it.
@@ -413,17 +484,83 @@ pub(super) fn notebook_view<'a>(hwnd: HWND) -> &'a mut NotebookView {
     &mut app_mut(hwnd).sidebar.as_mut().unwrap().notebook
 }
 
-pub(super) fn row_of(hwnd: HWND, kind: &RowKind) -> usize {
-    crate::library::tree::row_index(&notebook_view(hwnd).rows, kind)
-        .unwrap_or_else(|| panic!("{kind:?} is not in {:?}", notebook_view(hwnd).rows))
+/// The first open notebook in sidebar order: the one the single-notebook tests open.
+pub(super) fn first_id(hwnd: HWND) -> crate::window::library_host::NotebookId {
+    crate::window::library_host::notebooks(hwnd)
+        .first()
+        .map(|(id, _)| *id)
+        .expect("a notebook is open")
 }
 
-pub(super) fn selected_kind(hwnd: HWND) -> Option<RowKind> {
+/// `folder` (relative) of the first open notebook, as a new item's place.
+pub(super) fn in_first(
+    hwnd: HWND,
+    folder: std::path::PathBuf,
+) -> Option<(crate::window::library_host::NotebookId, std::path::PathBuf)> {
+    Some((first_id(hwnd), folder))
+}
+
+/// The index of the row of the notebook `id` showing `kind`.
+pub(super) fn row_in(
+    hwnd: HWND,
+    id: crate::window::library_host::NotebookId,
+    kind: &RowKind,
+) -> usize {
+    crate::window::notebook_view::view_row_index(&notebook_view(hwnd).rows, id, kind)
+        .unwrap_or_else(|| {
+            panic!(
+                "{kind:?} of {id:?} is not in {:?}",
+                notebook_view(hwnd).rows
+            )
+        })
+}
+
+/// `row_in` for the first open notebook.
+pub(super) fn row_of(hwnd: HWND, kind: &RowKind) -> usize {
+    row_in(hwnd, first_id(hwnd), kind)
+}
+
+/// The view's rows as their notebooks and kinds.
+pub(super) fn view_rows(hwnd: HWND) -> Vec<(crate::window::library_host::NotebookId, RowKind)> {
+    notebook_view(hwnd)
+        .rows
+        .iter()
+        .map(|row| (row.notebook, row.kind.clone()))
+        .collect()
+}
+
+/// The selected row's notebook and kind.
+pub(super) fn selected_row_of(
+    hwnd: HWND,
+) -> Option<(crate::window::library_host::NotebookId, RowKind)> {
     let view = notebook_view(hwnd);
     view.list
         .selected
         .and_then(|index| view.rows.get(index))
-        .map(|row| row.kind.clone())
+        .map(|row| (row.notebook, row.kind.clone()))
+}
+
+/// The first notebook's root row shows only the placeholder `placeholder` under it.
+pub(super) fn shows_placeholder(
+    hwnd: HWND,
+    placeholder: crate::library::tree::Placeholder,
+) -> bool {
+    let id = first_id(hwnd);
+    let rows: Vec<RowKind> = view_rows(hwnd)
+        .into_iter()
+        .filter(|(notebook, _)| *notebook == id)
+        .map(|(_, kind)| kind)
+        .collect();
+    rows == [RowKind::Root, RowKind::Placeholder(placeholder)]
+}
+
+/// The first notebook is listed with no notes: "No notes yet" under its root row.
+pub(super) fn shows_empty(hwnd: HWND) -> bool {
+    shows_placeholder(hwnd, crate::library::tree::Placeholder::Empty)
+}
+
+pub(super) fn selected_kind(hwnd: HWND) -> Option<RowKind> {
+    selected_row_of(hwnd).map(|(_, kind)| kind)
 }
 
 pub(super) fn select_row(hwnd: HWND, kind: &RowKind) {
@@ -525,7 +662,7 @@ pub(super) fn row_lparam(hwnd: HWND, kind: &RowKind) -> super::LPARAM {
 
 pub(super) fn rescan_and_wait(hwnd: HWND) {
     crate::window::library_host::request_rescan(hwnd);
-    pump_until(hwnd, || !app_mut(hwnd).library.scanning);
+    pump_until(hwnd, || !app_mut(hwnd).library.scanning());
 }
 
 pub(super) fn sidebar_panel(hwnd: HWND) -> HWND {

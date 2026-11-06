@@ -32,11 +32,16 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 /// Whether row `index` is the one a started drag carries (tree drag spec §3.2): both sides
 /// absent (no drag, and `index` past the rows the list actually has, such as the truncated row)
 /// must not read as a match. Only a dragged row matches: a tab or files are not tree rows.
-pub(super) fn is_dragged_row(dragged: Option<&DragSource>, rows: &[TreeRow], index: usize) -> bool {
+pub(super) fn is_dragged_row<R: AsRef<TreeRow>>(
+    dragged: Option<&DragSource>,
+    rows: &[R],
+    index: usize,
+) -> bool {
     let Some(DragSource::Row(dragged)) = dragged else {
         return false;
     };
-    rows.get(index).is_some_and(|row| &row.kind == dragged)
+    rows.get(index)
+        .is_some_and(|row| &row.as_ref().kind == dragged)
 }
 
 /// Draws `item`'s icon from `set` at `px` square, centred in `rect` and clipped to it (a deep row
@@ -113,6 +118,21 @@ pub(super) fn draw_tree_row(
         return;
     };
     let parts = row_parts(rect, row.depth, dpi);
+    // A placeholder is its text alone, where a row's chevron would start (multi-root notebooks
+    // spec §4.3). A root row draws itself (`draw_root_row`).
+    match &row.kind {
+        RowKind::Placeholder(placeholder) => {
+            let text = RECT {
+                left: parts.chevron.left,
+                ..rect
+            };
+            let words = placeholder_text(*placeholder);
+            unsafe { draw_text(dc, words, text, fonts.italic, muted, LINE) };
+            return;
+        }
+        RowKind::Root => return,
+        _ => {}
+    }
     // `px` is the full icon box, not the box clamped by `row_parts` to fit a narrow panel: a
     // clipped box draws part of the icon instead of resampling it smaller and caching a bitmap
     // per clipped width.
@@ -149,6 +169,7 @@ pub(super) fn draw_tree_row(
                 draw_icon(item);
             }
         }
+        RowKind::Root | RowKind::Placeholder(_) => {}
     }
     if matches!(row.kind, RowKind::Note(_)) {
         // Pinned is a filled glyph, never color alone (spec §10). Segoe's PinFill is only the
@@ -241,7 +262,7 @@ pub(super) fn drag_item(kind: &RowKind) -> Option<TreeItem> {
     match kind {
         RowKind::Folder(_) => Some(TreeItem::Folder { expanded: false }),
         RowKind::Note(path) => Some(TreeItem::Note(note_kind(path))),
-        RowKind::Draft => None,
+        RowKind::Draft | RowKind::Root | RowKind::Placeholder(_) => None,
     }
 }
 
@@ -531,7 +552,13 @@ impl NotebookView {
         let (item, name) = match &source {
             DragSource::Row(kind) => {
                 let item = drag_item(kind)?;
-                let name = self.rows.iter().find(|row| &row.kind == kind)?.name.clone();
+                let notebook = self.drag_notebook;
+                let name = self
+                    .rows
+                    .iter()
+                    .find(|row| Some(row.notebook) == notebook && &row.kind == kind)?
+                    .name
+                    .clone();
                 (item, name)
             }
             DragSource::Tab { path, name, .. } => (
@@ -592,7 +619,8 @@ impl NotebookView {
         }
     }
 
-    /// The hovered row's tip: a truncated note name in full, or a recent notebook's path.
+    /// The hovered row's tip: a truncated note name in full, or a recent notebook's path. A root
+    /// row's tips are its own tools (`tooltip_tools`).
     pub(super) fn row_tip(&mut self, fonts: UiFonts) -> (RECT, String) {
         let none = (RECT::default(), String::new());
         let Some(index) = self.list.hover else {
@@ -611,37 +639,43 @@ impl NotebookView {
                 let Some(row) = self.rows.get(index).cloned() else {
                     return none;
                 };
+                if matches!(row.kind, RowKind::Root | RowKind::Placeholder(_)) {
+                    return none;
+                }
                 let parts = row_parts(rect, row.depth, self.dpi());
                 let font = fonts.text;
                 if self.text_width(&row.name, font) > parts.name.right - parts.name.left {
-                    (parts.name, row.name)
+                    (parts.name, row.row.name)
                 } else {
                     none
                 }
             }
-            Mode::Loading | Mode::Empty | Mode::Failed => none,
         }
+    }
+
+    /// The root row the pointer is on, with its index and parts.
+    fn hovered_root(&self) -> Option<(usize, &RootInfo, notebook_layout::RootParts)> {
+        let index = self.list.hover?;
+        let row = self
+            .rows
+            .get(index)
+            .filter(|row| row.kind == RowKind::Root)?;
+        let rect = self.row_rect(self.list_rect(self.client()), index)?;
+        let root = self.root(row.notebook)?;
+        Some((index, root, notebook_layout::root_parts(rect, self.dpi())))
     }
 
     /// Every tool's ID, rectangle and text, for `apply_tooltips`. `fonts` measures whether the
     /// hovered name is cut off. A tool with an empty text is removed, so a hidden button shows
-    /// no tip.
+    /// no tip. The root row tools are the hovered root row's: its folder on its name, "Default
+    /// notebook" on the default's marker, and its buttons.
     pub(super) fn tooltip_tools(&mut self, fonts: UiFonts) -> Vec<(usize, RECT, String)> {
         let area = self.client();
         let dpi = self.dpi();
         let layout = self.layout(area, dpi);
-        let parts = notebook_layout::root_parts(layout.root, dpi);
-        let title = self
-            .root
-            .as_ref()
-            .map(|root| root.display().to_string())
-            .unwrap_or_default();
-        let favorite = if self.favorite {
-            "Remove from favorites"
-        } else {
-            "Add to favorites"
-        };
-        let buttons_shown = self.mode != Mode::NoNotebook;
+        let hovered = self
+            .hovered_root()
+            .map(|(_, root, parts)| (root.clone(), parts));
         // An Open Editors row shows its path; a tree row its cut-off name.
         let editor_tip = self.editors.list.hover.and_then(|index| {
             let rect = self.editors_row_rect(layout.editors_list, index)?;
@@ -652,19 +686,52 @@ impl NotebookView {
             Some(tip) => tip,
             None => self.row_tip(fonts),
         };
-        let mut tools = vec![(TOOL_TITLE, parts.name, title)];
-        for (button, rect) in parts.buttons {
-            let (id, text) = match button {
-                HeaderButton::Favorite => (TOOL_FAVORITE, favorite),
-                HeaderButton::NewNote => (TOOL_NEW, "New note"),
-                HeaderButton::NewFolder => (TOOL_NEW_FOLDER, "New folder"),
-                HeaderButton::Refresh => (TOOL_REFRESH, "Refresh"),
-                HeaderButton::ToggleFolders => (TOOL_TOGGLE_FOLDERS, self.toggle_folders_name()),
-                HeaderButton::More => (TOOL_MORE, "More actions"),
+        let mut tools = Vec::new();
+        let (title, marker) = match &hovered {
+            Some((root, parts)) => {
+                let label = root_label_text(&root.label);
+                let width = self.text_width(&label, fonts.bold);
+                let marker = root
+                    .label
+                    .marker
+                    .map(|tip| (marker_rect(parts.name, width, dpi), tip.to_owned()));
+                // The name's tip ends where the marker's begins, so the marker shows its own.
+                let title = RECT {
+                    right: marker
+                        .as_ref()
+                        .map_or(parts.name.right, |(rect, _)| rect.left),
+                    ..parts.name
+                };
+                (
+                    (title, root.folder.display().to_string()),
+                    marker.unwrap_or_default(),
+                )
+            }
+            None => Default::default(),
+        };
+        tools.push((TOOL_TITLE, title.0, title.1));
+        tools.push((TOOL_DEFAULT, marker.0, marker.1));
+        let buttons = hovered.as_ref().map(|(root, parts)| (root, parts.buttons));
+        for button in [
+            HeaderButton::NewNote,
+            HeaderButton::NewFolder,
+            HeaderButton::Refresh,
+            HeaderButton::ToggleFolders,
+            HeaderButton::More,
+        ] {
+            let id = match button {
+                HeaderButton::NewNote => TOOL_NEW,
+                HeaderButton::NewFolder => TOOL_NEW_FOLDER,
+                HeaderButton::Refresh => TOOL_REFRESH,
+                HeaderButton::ToggleFolders => TOOL_TOGGLE_FOLDERS,
+                HeaderButton::More => TOOL_MORE,
             };
-            // A button a narrow panel left out has an empty rectangle and no tip.
-            let shown = buttons_shown && rect.right > rect.left;
-            let text = if shown { text } else { "" };
+            let shown = buttons.as_ref().and_then(|(root, buttons)| {
+                let rect = buttons.iter().find(|(shown, _)| *shown == button)?.1;
+                // A button a narrow panel left out has an empty rectangle and no tip.
+                (rect.right > rect.left).then(|| (rect, button_name(button, root)))
+            });
+            let (rect, text) = shown.unwrap_or((RECT::default(), ""));
             tools.push((id, rect, text.to_owned()));
         }
         tools.push((TOOL_ROW, row_rect, row_text));
@@ -692,21 +759,6 @@ impl NotebookView {
         self.paint_sections(paint, sections);
         let layout = state_layout(sections.body, dpi);
         match self.mode {
-            // The states under the root show only while it is expanded; without a notebook there
-            // is no root to collapse.
-            Mode::Loading | Mode::Empty | Mode::Failed | Mode::Tree if !self.root_expanded => {}
-            Mode::Loading => {
-                unsafe {
-                    draw_text(
-                        dc,
-                        "Loading…",
-                        layout.message,
-                        fonts.text,
-                        palette.muted_foreground,
-                        LINE,
-                    )
-                };
-            }
             Mode::NoNotebook => {
                 let message = "Open a notebook to see its notes.";
                 unsafe {
@@ -762,62 +814,24 @@ impl NotebookView {
                     },
                 );
             }
-            Mode::Empty => {
-                let message = format!("No notes in {} yet.", self.name);
-                unsafe {
-                    draw_text(
-                        dc,
-                        &message,
-                        layout.message,
-                        fonts.text,
-                        palette.editor_foreground,
-                        DT_WORDBREAK | DT_NOPREFIX,
-                    )
-                };
-                self.paint_button(
-                    dc,
-                    layout.button,
-                    "New note",
-                    Hit::StateButton,
-                    palette,
-                    fonts,
-                );
-            }
-            Mode::Failed => {
-                unsafe {
-                    draw_text(
-                        dc,
-                        LOAD_FAILED,
-                        layout.message,
-                        fonts.text,
-                        palette.editor_foreground,
-                        DT_WORDBREAK | DT_NOPREFIX,
-                    )
-                };
-                self.paint_button(dc, layout.button, "Retry", Hit::StateButton, palette, fonts);
-                self.paint_button(
-                    dc,
-                    layout.second,
-                    "Open notebook…",
-                    Hit::SecondButton,
-                    palette,
-                    fonts,
-                );
-            }
             Mode::Tree => {
                 // `row_list::paint` draws the rows in view and the scroll thumb.
                 let list = self.list_rect(area);
                 self.inline.set_colors(*palette);
+                let highlight = self.drop_highlight();
                 let rows = &self.rows;
+                let roots = &self.roots;
                 let images = &mut self.images;
                 let (icon_set, light_theme) = (paint.icon_set, paint.light_theme);
                 let hover_pin = self.hover_pin;
+                let hot_button = match self.hover {
+                    Some(Hit::Header(id, button)) => Some((id, button)),
+                    _ => None,
+                };
                 let icons = &paint.icons;
                 let drag = self.drag.as_ref().filter(|drag| drag.started);
                 let dragged = drag.map(|drag| drag.source.clone());
-                let highlight = drag
-                    .and_then(|drag| drag.target.as_deref())
-                    .and_then(|folder| tree_drag::highlight(rows, folder));
+                let drag_notebook = self.drag_notebook;
                 let band = highlight.and_then(|highlight| band_rect(list, &self.list, highlight));
                 if let Some(band) = band {
                     paint_band(dc, band, palette, dpi, true);
@@ -838,11 +852,36 @@ impl NotebookView {
                     &|index| under_row(highlight, index, palette, paint.background),
                     dpi,
                     &mut |dc, index, rect, look| {
+                        if let Some(row) = rows.get(index).filter(|row| row.kind == RowKind::Root)
+                            && let Some(root) = roots.iter().find(|root| root.id == row.notebook)
+                        {
+                            let hot = hot_button
+                                .filter(|(id, _)| *id == root.id)
+                                .map(|(_, button)| button);
+                            // The buttons show while the row is hovered or selected (multi-root
+                            // notebooks spec §4.2).
+                            let buttons = look.hover || look.selected;
+                            draw_root_row(
+                                dc,
+                                RootRow {
+                                    root,
+                                    expanded: row.expanded,
+                                    buttons,
+                                    hot,
+                                },
+                                rect,
+                                look,
+                                palette,
+                                fonts,
+                                dpi,
+                            );
+                            return;
+                        }
                         let editing =
                             edited.and_then(|(edited, icon)| (edited == index).then_some(icon));
                         draw_tree_row(
                             dc,
-                            rows.get(index),
+                            rows.get(index).map(|row| &row.row),
                             rect,
                             look,
                             palette,
@@ -854,7 +893,10 @@ impl NotebookView {
                             images,
                             icon_set,
                             light_theme,
-                            is_dragged_row(dragged.as_ref(), rows, index),
+                            is_dragged_row(dragged.as_ref(), rows, index)
+                                && rows
+                                    .get(index)
+                                    .is_some_and(|row| Some(row.notebook) == drag_notebook),
                         );
                     },
                 );
@@ -863,6 +905,23 @@ impl NotebookView {
                 }
                 if let Some(layout) = self.inline_layout_in(area, dpi) {
                     self.paint_inline(dc, layout, list, palette, fonts, dpi);
+                }
+                // Why the pointer's place refuses the dragged row: a strip along the list's
+                // bottom edge, clear of the pointer's label.
+                if let Some(hint) = self.drag_hint() {
+                    let height = self.list.row_height.min(height(list));
+                    let strip = RECT {
+                        top: list.bottom - height,
+                        ..list
+                    };
+                    let text = RECT {
+                        left: strip.left + scale(12, dpi),
+                        ..strip
+                    };
+                    unsafe {
+                        fill(dc, strip, palette.hover_background);
+                        draw_text(dc, hint, text, fonts.text, palette.muted_foreground, LINE);
+                    }
                 }
             }
         }
@@ -945,58 +1004,8 @@ impl NotebookView {
                 None => {}
             },
         );
-        // The root row: chevron, name, and its buttons (not without a notebook).
-        let parts = notebook_layout::root_parts(layout.root, dpi);
-        if self.mode == Mode::NoNotebook {
-            bold(
-                "No notebook",
-                RECT {
-                    left: parts.chevron.right,
-                    ..layout.root
-                },
-                palette.muted_foreground,
-            );
-        } else {
-            let glyph = if self.root_expanded {
-                GLYPH_CHEVRON_DOWN
-            } else {
-                GLYPH_CHEVRON_RIGHT
-            };
-            unsafe {
-                draw_text(
-                    dc,
-                    glyph,
-                    parts.chevron,
-                    fonts.glyph,
-                    palette.muted_foreground,
-                    CENTERED,
-                )
-            };
-            bold(&self.name, parts.name, palette.muted_foreground);
-            for (button, rect) in parts.shown() {
-                let hot = self.hover == Some(Hit::Header(button));
-                if hot {
-                    unsafe { fill(dc, rect, palette.hover_background) };
-                }
-                let glyph = match button {
-                    HeaderButton::Favorite if self.favorite => GLYPH_STAR_FILLED,
-                    HeaderButton::Favorite => GLYPH_STAR,
-                    HeaderButton::NewNote => GLYPH_ADD,
-                    HeaderButton::NewFolder => GLYPH_NEW_FOLDER,
-                    HeaderButton::Refresh => GLYPH_REFRESH,
-                    HeaderButton::ToggleFolders if self.folders_open => GLYPH_COLLAPSE_ALL,
-                    HeaderButton::ToggleFolders => GLYPH_EXPAND_ALL,
-                    HeaderButton::More => GLYPH_MORE,
-                };
-                let color = if hot {
-                    palette.hover_foreground
-                } else {
-                    palette.muted_foreground
-                };
-                unsafe { draw_text(dc, glyph, rect, fonts.glyph, color, CENTERED) };
-            }
-        }
-        // The keyboard selection on a header or tab row; the tree shows its own.
+        // The keyboard selection on the Open Editors header or a tab row; the tree shows its
+        // own.
         if paint.focused {
             let outlined = match self.cursor {
                 Cursor::EditorsHeader => Some(layout.editors_header),
@@ -1009,8 +1018,7 @@ impl NotebookView {
                             ..row
                         })
                 }
-                Cursor::Root if self.mode != Mode::NoNotebook => Some(layout.root),
-                Cursor::Root | Cursor::Editor(_) | Cursor::Tree => None,
+                Cursor::Editor(_) | Cursor::Tree => None,
             };
             if let Some(rect) = outlined {
                 unsafe { paint_focus_ring(dc, rect, palette, dpi) };
@@ -1044,4 +1052,149 @@ impl NotebookView {
             )
         };
     }
+}
+
+/// A root row button's name: its tooltip and its accessible name.
+pub(super) fn button_name(button: HeaderButton, root: &RootInfo) -> &'static str {
+    match button {
+        HeaderButton::NewNote => "New note",
+        HeaderButton::NewFolder => "New folder",
+        HeaderButton::Refresh => "Refresh",
+        HeaderButton::ToggleFolders if root.folders_open => "Collapse all",
+        HeaderButton::ToggleFolders => "Expand all",
+        HeaderButton::More => "More actions",
+    }
+}
+
+/// A root row's label as painted: the notebook's name, then the parent hint two spaces after
+/// it when two open notebooks share the name.
+pub(crate) fn root_label_text(label: &RootLabel) -> String {
+    match &label.hint {
+        Some(hint) => format!("{}  {hint}", label.name),
+        None => label.name.clone(),
+    }
+}
+
+/// The default marker's box: just after a label `width` pixels wide in `name`. Its box is
+/// reserved first, so a long label is cut off before it rather than hiding it.
+pub(crate) fn marker_rect(name: RECT, width: i32, dpi: u32) -> RECT {
+    let (gap, glyph) = (scale(GAP, dpi), scale(GLYPH_BOX, dpi));
+    let room = (name.right - name.left - gap - glyph).max(0);
+    let left = (name.left + width.clamp(0, room) + gap).min(name.right);
+    RECT {
+        left,
+        right: (left + glyph).min(name.right),
+        ..name
+    }
+}
+
+/// Where a root row's label is drawn: its name room, less the marker's box when it has one.
+fn label_rect(name: RECT, marker: Option<RECT>, dpi: u32) -> RECT {
+    match marker {
+        Some(marker) => RECT {
+            right: (marker.left - scale(GAP, dpi)).max(name.left),
+            ..name
+        },
+        None => name,
+    }
+}
+
+/// What a root row paints besides its look.
+pub(super) struct RootRow<'a> {
+    pub(super) root: &'a RootInfo,
+    pub(super) expanded: bool,
+    /// Its buttons show: the row is hovered or selected.
+    pub(super) buttons: bool,
+    /// The button under the pointer.
+    pub(super) hot: Option<HeaderButton>,
+}
+
+/// A notebook's root row (multi-root notebooks spec §4.2): its chevron, its name in the bold
+/// muted style of a section header, a parent hint on a name clash, the default marker, and,
+/// while hovered or selected, its buttons.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one row's paint inputs, called from one closure"
+)]
+pub(super) fn draw_root_row(
+    dc: HDC,
+    root_row: RootRow<'_>,
+    rect: RECT,
+    look: RowLook,
+    palette: &Palette,
+    fonts: UiFonts,
+    dpi: u32,
+) {
+    let RootRow {
+        root,
+        expanded,
+        buttons,
+        hot,
+    } = root_row;
+    let color = if look.selected && look.focused {
+        row_foreground(look, palette)
+    } else {
+        palette.muted_foreground
+    };
+    let parts = notebook_layout::root_parts(rect, dpi);
+    let chevron = if expanded {
+        GLYPH_CHEVRON_DOWN
+    } else {
+        GLYPH_CHEVRON_RIGHT
+    };
+    unsafe { draw_text(dc, chevron, parts.chevron, fonts.glyph, color, CENTERED) };
+    let label = root_label_text(&root.label);
+    let marker = root.label.marker.map(|_| {
+        let width = text_extent(dc, &label, fonts.bold);
+        marker_rect(parts.name, width, dpi)
+    });
+    unsafe {
+        draw_text(
+            dc,
+            &label,
+            label_rect(parts.name, marker, dpi),
+            fonts.bold,
+            color,
+            LINE,
+        )
+    };
+    if let Some(marker) = marker
+        && marker.right > marker.left
+    {
+        unsafe { draw_text(dc, GLYPH_DEFAULT, marker, fonts.glyph, color, CENTERED) };
+    }
+    if !buttons {
+        return;
+    }
+    for (button, rect) in parts.shown() {
+        let hot = hot == Some(button);
+        if hot {
+            unsafe { fill(dc, rect, palette.hover_background) };
+        }
+        let glyph = match button {
+            HeaderButton::NewNote => GLYPH_ADD,
+            HeaderButton::NewFolder => GLYPH_NEW_FOLDER,
+            HeaderButton::Refresh => GLYPH_REFRESH,
+            HeaderButton::ToggleFolders if root.folders_open => GLYPH_COLLAPSE_ALL,
+            HeaderButton::ToggleFolders => GLYPH_EXPAND_ALL,
+            HeaderButton::More => GLYPH_MORE,
+        };
+        let glyph_color = if hot { palette.hover_foreground } else { color };
+        unsafe { draw_text(dc, glyph, rect, fonts.glyph, glyph_color, CENTERED) };
+    }
+}
+
+/// How wide `text` is in `font` on `dc`.
+pub(crate) fn text_extent(dc: HDC, text: &str, font: HFONT) -> i32 {
+    let wide = text.encode_utf16().collect::<Vec<_>>();
+    if wide.is_empty() {
+        return 0;
+    }
+    let mut size = SIZE::default();
+    unsafe {
+        let previous = SelectObject(dc, font);
+        GetTextExtentPoint32W(dc, wide.as_ptr(), wide.len() as i32, &mut size);
+        SelectObject(dc, previous);
+    }
+    size.cx
 }

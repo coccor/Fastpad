@@ -7,8 +7,8 @@ use super::library_host;
 use super::main_window::{TabMark, app_ptr, push_notice};
 use super::tree_copy::{self, Outcome, Planned, Refusal};
 use crate::document::DocumentId;
+use crate::library;
 use crate::library::tree::{self, RowKind};
-use crate::library::{self, model::same_path};
 use crate::platform::files::{self, Copied};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -216,13 +216,27 @@ fn kept_by_identity(source: &Path, destination: &Path, name: &str) -> Option<Str
 /// plans, asks about each clash, recycles each answered replace, and queues the copies.
 /// `dirty_tab` names the tab whose saved version is copied: its notice comes once that copy
 /// worked.
+#[cfg(test)]
 pub(crate) fn copy_into(
     hwnd: HWND,
     sources: Vec<PathBuf>,
     folder: &Path,
     dirty_tab: Option<String>,
 ) {
-    let Some(root) = library_host::folder(hwnd) else {
+    if let Some(id) = library_host::default_notebook(hwnd) {
+        copy_into_of(hwnd, id, sources, folder, dirty_tab);
+    }
+}
+
+/// `copy_into` for the notebook `id`: `folder` is a folder of that notebook.
+pub(crate) fn copy_into_of(
+    hwnd: HWND,
+    id: library_host::NotebookId,
+    sources: Vec<PathBuf>,
+    folder: &Path,
+    dirty_tab: Option<String>,
+) {
+    let Some(root) = library_host::notebook_folder(hwnd, id) else {
         return;
     };
     let planned = tree_copy::plan(&sources, &root, folder, &|path: &Path| path.exists());
@@ -290,7 +304,21 @@ pub(crate) fn copy_into(
 
 /// An Open Editors row dropped on `folder`: its file on disk is copied. A dirty tab's saved
 /// version goes, and the notice says so.
+#[cfg(test)]
 pub(crate) fn copy_tab_into(hwnd: HWND, id: DocumentId, path: &Path, folder: &Path) {
+    if let Some(dest) = library_host::default_notebook(hwnd) {
+        copy_tab_into_of(hwnd, dest, id, path, folder);
+    }
+}
+
+/// `copy_tab_into` for the notebook `dest`.
+pub(crate) fn copy_tab_into_of(
+    hwnd: HWND,
+    dest: library_host::NotebookId,
+    id: DocumentId,
+    path: &Path,
+    folder: &Path,
+) {
     let dirty = unsafe { app_ptr(hwnd) }
         .and_then(|app| {
             unsafe { app.as_ref() }
@@ -300,20 +328,25 @@ pub(crate) fn copy_tab_into(hwnd: HWND, id: DocumentId, path: &Path, folder: &Pa
         })
         .unwrap_or(false);
     let dirty_tab = dirty.then(|| tree_copy::item_name(path));
-    copy_into(hwnd, vec![path.to_path_buf()], folder, dirty_tab);
+    copy_into_of(hwnd, dest, vec![path.to_path_buf()], folder, dirty_tab);
 }
 
 /// `WM_FASTPAD_PANEL_DROPPED`'s payload: what an Explorer drop on the panel does.
 pub(crate) struct PanelDrop {
     paths: Vec<PathBuf>,
-    /// `None` opens the paths, as a drop on the window does.
-    folder: Option<PathBuf>,
+    /// The notebook, and the folder in it, the paths are copied into; `None` opens them, as a
+    /// drop on the window does.
+    place: Option<(library_host::NotebookId, PathBuf)>,
 }
 
 /// Posts an Explorer drop on the panel to the window, so Drop returns before anything is asked
 /// (open editors spec §6). False when the post failed; its payload is freed here then.
-pub(crate) fn post_panel_drop(hwnd: HWND, paths: Vec<PathBuf>, folder: Option<PathBuf>) -> bool {
-    let payload = Box::into_raw(Box::new(PanelDrop { paths, folder }));
+pub(crate) fn post_panel_drop(
+    hwnd: HWND,
+    paths: Vec<PathBuf>,
+    place: Option<(library_host::NotebookId, PathBuf)>,
+) -> bool {
+    let payload = Box::into_raw(Box::new(PanelDrop { paths, place }));
     let posted = unsafe {
         PostMessageW(
             hwnd,
@@ -339,8 +372,8 @@ pub(crate) fn panel_dropped(hwnd: HWND, lparam: LPARAM) {
     if super::modal::modal_active(hwnd) {
         return;
     }
-    match drop.folder {
-        Some(folder) => copy_into(hwnd, drop.paths, &folder, None),
+    match drop.place {
+        Some((id, folder)) => copy_into_of(hwnd, id, drop.paths, &folder, None),
         None => library_host::files_dropped(hwnd, drop.paths),
     }
 }
@@ -385,6 +418,30 @@ fn queue(hwnd: HWND, job: CopyJob) {
 pub(crate) fn stop(hwnd: HWND) {
     let worker = library_host::with_copy_worker(hwnd, std::mem::take);
     drop(worker);
+}
+
+/// A finished copy of the files `copied` (destinations) into `root`, as the worker posts it.
+#[cfg(test)]
+pub(crate) fn test_done_payload(root: PathBuf, copied: Vec<PathBuf>) -> LPARAM {
+    let items = copied
+        .into_iter()
+        .map(|destination| ItemDone {
+            destination,
+            is_folder: false,
+            copied: Copied {
+                files: 1,
+                error: None,
+            },
+        })
+        .collect();
+    Box::into_raw(Box::new(CopyDone {
+        items,
+        reloads: Vec::new(),
+        notices: Vec::new(),
+        dirty_tab: None,
+        root,
+        folder: PathBuf::new(),
+    })) as LPARAM
 }
 
 /// `WM_FASTPAD_COPY_DONE`: frees the result and applies it.
@@ -436,9 +493,10 @@ fn apply(hwnd: HWND, mut done: CopyDone) {
     if !hidden.is_empty() {
         notices.push(tree_copy::hidden_notice(&hidden));
     }
-    // The tree is left alone once another notebook is open: its rows are not these.
-    if library_host::folder(hwnd).is_some_and(|open| same_path(&open, &done.root)) {
-        show_in_tree(hwnd, &done, &listed, rescan);
+    // The notebook that owns the root takes the copies. A notebook closed since leaves nothing
+    // to update, and the files are still on disk.
+    if let Some(id) = library_host::notebook_of(hwnd, &done.root) {
+        show_in_tree(hwnd, id, &done, &listed, rescan);
     }
     // A reload swaps documents: inside a modal loop or a file population the tab is left as it
     // is, and its disk stamp pauses its autosave as for any change made outside FastPad.
@@ -465,8 +523,14 @@ fn apply(hwnd: HWND, mut done: CopyDone) {
 /// Indexes the copied notes and folders, expands the folder copied into, and selects the row of
 /// a drop's single item, as after a tree drag. Folders and failures are rescanned for what is in
 /// them.
-fn show_in_tree(hwnd: HWND, done: &CopyDone, listed: &[RowKind], rescan: bool) {
-    library_host::with_state(hwnd, |state| {
+fn show_in_tree(
+    hwnd: HWND,
+    id: library_host::NotebookId,
+    done: &CopyDone,
+    listed: &[RowKind],
+    rescan: bool,
+) {
+    library_host::with_notebook(hwnd, id, |state| {
         for row in listed {
             match row {
                 RowKind::Note(relative) => {
@@ -477,18 +541,19 @@ fn show_in_tree(hwnd: HWND, done: &CopyDone, listed: &[RowKind], rescan: bool) {
             }
         }
     });
-    library_host::set_root_expanded(hwnd, true);
+    library_host::set_root_expanded_of(hwnd, id, true);
     let mut folders = tree::ancestors(&done.folder);
     if !done.folder.as_os_str().is_empty() {
         folders.push(done.folder.clone());
     }
     for folder in folders {
-        library_host::set_expanded(hwnd, &folder, true);
+        library_host::set_expanded_of(hwnd, id, &folder, true);
     }
     library_host::schedule_write(hwnd);
     if rescan {
-        library_host::request_rescan(hwnd);
+        library_host::request_rescan_of(hwnd, id);
     }
+    // One item copied: its row, in the notebook it went to, is selected.
     let single = match (done.items.as_slice(), listed) {
         ([_], [row]) => Some(row),
         _ => None,
@@ -496,7 +561,7 @@ fn show_in_tree(hwnd: HWND, done: &CopyDone, listed: &[RowKind], rescan: bool) {
     super::side_panel::with_accessible_events(hwnd, || {
         super::side_panel::refresh(hwnd);
         if let Some(row) = single {
-            super::notebook_view::select_row(hwnd, row);
+            super::notebook_view::select_row(hwnd, id, row);
         }
     });
 }

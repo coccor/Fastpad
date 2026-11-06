@@ -227,7 +227,7 @@ pub(crate) const ENTRIES: [PaletteEntry; 166] = [
     entry("Notes: Previous daily note", CommandId::NotesPreviousDaily),
     entry("Notes: Next daily note", CommandId::NotesNextDaily),
     entry(
-        "Notes: New note from template{2026}",
+        "Notes: New note from template\u{2026}",
         CommandId::NotesNewFromTemplate,
     ),
     entry(
@@ -239,7 +239,7 @@ pub(crate) const ENTRIES: [PaletteEntry; 166] = [
         CommandId::NotesPasteImage,
     ),
     entry(
-        "Notes: Insert attachment{2026}",
+        "Notes: Insert attachment\u{2026}",
         CommandId::NotesInsertAttachment,
     ),
     entry("View: Zoom in", CommandId::ZoomIn),
@@ -627,6 +627,9 @@ pub(crate) struct CommandPalette {
     picker_rows: Vec<PickerRow>,
     /// The row `fill_list` selects in picker mode; `None` selects nothing.
     picker_selected: Option<usize>,
+    /// Quick Open's placeholder while a notebook is open: "Search notes in <name>" (multi-root
+    /// notebooks spec §5.3). `None` uses `QUICK_OPEN_PLACEHOLDER`.
+    quick_open_hint: Option<String>,
     visible: bool,
     colors: Palette,
     layout: Option<PanelLayout>,
@@ -681,6 +684,7 @@ impl CommandPalette {
             picker: None,
             picker_rows: Vec::new(),
             picker_selected: None,
+            quick_open_hint: None,
             visible: false,
             colors,
             layout: None,
@@ -788,13 +792,13 @@ impl CommandPalette {
     /// Switches between command mode (`None`) and picker mode; also clears any rows from a
     /// previous filter, so a stale selection index can't leak into the new mode.
     pub(crate) fn set_picker(&mut self, picker: Option<Picker>) {
-        let hint = self.placeholder();
+        let hint = self.placeholder().map(str::to_owned);
         self.picker = picker;
         self.picker_rows = Vec::new();
         self.picker_selected = None;
         // An empty field repaints only on an edit, and switching modes may make none: the hint
         // must come or go here. InvalidateRect only marks the region; it sends nothing.
-        if self.placeholder() != hint {
+        if self.placeholder() != hint.as_deref() {
             unsafe {
                 InvalidateRect(self.query_edit, std::ptr::null(), 1);
             }
@@ -803,6 +807,12 @@ impl CommandPalette {
                 self.hint_repaints += 1;
             }
         }
+    }
+
+    /// Names the notebook Quick Open searches, for its placeholder ("Search notes in <name>");
+    /// `None` for none. Set before the picker is, so `set_picker` repaints the hint.
+    pub(crate) fn set_quick_open_notebook(&mut self, name: Option<&str>) {
+        self.quick_open_hint = name.map(|name| format!("Search notes in {name}"));
     }
 
     pub(crate) fn picker(&self) -> Option<&Picker> {
@@ -1256,9 +1266,13 @@ impl CommandPalette {
 
     /// What the empty query field shows: what quick open and the status bar's pickers choose,
     /// nothing in other modes.
-    pub(crate) fn placeholder(&self) -> Option<&'static str> {
+    pub(crate) fn placeholder(&self) -> Option<&str> {
         match self.picker.as_ref()?.kind {
-            PickerKind::QuickOpen => Some(QUICK_OPEN_PLACEHOLDER),
+            PickerKind::QuickOpen => Some(
+                self.quick_open_hint
+                    .as_deref()
+                    .unwrap_or(QUICK_OPEN_PLACEHOLDER),
+            ),
             PickerKind::Language => Some(LANGUAGE_PLACEHOLDER),
             PickerKind::Encoding => Some(ENCODING_PLACEHOLDER),
             PickerKind::RecentFolder | PickerKind::MoveToNotebook | PickerKind::Template => None,

@@ -187,9 +187,19 @@ fn moving_a_note_keeps_its_links_to_pdfs_and_moving_an_image_updates_links_to_it
         "[spec](../attachments/spec.pdf) ![](../attachments/shot.png)\n"
     );
 
-    pump_until(window.hwnd, || !app_mut(window.hwnd).library.index_running);
+    pump_until(window.hwnd, || {
+        !app_mut(window.hwnd)
+            .library
+            .default_slot()
+            .is_some_and(|slot| slot.index_running)
+    });
     crate::window::library_host::request_index(window.hwnd);
-    pump_until(window.hwnd, || !app_mut(window.hwnd).library.index_running);
+    pump_until(window.hwnd, || {
+        !app_mut(window.hwnd)
+            .library
+            .default_slot()
+            .is_some_and(|slot| slot.index_running)
+    });
     crate::window::modal::answer_next_choice(|_| 0);
     crate::window::tree_move::drop_into(
         window.hwnd,

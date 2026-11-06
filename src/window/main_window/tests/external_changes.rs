@@ -332,8 +332,7 @@ fn a_new_note_written_by_another_program_appears_in_the_notebook() {
     pump_until(window.hwnd, || {
         app_mut(window.hwnd)
             .library
-            .state
-            .as_ref()
+            .default_state()
             .is_some_and(|state| {
                 state
                     .notes
@@ -354,7 +353,11 @@ fn changes_inside_git_and_other_skipped_folders_cause_no_rescan() {
     open_note(&window, &scratch, "a.md", "a\n");
     std::fs::create_dir_all(scratch.folder().join(".git").join("objects")).unwrap();
     pump_for(window.hwnd, std::time::Duration::from_millis(600));
-    let scans = app_mut(window.hwnd).library.generation;
+    let scans = app_mut(window.hwnd)
+        .library
+        .default_slot()
+        .unwrap()
+        .generation;
 
     for index in 0..5 {
         std::fs::write(
@@ -369,7 +372,14 @@ fn changes_inside_git_and_other_skipped_folders_cause_no_rescan() {
     }
     std::fs::write(scratch.folder().join(".git").join("index"), "x").unwrap();
     pump_for(window.hwnd, std::time::Duration::from_millis(600));
-    assert_eq!(app_mut(window.hwnd).library.generation, scans);
+    assert_eq!(
+        app_mut(window.hwnd)
+            .library
+            .default_slot()
+            .unwrap()
+            .generation,
+        scans
+    );
 }
 
 #[test]
@@ -416,8 +426,7 @@ fn the_watcher_stops_when_the_notebook_closes_or_notes_mode_goes_off() {
 fn marked(hwnd: HWND, relative: &str) -> bool {
     app_mut(hwnd)
         .library
-        .state
-        .as_ref()
+        .default_state()
         .is_some_and(|state| state.local.is_changed(std::path::Path::new(relative)))
 }
 
@@ -437,8 +446,7 @@ fn a_note_changed_outside_fastpad_is_marked_until_it_is_opened() {
     pump_until(window.hwnd, || marked(window.hwnd, "b.md"));
     let local_path = app_mut(window.hwnd)
         .library
-        .state
-        .as_ref()
+        .default_state()
         .unwrap()
         .local_path
         .clone();

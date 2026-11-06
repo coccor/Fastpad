@@ -405,7 +405,8 @@ pub(crate) fn open_search_result(
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
-    let Some(folder) = crate::window::library_host::folder(hwnd) else {
+    // Relative to the notebook the results come from.
+    let Some(folder) = crate::window::search_view::notebook(hwnd) else {
         return;
     };
     let path = folder.join(relative);

@@ -4,6 +4,7 @@
 use super::*;
 use crate::library::tree::{self, RowKind, TreeRow};
 use crate::window::commands::CommandId;
+use crate::window::library_host;
 use crate::window::main_window::app_ptr;
 use crate::window::panel_cursor::Cursor;
 use crate::window::side_panel::ViewPaint;
@@ -14,18 +15,26 @@ use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
 use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_COMMAND};
 
+/// What a rebuild read of one open notebook.
+pub(super) struct RootSnapshot {
+    pub(super) info: RootInfo,
+    /// Its root row is expanded.
+    pub(super) expanded: bool,
+    /// Its tree's visible rows, relative to it at depth 0 for its top level; `None` while its
+    /// state has not loaded, or with its root collapsed.
+    pub(super) rows: Option<Vec<TreeRow>>,
+    /// Its last load failed.
+    pub(super) failed: bool,
+    /// Its scan stopped at the limit.
+    pub(super) truncated: bool,
+}
+
 /// What a rebuild read from the library, the tabs and `folders.ini`'s cache.
 pub(super) struct Snapshot {
     pub(super) mode: Mode,
-    pub(super) rows: Vec<TreeRow>,
-    pub(super) truncated: bool,
+    /// The open notebooks, in sidebar order.
+    pub(super) roots: Vec<RootSnapshot>,
     pub(super) recent: Vec<PathBuf>,
-    pub(super) root: Option<PathBuf>,
-    pub(super) favorite: bool,
-    /// Some folder is expanded.
-    pub(super) folders_open: bool,
-    /// The notebook's root row is expanded (true without a notebook).
-    pub(super) root_expanded: bool,
     /// The Open Editors section is expanded.
     pub(super) editors_expanded: bool,
     pub(super) key: RebuildKey,
@@ -42,60 +51,85 @@ pub(crate) fn with_view<R>(hwnd: HWND, f: impl FnOnce(&mut NotebookView) -> R) -
 
 /// What the rows would be built from now. Cheap: no flattening, no disk.
 pub(super) fn rebuild_key(hwnd: HWND) -> RebuildKey {
+    let expansion = library_host::expansion_revision(hwnd);
+    let roots = library_host::notebooks(hwnd)
+        .into_iter()
+        .map(|(id, folder)| {
+            let truncated = library_host::with_notebook(hwnd, id, |state| state.truncated);
+            RootKey {
+                id,
+                folder,
+                loaded: truncated.is_some(),
+                failed: library_host::load_failed_of(hwnd, id),
+                expansion,
+                root_expanded: library_host::root_expanded_of(hwnd, id),
+                truncated: truncated.unwrap_or(false),
+            }
+        })
+        .collect();
     RebuildKey {
-        root: crate::window::library_host::folder(hwnd),
-        loaded: crate::window::library_host::with_state(hwnd, |_| ()).is_some(),
-        failed: crate::window::library_host::load_failed(hwnd),
-        expansion: crate::window::library_host::expansion_revision(hwnd),
-        root_expanded: crate::window::library_host::root_expanded(hwnd),
-        changed_only: crate::window::library_host::changed_only(hwnd),
+        roots,
+        default: library_host::default_notebook(hwnd),
+        changed_only: library_host::changed_only(hwnd),
     }
 }
 
-/// Reads everything the rows need. Each call borrows the App on its own, never nested.
+/// Reads everything the rows need, notebook by notebook. Each call borrows the App on its own,
+/// never nested.
 pub(super) fn snapshot(hwnd: HWND) -> Snapshot {
     let key = rebuild_key(hwnd);
     let editors_expanded = crate::window::main_window::open_editors_expanded(hwnd);
-    let Some(root) = key.root.clone() else {
+    if key.roots.is_empty() {
         return Snapshot {
             mode: Mode::NoNotebook,
-            rows: Vec::new(),
-            truncated: false,
-            recent: crate::window::library_host::recent_notebooks(hwnd),
-            root: None,
-            favorite: false,
-            folders_open: false,
-            root_expanded: true,
+            roots: Vec::new(),
+            recent: library_host::recent_notebooks(hwnd),
             editors_expanded,
             key,
         };
-    };
-    let favorite = crate::window::library_host::is_favorite(hwnd);
-    let built = crate::window::library_host::with_state(hwnd, |state| {
-        let rows = if key.changed_only {
-            changed_rows(&state.tree, &state.local.changed)
-        } else {
-            let mut rows = flatten(&state.tree, &state.local.expanded);
-            mark_changed_rows(&mut rows, &state.local.changed);
-            rows
-        };
-        (rows, state.truncated)
-    });
-    let (mode, rows, truncated) = match built {
-        None if key.failed => (Mode::Failed, Vec::new(), false),
-        None => (Mode::Loading, Vec::new(), false),
-        Some((rows, _)) if rows.is_empty() => (Mode::Empty, rows, false),
-        Some((rows, truncated)) => (Mode::Tree, rows, truncated),
-    };
+    }
+    let folders: Vec<PathBuf> = key.roots.iter().map(|root| root.folder.clone()).collect();
+    let names = crate::library::local::display_names(&folders);
+    let roots = key
+        .roots
+        .iter()
+        .zip(names)
+        .map(|(root, (name, hint))| {
+            let id = root.id;
+            let rows = root
+                .root_expanded
+                .then(|| {
+                    library_host::with_notebook(hwnd, id, |state| {
+                        if key.changed_only {
+                            changed_rows(&state.tree, &state.local.changed)
+                        } else {
+                            let mut rows = flatten(&state.tree, &state.local.expanded);
+                            mark_changed_rows(&mut rows, &state.local.changed);
+                            rows
+                        }
+                    })
+                })
+                .flatten();
+            let marker = (key.default == Some(id)).then_some(DEFAULT_MARKER_TIP);
+            RootSnapshot {
+                info: RootInfo {
+                    id,
+                    folder: root.folder.clone(),
+                    label: RootLabel { name, hint, marker },
+                    favorite: library_host::is_favorite_folder(hwnd, &root.folder),
+                    folders_open: library_host::any_folder_expanded_of(hwnd, id),
+                },
+                expanded: root.root_expanded,
+                rows,
+                failed: root.failed,
+                truncated: root.truncated,
+            }
+        })
+        .collect();
     Snapshot {
-        mode,
-        rows,
-        truncated,
+        mode: Mode::Tree,
+        roots,
         recent: Vec::new(),
-        root: Some(root),
-        favorite,
-        folders_open: crate::window::library_host::any_folder_expanded(hwnd),
-        root_expanded: key.root_expanded,
         editors_expanded,
         key,
     }
@@ -107,23 +141,32 @@ pub(crate) fn rebuild(hwnd: HWND) {
     let snapshot = snapshot(hwnd);
     let names = crate::library::local::display_names(&snapshot.recent);
     let lost = with_view(hwnd, |view| {
-        // The notebook itself changed under the drag (root switched): a row that happens to
-        // share a relative path in the new notebook is not the same row (tree drag spec §3.3).
-        let root_changed = snapshot.root != view.root;
+        // The drag's notebook now at another folder (its slot reused for another notebook): a
+        // row that happens to share a relative path there is not the same row.
+        let folder_before = view.drag_notebook.and_then(|id| view.notebook_folder(id));
         view.apply(snapshot, names);
         view.invalidate();
-        // A drag whose row went ends; a target folder that went is found again at the next
-        // move. A tab or files are not tree rows: a rebuild never loses them.
+        let folder_after = view.drag_notebook.and_then(|id| view.notebook_folder(id));
+        let moved = folder_before.is_some_and(|before| {
+            !folder_after
+                .as_deref()
+                .is_some_and(|after| crate::library::model::same_path(&before, after))
+        });
+        // A drag whose row went ends, as does one whose notebook closed: a row that happens to
+        // share a relative path in another notebook is not the same row (tree drag spec §3.3).
+        // A target folder that went is found again at the next move. A tab or files are not
+        // tree rows: a rebuild never loses them.
         let rows = &view.rows;
+        let notebook = view.drag_notebook;
+        let find = |kind: &RowKind| notebook.and_then(|id| view_row_index(rows, id, kind));
         let lost = view.drag.as_mut().is_some_and(|drag| {
             if let DragSource::Row(kind) = &drag.source
-                && (root_changed || tree::row_index(rows, kind).is_none())
+                && (moved || find(kind).is_none())
             {
                 return true;
             }
             if drag.target.as_ref().is_some_and(|folder| {
-                !folder.as_os_str().is_empty()
-                    && tree::row_index(rows, &RowKind::Folder(folder.clone())).is_none()
+                !folder.as_os_str().is_empty() && find(&RowKind::Folder(folder.clone())).is_none()
             }) {
                 drag.target = None;
             }
@@ -186,13 +229,15 @@ pub(crate) fn editors_changed(hwnd: HWND) {
     }
 }
 
-/// The row for the active tab: its note inside the open notebook. `None` for an untitled tab.
-pub(super) fn active_target(hwnd: HWND) -> Option<RowKind> {
-    let root = crate::window::library_host::folder(hwnd)?;
+/// The row for the active tab: its note inside the open notebook that holds it. `None` for an
+/// untitled tab or a file of no open notebook.
+pub(super) fn active_target(hwnd: HWND) -> Option<(NotebookId, RowKind)> {
     let path = unsafe { app_ptr(hwnd) }
         .and_then(|app| unsafe { app.as_ref() }.tabs.active()?.path.clone())?;
+    let id = crate::window::library_host::notebook_of(hwnd, &path)?;
+    let root = crate::window::library_host::notebook_folder(hwnd, id)?;
     crate::library::is_inside(&root, &path)
-        .then(|| RowKind::Note(crate::library::record_path(&root, &path)))
+        .then(|| (id, RowKind::Note(crate::library::record_path(&root, &path))))
 }
 
 /// Whether something the rows are built from, besides the library itself, changed since the
@@ -210,9 +255,9 @@ pub(crate) fn stale(hwnd: HWND) -> bool {
 pub(crate) fn active_tab_changed(hwnd: HWND) {
     editors_changed(hwnd);
     let target = active_target(hwnd);
-    if let Some(RowKind::Note(relative)) = &target {
+    if let Some((id, RowKind::Note(relative))) = &target {
         for folder in tree::ancestors(relative) {
-            crate::window::library_host::set_expanded(hwnd, &folder, true);
+            crate::window::library_host::set_expanded_of(hwnd, *id, &folder, true);
         }
     }
     if stale(hwnd) {
@@ -221,7 +266,7 @@ pub(crate) fn active_tab_changed(hwnd: HWND) {
     with_view(hwnd, |view| {
         if let Some(index) = target
             .as_ref()
-            .and_then(|kind| tree::row_index(&view.rows, kind))
+            .and_then(|(id, kind)| view_row_index(&view.rows, *id, kind))
         {
             view.select(index);
         }
@@ -243,67 +288,101 @@ pub(super) fn run(hwnd: HWND, command: CommandId) {
     }
 }
 
-/// The selected note's absolute path while the panel has the keyboard focus on the tree, so
-/// palette and accelerator commands act on it rather than on the active tab (spec §6.3).
-pub(crate) fn focused_note(hwnd: HWND) -> Option<PathBuf> {
-    let root = crate::window::library_host::folder(hwnd)?;
-    with_view(hwnd, |view| {
-        let focused = unsafe { GetFocus() } == view.panel && view.cursor == Cursor::Tree;
-        match view.list.selected.map(|index| view.target(index)) {
-            Some(Target::Row(TreeRow {
-                kind: RowKind::Note(relative),
-                ..
-            })) if focused => Some(root.join(relative)),
-            _ => None,
-        }
-    })
-    .flatten()
-}
-
-/// The selected folder row's path, relative to the notebook, while the panel has the keyboard
-/// focus on the tree: Rename and Delete act on it (notebook folders spec §4.2, §4.3).
-pub(crate) fn focused_folder(hwnd: HWND) -> Option<PathBuf> {
-    with_view(hwnd, |view| {
-        let focused = unsafe { GetFocus() } == view.panel && view.cursor == Cursor::Tree;
-        match view.list.selected.map(|index| view.target(index)) {
-            Some(Target::Row(TreeRow {
-                kind: RowKind::Folder(relative),
-                ..
-            })) if focused => Some(relative),
-            _ => None,
-        }
-    })
-    .flatten()
-}
-
-/// The folder a new note goes to (spec §6.7): a selected folder row's own folder, or a
-/// selected note's parent. `None` (the root) for a draft row, no selection, or the keyboard
-/// selection outside the tree.
-pub(crate) fn selected_folder(hwnd: HWND) -> Option<PathBuf> {
-    let root = crate::window::library_host::folder(hwnd)?;
-    let target = with_view(hwnd, |view| {
-        (view.cursor == Cursor::Tree)
-            .then(|| view.list.selected.map(|index| view.target(index)))
-            .flatten()
-    })
-    .flatten()?;
-    match target {
-        Target::Row(TreeRow {
-            kind: RowKind::Folder(relative),
-            ..
-        }) => Some(root.join(relative)),
-        Target::Row(TreeRow {
-            kind: RowKind::Note(relative),
-            ..
-        }) => Some(root.join(relative).parent()?.to_path_buf()),
+/// The selected row's notebook and what it shows, while the keyboard selection is on the tree.
+fn selected_row(view: &NotebookView) -> Option<(NotebookId, TreeRow)> {
+    if view.cursor != Cursor::Tree {
+        return None;
+    }
+    match view.target(view.list.selected?) {
+        Target::Row(id, row) => Some((id, row)),
         _ => None,
     }
 }
 
-/// Selects the row showing `kind` and scrolls it into view; false when no row shows it.
-pub(crate) fn select_row(hwnd: HWND, kind: &RowKind) -> bool {
+/// The notebook the Notebook view puts first for `target_notebook` (multi-root notebooks spec
+/// §5.1): while the view shows, the selected row's notebook. The view shares the panel with
+/// Search and Tags, so a selection it keeps while they show does not count.
+pub(crate) fn selected_notebook(hwnd: HWND) -> Option<NotebookId> {
+    if crate::window::side_panel::current_view(hwnd) != crate::config::SidebarView::Notebook {
+        return None;
+    }
+    with_view(hwnd, |view| selected_row(view).map(|(id, _)| id)).flatten()
+}
+
+/// The selected note's absolute path while the panel has the keyboard focus on the tree, so
+/// palette and accelerator commands act on it rather than on the active tab (spec §6.3).
+pub(crate) fn focused_note(hwnd: HWND) -> Option<PathBuf> {
+    let (id, relative) = with_view(hwnd, |view| {
+        if unsafe { GetFocus() } != view.panel {
+            return None;
+        }
+        match selected_row(view)? {
+            (
+                id,
+                TreeRow {
+                    kind: RowKind::Note(relative),
+                    ..
+                },
+            ) => Some((id, relative)),
+            _ => None,
+        }
+    })
+    .flatten()?;
+    Some(crate::window::library_host::notebook_folder(hwnd, id)?.join(relative))
+}
+
+/// The selected folder row's notebook and path, relative to that notebook, while the panel has
+/// the keyboard focus on the tree: Rename and Delete act on it (notebook folders spec §4.2,
+/// §4.3).
+pub(crate) fn focused_folder(hwnd: HWND) -> Option<(NotebookId, PathBuf)> {
+    with_view(hwnd, |view| {
+        if unsafe { GetFocus() } != view.panel {
+            return None;
+        }
+        match selected_row(view)? {
+            (
+                id,
+                TreeRow {
+                    kind: RowKind::Folder(relative),
+                    ..
+                },
+            ) => Some((id, relative)),
+            _ => None,
+        }
+    })
+    .flatten()
+}
+
+/// Where a new note goes from the selection (spec §6.7): the selected row's notebook and, relative
+/// to it, a folder row's own folder or a note's parent; the notebook's root for its root row or a
+/// placeholder. `None` for a draft row, no selection, or the keyboard selection outside the tree.
+pub(crate) fn selected_place(hwnd: HWND) -> Option<(NotebookId, PathBuf)> {
+    let (id, row) = with_view(hwnd, |view| selected_row(view)).flatten()?;
+    let folder = match row.kind {
+        RowKind::Folder(relative) => relative,
+        RowKind::Note(relative) => relative.parent().map(PathBuf::from).unwrap_or_default(),
+        RowKind::Root | RowKind::Placeholder(_) => PathBuf::new(),
+        RowKind::Draft => return None,
+    };
+    Some((id, folder))
+}
+
+/// `selected_place` as an absolute folder: where an untitled tab's first save goes.
+pub(crate) fn selected_folder(hwnd: HWND) -> Option<PathBuf> {
+    let (id, folder) = selected_place(hwnd)?;
+    let root = crate::window::library_host::notebook_folder(hwnd, id)?;
+    Some(if folder.as_os_str().is_empty() {
+        root
+    } else {
+        root.join(folder)
+    })
+}
+
+/// Selects the row of the notebook `id` showing `kind` and scrolls it into view; false when no
+/// row shows it.
+pub(crate) fn select_row(hwnd: HWND, id: NotebookId, kind: &RowKind) -> bool {
     let selected = with_view(hwnd, |view| {
-        let Some(index) = tree::row_index(&view.rows, kind) else {
+        let Some(index) = view_row_index(&view.rows, id, kind) else {
             return false;
         };
         view.select(index);
@@ -325,12 +404,25 @@ pub(crate) fn focus_tree(hwnd: HWND) {
     focus_panel(hwnd);
 }
 
-/// Where the row showing `kind` is, and the kind of the row that takes its place once it and
-/// everything shown under it go (`tree::row_in_place_of`).
-pub(crate) fn row_in_place_of(hwnd: HWND, kind: &RowKind) -> Option<(usize, Option<RowKind>)> {
+/// Where the row of the notebook `id` showing `kind` is, and the row that takes its place once
+/// it and everything shown under it go (`tree::row_in_place_of`), by its notebook and kind. The
+/// next row is never another notebook's (its root row follows a notebook's last row): the row
+/// before takes the place then, so the target notebook stays the same.
+pub(crate) fn row_in_place_of(
+    hwnd: HWND,
+    id: NotebookId,
+    kind: &RowKind,
+) -> Option<(usize, Option<(NotebookId, RowKind)>)> {
     with_view(hwnd, |view| {
-        let index = tree::row_index(&view.rows, kind)?;
-        let next = tree::row_in_place_of(&view.rows, index).map(|row| row.kind.clone());
+        let index = view_row_index(&view.rows, id, kind)?;
+        let next = tree::row_in_place_of(&view.rows, index)
+            .filter(|row| row.notebook == id)
+            .or_else(|| {
+                index
+                    .checked_sub(1)
+                    .and_then(|before| view.rows.get(before))
+            })
+            .map(|row| (row.notebook, row.kind.clone()));
         Some((index, next))
     })
     .flatten()

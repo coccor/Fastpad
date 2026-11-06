@@ -247,3 +247,31 @@ fn an_unknown_capture_hotkey_is_named_in_a_notice() {
         ["capture_hotkey \"Ctrl+Banana\" is not a key FastPad knows."]
     );
 }
+
+#[test]
+fn quick_capture_appends_to_the_default_notebooks_inbox() {
+    // Break caught: a capture filed into the notebook in front rather than the default one, or
+    // the box not saying which notebook it files into (multi-root notebooks spec §5.3).
+    let _scintilla = load_native_scintilla();
+    let _clean = Clean::new();
+    let ab = notebooks_a_and_b("capture-default", "a", "b");
+    let hwnd = ab.window.hwnd;
+    super::super::open_path(hwnd, &ab.b.join("b.md")).unwrap();
+
+    let capture = open_box(hwnd);
+    assert_eq!(capture_box::shown_notebook(capture).as_deref(), Some("A"));
+    capture_box::set_text_for_test(capture, "Call Dana");
+    capture_box::key_for_test(capture, Action::Submit { open: false });
+
+    assert_eq!(
+        std::fs::read_to_string(ab.a.join("inbox.md")).unwrap(),
+        "# Inbox\n\n- 10:30 Call Dana\n"
+    );
+    assert!(!ab.b.join("inbox.md").exists());
+    assert_eq!(
+        crate::window::library_host::with_notebook(hwnd, ab.a_id, |state| {
+            state.is_listed(std::path::Path::new("inbox.md"))
+        }),
+        Some(true)
+    );
+}

@@ -1,6 +1,6 @@
 //! The Notebook view's one keyboard selection (open editors spec §3.5): Up and Down run from
-//! the Open Editors header through its rows, the notebook's root row and the tree's rows, as
-//! one list. Pure.
+//! the Open Editors header through its rows and the tree's rows, every notebook's root row among
+//! them (multi-root notebooks spec §4.4), as one list. Pure.
 
 use crate::window::row_list::ListKey;
 
@@ -8,31 +8,28 @@ use crate::window::row_list::ListKey;
 pub(crate) enum Cursor {
     EditorsHeader,
     Editor(usize),
-    Root,
-    /// The tree's own selection (`RowListState::selected`) is the row.
+    /// The tree's own selection (`RowListState::selected`) is the row: a root row, a
+    /// placeholder, a folder or a note.
     Tree,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Shape {
     pub editors: usize,
-    pub root: bool,
     pub tree: usize,
 }
 
 fn last(shape: Shape) -> usize {
-    shape.editors + usize::from(shape.root) + shape.tree
+    shape.editors + shape.tree
 }
 
 fn index_of(cursor: Cursor, tree_selected: Option<usize>, shape: Shape) -> usize {
     match cursor {
         Cursor::EditorsHeader => 0,
         Cursor::Editor(index) => 1 + index.min(shape.editors.saturating_sub(1)),
-        Cursor::Root if shape.root => shape.editors + 1,
-        Cursor::Root => shape.editors,
         Cursor::Tree if shape.tree > 0 => {
             let selected = tree_selected.unwrap_or(0).min(shape.tree - 1);
-            shape.editors + usize::from(shape.root) + 1 + selected
+            shape.editors + 1 + selected
         }
         Cursor::Tree => last(shape),
     }
@@ -45,11 +42,7 @@ fn cursor_at(index: usize, shape: Shape) -> (Cursor, Option<usize>) {
     if index <= shape.editors {
         return (Cursor::Editor(index - 1), None);
     }
-    let after_editors = index - shape.editors - 1;
-    if shape.root && after_editors == 0 {
-        return (Cursor::Root, None);
-    }
-    (Cursor::Tree, Some(after_editors - usize::from(shape.root)))
+    (Cursor::Tree, Some(index - shape.editors - 1))
 }
 
 /// Where `key` moves the selection. `None` for a page key: the section's own list pages.
@@ -76,26 +69,24 @@ mod tests {
 
     const SHAPE: Shape = Shape {
         editors: 2,
-        root: true,
         tree: 3,
     };
 
     #[test]
-    fn up_and_down_cross_from_open_editors_through_the_root_into_the_tree() {
-        // Break caught: Down stuck at the last tab, the root row skipped, or Up from the first
-        // tree row jumping to the top (open editors spec §3.5).
+    fn up_and_down_cross_from_open_editors_into_the_tree() {
+        // Break caught: Down stuck at the last tab, or Up from the first tree row (a root row)
+        // jumping to the top (open editors spec §3.5).
         let down = |cursor, tree| step(cursor, tree, ListKey::Down, SHAPE).unwrap();
         assert_eq!(down(Cursor::EditorsHeader, None), (Cursor::Editor(0), None));
-        assert_eq!(down(Cursor::Editor(1), None), (Cursor::Root, None));
-        assert_eq!(down(Cursor::Root, None), (Cursor::Tree, Some(0)));
+        assert_eq!(down(Cursor::Editor(1), None), (Cursor::Tree, Some(0)));
+        assert_eq!(down(Cursor::Tree, Some(0)), (Cursor::Tree, Some(1)));
         assert_eq!(
             down(Cursor::Tree, Some(2)),
             (Cursor::Tree, Some(2)),
             "stays on the last"
         );
         let up = |cursor, tree| step(cursor, tree, ListKey::Up, SHAPE).unwrap();
-        assert_eq!(up(Cursor::Tree, Some(0)), (Cursor::Root, None));
-        assert_eq!(up(Cursor::Root, None), (Cursor::Editor(1), None));
+        assert_eq!(up(Cursor::Tree, Some(0)), (Cursor::Editor(1), None));
         assert_eq!(
             up(Cursor::EditorsHeader, None),
             (Cursor::EditorsHeader, None)
@@ -105,7 +96,7 @@ mod tests {
     #[test]
     fn home_end_and_collapsed_sections() {
         assert_eq!(
-            step(Cursor::Root, None, ListKey::End, SHAPE),
+            step(Cursor::Tree, Some(0), ListKey::End, SHAPE),
             Some((Cursor::Tree, Some(2)))
         );
         assert_eq!(
@@ -115,20 +106,18 @@ mod tests {
         assert_eq!(step(Cursor::Tree, Some(1), ListKey::PageDown, SHAPE), None);
         let collapsed = Shape {
             editors: 0,
-            root: true,
-            tree: 0,
+            tree: 1,
         };
         assert_eq!(
             step(Cursor::EditorsHeader, None, ListKey::Down, collapsed),
-            Some((Cursor::Root, None))
+            Some((Cursor::Tree, Some(0)))
         );
         assert_eq!(
-            step(Cursor::Root, None, ListKey::Down, collapsed),
-            Some((Cursor::Root, None))
+            step(Cursor::Tree, Some(0), ListKey::Down, collapsed),
+            Some((Cursor::Tree, Some(0)))
         );
         let no_notebook = Shape {
             editors: 1,
-            root: false,
             tree: 0,
         };
         assert_eq!(

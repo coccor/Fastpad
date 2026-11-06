@@ -156,20 +156,22 @@ pub(crate) fn location_segments(
     }
 }
 
-/// Group `id`'s active tab's location.
-fn location(main: HWND, id: GroupId) -> Vec<String> {
-    let notebook = crate::window::library_host::folder(main);
-    unsafe { crate::window::main_window::app_ptr(main) }
-        .and_then(|app| {
-            let tabs = &unsafe { app.as_ref() }.tabs;
-            let document = tabs.document(tabs.group(id)?.active_document()?)?;
-            Some(location_segments(
-                document.path.as_deref(),
-                &document.title(),
-                notebook.as_deref(),
-            ))
-        })
-        .unwrap_or_default()
+/// Group `id`'s active tab's location, from the notebook that owns its file (multi-root
+/// notebooks spec §5.4).
+pub(crate) fn location(main: HWND, id: GroupId) -> Vec<String> {
+    let shown = unsafe { crate::window::main_window::app_ptr(main) }.and_then(|app| {
+        let tabs = &unsafe { app.as_ref() }.tabs;
+        let document = tabs.document(tabs.group(id)?.active_document()?)?;
+        Some((document.path.clone(), document.title()))
+    });
+    let Some((path, title)) = shown else {
+        return Vec::new();
+    };
+    let notebook = path
+        .as_deref()
+        .and_then(|path| crate::window::library_host::notebook_of(main, path))
+        .and_then(|id| crate::window::library_host::notebook_folder(main, id));
+    location_segments(path.as_deref(), &title, notebook.as_deref())
 }
 
 /// The segment at `index` of `count`, in the toolbar window's client coordinates: right-aligned,

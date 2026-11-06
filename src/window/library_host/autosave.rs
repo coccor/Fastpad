@@ -9,34 +9,29 @@ use std::path::PathBuf;
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 
-/// The open notebook's autosave switch, or `None` while no notebook is open or its state is still
-/// loading. The Settings dialog greys its row out then (settings dialog spec §3.2).
+/// The target notebook's autosave switch (multi-root notebooks spec §5.1), or `None` while no
+/// notebook is open or its state is still loading. The Settings dialog greys its row out then
+/// (settings dialog spec §3.2).
 pub(crate) fn notebook_autosave(hwnd: HWND) -> Option<bool> {
-    host(hwnd, |host| {
-        host.state.as_ref().map(|state| state.local.autosave)
-    })
-    .flatten()
+    with_notebook(hwnd, target_notebook(hwnd)?, |state| state.local.autosave)
 }
 
-pub(super) fn folder_autosave(hwnd: HWND) -> bool {
-    host(hwnd, |host| {
-        // Until the folder's state has loaded, its autosave setting is unknown: do not save.
-        host.state
-            .as_ref()
-            .is_some_and(|state| state.local.autosave)
-    })
-    .unwrap_or(false)
-}
-
-/// The active tab's path, if autosave applies to it right now.
+/// The active tab's path, if autosave applies to it right now: it is a note of an open notebook
+/// whose own switch is on (multi-root notebooks spec §5.2). A file no open notebook owns is a
+/// plain file and is never autosaved.
 pub(super) fn autosave_target(hwnd: HWND) -> Option<PathBuf> {
-    if !notes_mode(hwnd)
-        || !folder_autosave(hwnd)
-        || crate::window::main_window::file_population_active(hwnd)
-    {
+    let path = unsafe { app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.tabs.active()?.path.clone())?;
+    autosave_target_of(hwnd, notebook_of(hwnd, &path)?)
+}
+
+/// The active tab's path, if autosave applies to it right now as a note of the notebook `id`.
+pub(super) fn autosave_target_of(hwnd: HWND, id: NotebookId) -> Option<PathBuf> {
+    let enabled = with_notebook(hwnd, id, |state| state.local.autosave).unwrap_or(false);
+    if !notes_mode(hwnd) || !enabled || crate::window::main_window::file_population_active(hwnd) {
         return None;
     }
-    let folder = folder(hwnd)?;
+    let folder = notebook_folder(hwnd, id)?;
     unsafe { app_ptr(hwnd) }.and_then(|app| {
         let active = unsafe { app.as_ref() }.tabs.active()?;
         let path = active.path.clone()?;
@@ -64,10 +59,15 @@ pub(crate) fn schedule_autosave(hwnd: HWND) {
 /// and autosave pauses for that tab until the user reloads or keeps theirs. Only a successful
 /// write marks the tab clean.
 pub(crate) fn autosave_active(hwnd: HWND) -> Autosave {
+    autosave_active_with(hwnd, autosave_target)
+}
+
+/// `autosave_active`, with `target` deciding whether the active tab is eligible and its path.
+fn autosave_active_with(hwnd: HWND, target: impl Fn(HWND) -> Option<PathBuf>) -> Autosave {
     unsafe {
         KillTimer(hwnd, AUTOSAVE_TIMER_ID);
     }
-    let Some(path) = autosave_target(hwnd) else {
+    let Some(path) = target(hwnd) else {
         return Autosave::NotEligible;
     };
     // The guard runs right before the write: nothing between here and `complete_save` yields.
@@ -92,7 +92,7 @@ pub(crate) fn autosave_active(hwnd: HWND) -> Autosave {
         // After an append (or a rewrite with the same text) the tab knows the file again.
         let caught_up = active(hwnd)
             .is_some_and(|(_, known)| known.is_some() && known == library::disk_stamp(&path));
-        if !settled || !caught_up || autosave_target(hwnd).is_none() {
+        if !settled || !caught_up || target(hwnd).is_none() {
             return Autosave::Paused;
         }
     }
@@ -116,15 +116,24 @@ pub(crate) fn autosave_active(hwnd: HWND) -> Autosave {
     }
 }
 
-/// Before the window closes: save every eligible dirty tab. Failures fall back to the prompt.
+/// Before the window closes: save every eligible dirty tab of every open notebook, each by its
+/// own notebook's switch. Failures fall back to the prompt.
 pub(crate) fn autosave_all(hwnd: HWND) {
+    for (id, _) in notebooks(hwnd) {
+        autosave_all_of(hwnd, id);
+    }
+}
+
+/// `autosave_all` for the dirty tabs of the notebook `id`.
+pub(crate) fn autosave_all_of(hwnd: HWND, id: NotebookId) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
-    let Some(folder) = folder(hwnd) else {
+    let Some(folder) = notebook_folder(hwnd, id) else {
         return;
     };
-    if !notes_mode(hwnd) || !folder_autosave(hwnd) {
+    let autosave = with_notebook(hwnd, id, |state| state.local.autosave).unwrap_or(false);
+    if !notes_mode(hwnd) || !autosave {
         return;
     }
     let (active, ids): (Option<_>, Vec<_>) = unsafe { app_ptr(hwnd) }
@@ -145,13 +154,13 @@ pub(crate) fn autosave_all(hwnd: HWND) {
             (tabs.active().map(|document| document.id), ids)
         })
         .unwrap_or_default();
-    for id in ids {
+    for document in ids {
         if !identity.is_live_for(hwnd)
-            || !crate::window::main_window::activate_document_by_id(hwnd, id)
+            || !crate::window::main_window::activate_document_by_id(hwnd, document)
         {
             return;
         }
-        autosave_active(hwnd);
+        autosave_active_with(hwnd, |hwnd| autosave_target_of(hwnd, id));
     }
     // The session records the tab the user had active, not the last one saved.
     if let Some(active) = active
@@ -161,16 +170,22 @@ pub(crate) fn autosave_all(hwnd: HWND) {
     }
 }
 
+/// Notes: Toggle autosave, on the target notebook (multi-root notebooks spec §5.1).
 pub(crate) fn toggle_folder_autosave(hwnd: HWND) {
-    let Some(enabled) = with_state(hwnd, |state| {
+    let Some(id) = target_notebook(hwnd) else {
+        push_notice(hwnd, "Loading notebook…".to_owned());
+        return;
+    };
+    let Some(enabled) = with_notebook(hwnd, id, |state| {
         state.local.autosave = !state.local.autosave;
         state.local.autosave
     }) else {
         push_notice(hwnd, "Loading notebook…".to_owned());
         return;
     };
-    save_local(
+    save_local_of(
         hwnd,
+        id,
         LocalWrite {
             wait: false,
             force: false,
@@ -264,12 +279,15 @@ pub(crate) fn document_saved(hwnd: HWND) {
     });
     let (path, promoted) = saved.unwrap_or((None, false));
     // A saved Markdown note's tags and front matter go into the index (spec §6.4).
+    // The note goes into the notebook that owns it; a file no open notebook owns is a plain file.
     let indexed = path.as_deref().is_some_and(library::index::is_indexed);
+    let owner = path.as_deref().and_then(|path| notebook_of(hwnd, path));
     let inserted = path
-        .and_then(|path| with_state(hwnd, |state| state.add_note(&path)))
+        .zip(owner)
+        .and_then(|(path, id)| with_notebook(hwnd, id, |state| state.add_note(&path)))
         .unwrap_or(false);
-    if indexed {
-        request_index(hwnd);
+    if indexed && let Some(id) = owner {
+        request_index_of(hwnd, id);
     }
     close_stale_name_box(hwnd);
     if inserted || crate::window::notebook_view::stale(hwnd) {
@@ -283,9 +301,13 @@ pub(crate) fn document_saved(hwnd: HWND) {
 
 #[cfg(test)]
 pub(crate) fn install_for_test(hwnd: HWND, state: LibraryState) {
+    // As if a load had just landed: the default notebook (opened now if none is) takes it.
     host(hwnd, |host| {
-        host.folder = Some(state.folder.clone());
-        host.generation = host.generation.wrapping_add(1);
+        let id = host.assume_folder(state.folder.clone());
+        let generation = host.fresh_generation();
+        if let Some(slot) = host.slot_mut(id) {
+            slot.generation = generation;
+        }
     });
     install(hwnd, state);
 }

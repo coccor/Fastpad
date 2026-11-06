@@ -30,10 +30,16 @@ fn a_favorite_opens_from_the_favorites_view_and_its_menu_removes_it() {
     pump_until(window.hwnd, || {
         crate::window::side_panel::current_view(window.hwnd) == SidebarView::Notebook
     });
-    assert!(crate::library::model::same_path(
-        &crate::window::library_host::folder(window.hwnd).unwrap(),
-        &second.folder()
-    ));
+    // Opening adds a root: both notebooks are open, the first still the default.
+    assert_eq!(crate::window::library_host::notebooks(window.hwnd).len(), 2);
+    assert!(
+        crate::window::library_host::notebooks(window.hwnd)
+            .iter()
+            .any(|(_, folder)| crate::library::model::same_path(folder, &second.folder()))
+    );
+    // The star acts on the default notebook until the root menu names its own.
+    let second_id = crate::window::library_host::notebooks(window.hwnd)[1].0;
+    crate::window::library_host::set_default_notebook(window.hwnd, second_id);
 
     crate::window::side_panel::show_view(window.hwnd, SidebarView::Favorites, true);
     let panel = sidebar_panel(window.hwnd);
@@ -680,4 +686,31 @@ fn an_ignored_key_line_can_be_reset_from_the_row_menu() {
         offered.borrow()
     );
     assert!(app_mut(window.hwnd).settings.key_overrides.is_empty());
+}
+
+#[test]
+fn favorites_highlight_every_open_notebook_and_reveal_on_click() {
+    // Break caught: only the default notebook highlighted, or a click on an open favorite
+    // starting a folder check (and reopening it) instead of selecting its root row.
+    use crate::config::SidebarView;
+    use crate::window::favorites_view::{FavoriteAction, run, shown_rows};
+    use crate::window::library_host::{check_request, toggle_notebook_favorite_of};
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("favorites-open", "a", "b");
+    let hwnd = ab.window.hwnd;
+    toggle_notebook_favorite_of(hwnd, ab.a_id);
+    toggle_notebook_favorite_of(hwnd, ab.b_id);
+    crate::window::side_panel::show_view(hwnd, SidebarView::Favorites, true);
+    let rows = shown_rows(hwnd);
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.open), "{rows:?}");
+
+    let before = check_request(hwnd);
+    run(hwnd, FavoriteAction::Open(ab.b.clone()), false);
+    assert_eq!(check_request(hwnd), before, "no folder check starts");
+    assert_eq!(
+        SidebarView::Notebook,
+        crate::window::side_panel::current_view(hwnd)
+    );
+    assert_eq!(selected_row_of(hwnd), Some((ab.b_id, RowKind::Root)));
 }

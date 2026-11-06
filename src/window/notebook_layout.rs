@@ -1,6 +1,7 @@
 //! Where the Notebook view's parts go (open editors spec §3.1): the title band in the window's
-//! title strip, the Open Editors header and its rows, the notebook's root row with its buttons,
-//! and the body below, which holds the tree or the view's state. Pure: rectangles only.
+//! title strip, the Open Editors header and its rows, and the body below, which holds the tree
+//! or the no-notebook state. Each open notebook's root row is a row of the tree, with its
+//! buttons laid out within it (multi-root notebooks spec §4.2). Pure: rectangles only.
 
 use crate::window::design::metrics::{panel_header, scale, sidebar_row};
 use crate::window::notebook_view::HeaderButton;
@@ -17,6 +18,8 @@ const RIGHT_PAD: i32 = 6;
 const MIN_NAME: i32 = 72;
 /// The buttons that always show, whatever the width: Refresh, the folders toggle and "…".
 const ALWAYS_SHOWN: usize = 3;
+/// A root row's buttons.
+const BUTTONS: usize = 5;
 
 #[derive(Clone, Copy)]
 pub(crate) struct PanelLayout {
@@ -25,9 +28,7 @@ pub(crate) struct PanelLayout {
     pub editors_header: RECT,
     /// The Open Editors rows; empty when collapsed or with no tabs.
     pub editors_list: RECT,
-    /// The notebook's root row.
-    pub root: RECT,
-    /// Everything under the root row: the tree, or the view's state.
+    /// Everything under Open Editors: the tree with its root rows, or the no-notebook state.
     pub body: RECT,
 }
 
@@ -49,7 +50,6 @@ pub(crate) fn panel_layout(
         0
     };
     let list_bottom = cut(header_bottom + row * shown as i32);
-    let root_bottom = cut(list_bottom + row);
     let band = |top: i32, bottom: i32| RECT {
         left: client.left,
         top,
@@ -60,8 +60,7 @@ pub(crate) fn panel_layout(
         title: band(client.top, title_bottom),
         editors_header: band(title_bottom, header_bottom),
         editors_list: band(header_bottom, list_bottom),
-        root: band(list_bottom, root_bottom),
-        body: band(root_bottom, client.bottom),
+        body: band(list_bottom, client.bottom),
     }
 }
 
@@ -79,10 +78,11 @@ pub(crate) fn section_chevron(row: RECT, dpi: u32) -> RECT {
 #[derive(Clone, Copy)]
 pub(crate) struct RootParts {
     pub chevron: RECT,
+    /// The notebook's name, its parent hint and the default marker.
     pub name: RECT,
-    /// Left to right: star, New note, New folder, Refresh, Collapse/Expand all, "…". A button
-    /// that does not fit the panel has an empty rectangle (`shown`, `hidden`).
-    pub buttons: [(HeaderButton, RECT); 6],
+    /// Left to right: New note, New folder, Refresh, Collapse/Expand all, "…". A button that
+    /// does not fit the panel has an empty rectangle (`shown`, `hidden`).
+    pub buttons: [(HeaderButton, RECT); BUTTONS],
 }
 
 impl RootParts {
@@ -101,9 +101,14 @@ impl RootParts {
             .filter(|(_, rect)| rect.right <= rect.left)
             .map(|(button, _)| *button)
     }
+
+    /// The "…" button, always shown.
+    pub(crate) fn more(&self) -> RECT {
+        self.buttons[BUTTONS - 1].1
+    }
 }
 
-/// The root row's chevron, the notebook's name after it, and its six buttons at the right. In a
+/// A root row's chevron, the notebook's name after it, and its five buttons at the right. In a
 /// narrow panel the leftmost buttons drop out, so the name keeps `MIN_NAME` (Refresh, the
 /// folders toggle and "…" stay).
 pub(crate) fn root_parts(row: RECT, dpi: u32) -> RootParts {
@@ -112,7 +117,7 @@ pub(crate) fn root_parts(row: RECT, dpi: u32) -> RootParts {
     let top = row.top + (row.bottom - row.top - size) / 2;
     let right = row.right - scale(RIGHT_PAD, dpi);
     let room = (right - chevron.right - scale(MIN_NAME, dpi)).max(0);
-    let count = ((room / size.max(1)) as usize).clamp(ALWAYS_SHOWN, 6);
+    let count = ((room / size.max(1)) as usize).clamp(ALWAYS_SHOWN, BUTTONS);
     let slot = |from_right: usize| {
         if from_right >= count {
             return RECT {
@@ -131,7 +136,6 @@ pub(crate) fn root_parts(row: RECT, dpi: u32) -> RootParts {
         }
     };
     let buttons = [
-        (HeaderButton::Favorite, slot(5)),
         (HeaderButton::NewNote, slot(4)),
         (HeaderButton::NewFolder, slot(3)),
         (HeaderButton::Refresh, slot(2)),
@@ -141,7 +145,7 @@ pub(crate) fn root_parts(row: RECT, dpi: u32) -> RootParts {
     let name = RECT {
         left: chevron.right,
         top: row.top,
-        right: buttons[5 - (count - 1)].1.left.max(chevron.right),
+        right: buttons[BUTTONS - count].1.left.max(chevron.right),
         bottom: row.bottom,
     };
     RootParts {
@@ -167,27 +171,26 @@ mod tests {
     };
 
     #[test]
-    fn the_bands_stack_title_editors_root_then_body() {
-        // Break caught: the Open Editors rows painted over the root row, the title band not the
+    fn the_bands_stack_title_editors_then_body() {
+        // Break caught: the Open Editors rows painted over the tree, the title band not the
         // strip's 38 px (so the window can't be dragged from it), or a body that starts above
-        // the root row.
+        // the Open Editors rows' end.
         let layout = panel_layout(CLIENT, 96, 3, true);
         assert_eq!(edges(layout.title), (0, 0, 260, 38));
         assert_eq!(edges(layout.editors_header), (0, 38, 260, 64));
         assert_eq!(edges(layout.editors_list), (0, 64, 260, 64 + 3 * 26));
-        assert_eq!(edges(layout.root), (0, 142, 260, 168));
-        assert_eq!(edges(layout.body), (0, 168, 260, 600));
+        assert_eq!(edges(layout.body), (0, 142, 260, 600));
     }
 
     #[test]
     fn a_collapsed_or_empty_section_has_no_rows_and_twenty_tabs_show_nine() {
         // Break caught: a collapsed section still taking room, or a long tab list pushing the
-        // notebook off the panel (spec §3.1).
+        // notebooks off the panel (spec §3.1).
         let collapsed = panel_layout(CLIENT, 96, 5, false);
         assert_eq!(collapsed.editors_list.top, collapsed.editors_list.bottom);
-        assert_eq!(collapsed.root.top, 64);
+        assert_eq!(collapsed.body.top, 64);
         let empty = panel_layout(CLIENT, 96, 0, true);
-        assert_eq!(empty.root.top, 64);
+        assert_eq!(empty.body.top, 64);
         let many = panel_layout(CLIENT, 96, 20, true);
         assert_eq!(many.editors_list.bottom - many.editors_list.top, 9 * 26);
         assert_eq!(panel_layout(CLIENT, 192, 1, true).title.bottom, 76);
@@ -204,7 +207,6 @@ mod tests {
             layout.title,
             layout.editors_header,
             layout.editors_list,
-            layout.root,
             layout.body,
         ] {
             assert!(band.top <= band.bottom && band.bottom <= 80);
@@ -213,8 +215,8 @@ mod tests {
 
     #[test]
     fn the_root_buttons_sit_right_to_left_and_the_name_stops_before_them() {
-        // Break caught: the notebook name drawn under the star, or buttons that don't follow the
-        // panel's right edge.
+        // Break caught: the notebook name drawn under New note, or buttons that don't follow
+        // the panel's right edge.
         let row = RECT {
             left: 0,
             top: 142,
@@ -222,18 +224,10 @@ mod tests {
             bottom: 168,
         };
         let parts = root_parts(row, 96);
-        let [
-            (a, star),
-            (b, new),
-            (c, folder),
-            (d, refresh),
-            (e, toggle),
-            (f, more),
-        ] = parts.buttons;
+        let [(a, new), (b, folder), (c, refresh), (d, toggle), (e, more)] = parts.buttons;
         assert_eq!(
-            (a, b, c, d, e, f),
+            (a, b, c, d, e),
             (
-                HeaderButton::Favorite,
                 HeaderButton::NewNote,
                 HeaderButton::NewFolder,
                 HeaderButton::Refresh,
@@ -242,20 +236,15 @@ mod tests {
             )
         );
         assert_eq!(edges(more), (232, 144, 254, 166));
+        assert_eq!(edges(parts.more()), edges(more));
         assert_eq!(
-            (
-                star.right,
-                new.right,
-                folder.right,
-                refresh.right,
-                toggle.right
-            ),
-            (new.left, folder.left, refresh.left, toggle.left, more.left)
+            (new.right, folder.right, refresh.right, toggle.right),
+            (folder.left, refresh.left, toggle.left, more.left)
         );
-        assert_eq!(parts.name.right, star.left);
+        assert_eq!(parts.name.right, new.left);
         assert_eq!(parts.name.left, parts.chevron.right);
         assert_eq!(edges(parts.chevron), (4, 142, 20, 168));
-        assert_eq!(parts.shown().count(), 6);
+        assert_eq!(parts.shown().count(), 5);
         assert_eq!(parts.hidden().count(), 0);
         let narrow = root_parts(RECT { right: 40, ..row }, 96);
         assert!(narrow.name.left <= narrow.name.right);
@@ -263,7 +252,7 @@ mod tests {
 
     #[test]
     fn a_narrow_panel_drops_the_leftmost_buttons_but_keeps_refresh_toggle_and_more() {
-        // Break caught: six buttons squeezing the notebook's name to nothing at the narrowest
+        // Break caught: five buttons squeezing the notebook's name to nothing at the narrowest
         // panel (180 px), or a button that does not fit still painted or hit as a sliver.
         let row = |right| RECT {
             left: 0,
@@ -286,19 +275,12 @@ mod tests {
                 HeaderButton::More
             ]
         );
-        assert_eq!(
-            hidden,
-            [
-                HeaderButton::Favorite,
-                HeaderButton::NewNote,
-                HeaderButton::NewFolder
-            ]
-        );
+        assert_eq!(hidden, [HeaderButton::NewNote, HeaderButton::NewFolder]);
         assert!(name >= 72, "{name}");
-        let (shown, hidden, name) = names(220);
-        assert_eq!((shown.len(), hidden), (5, vec![HeaderButton::Favorite]));
+        let (shown, hidden, name) = names(200);
+        assert_eq!((shown.len(), hidden), (4, vec![HeaderButton::NewNote]));
         assert!(name >= 72, "{name}");
-        assert_eq!(names(400).0.len(), 6);
+        assert_eq!(names(400).0.len(), 5);
         let (_, _, name) = names(40);
         assert!(name >= 0, "a degenerate panel never inverts the name");
     }

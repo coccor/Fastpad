@@ -182,7 +182,11 @@ pub(crate) struct SearchView {
     edit_failed: bool,
     brush: HBRUSH,
     colors: Palette,
+    /// The folder of the notebook the view searches: the target notebook when it last caught up
+    /// (multi-root notebooks spec §5.3).
     notebook: Option<PathBuf>,
+    /// That notebook's display name, for the header ("Searching <name>").
+    notebook_name: Option<String>,
     /// The library's state has loaded.
     loaded: bool,
     /// The notebook's load failed (`library_host::load_failed`).
@@ -264,6 +268,7 @@ impl SearchView {
             brush: unsafe { CreateSolidBrush(colors.editor_background) },
             colors,
             notebook: None,
+            notebook_name: None,
             loaded: false,
             failed: false,
             stale: false,
@@ -516,6 +521,12 @@ pub(crate) fn summary(hwnd: HWND) -> Option<(String, bool)> {
 #[cfg(test)]
 pub(crate) fn search_state(hwnd: HWND) -> SearchState {
     with_view(hwnd, |view| view.search.clone()).unwrap_or_default()
+}
+
+/// The title band's text, for in-process tests.
+#[cfg(test)]
+pub(crate) fn shown_header(hwnd: HWND) -> String {
+    with_view(hwnd, |view| view.header()).unwrap_or_default()
 }
 
 #[cfg(test)]

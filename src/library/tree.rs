@@ -23,6 +23,28 @@ pub enum RowKind {
     /// The Notebook view's row for a note or folder being named in the tree (inline naming spec
     /// §3.1). The view puts it in; `rows` never builds one.
     Draft,
+    /// The Notebook view's row for an open notebook's root (multi-root notebooks spec §4.2). The
+    /// view puts it in; `rows` never builds one.
+    Root,
+    /// The Notebook view's one row under a root that has no tree to show (spec §4.3), or the row
+    /// after a root's last row saying its scan stopped at the limit.
+    Placeholder(Placeholder),
+}
+
+/// What a placeholder row says (multi-root notebooks spec §4.3).
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Placeholder {
+    Loading,
+    Failed,
+    Empty,
+    /// The scan stopped at its limit: the root's rows above are not all of its notes.
+    Truncated,
+}
+
+impl AsRef<TreeRow> for TreeRow {
+    fn as_ref(&self) -> &TreeRow {
+        self
+    }
 }
 
 /// One visible row.
@@ -790,46 +812,58 @@ fn same_row_path(a: &Path, b: &Path) -> bool {
 
 /// The row that takes row `index`'s place once it and everything shown under it go: the next row
 /// after its subtree, else the row before it.
-pub fn row_in_place_of(rows: &[TreeRow], index: usize) -> Option<&TreeRow> {
-    let depth = rows.get(index)?.depth;
+pub fn row_in_place_of<R: AsRef<TreeRow>>(rows: &[R], index: usize) -> Option<&R> {
+    let depth = rows.get(index)?.as_ref().depth;
     rows[index + 1..]
         .iter()
-        .find(|row| row.depth <= depth)
+        .find(|row| row.as_ref().depth <= depth)
         .or_else(|| index.checked_sub(1).and_then(|before| rows.get(before)))
 }
 
-pub fn row_index(rows: &[TreeRow], kind: &RowKind) -> Option<usize> {
-    rows.iter().position(|row| match (&row.kind, kind) {
+/// Whether two rows stand for the same thing: the same folder or note path (ignoring case), or
+/// both the draft row, a root row or the same placeholder.
+pub fn same_kind(a: &RowKind, b: &RowKind) -> bool {
+    match (a, b) {
         (RowKind::Folder(a), RowKind::Folder(b)) | (RowKind::Note(a), RowKind::Note(b)) => {
             same_row_path(a, b)
         }
-        (RowKind::Draft, RowKind::Draft) => true,
+        (RowKind::Draft, RowKind::Draft) | (RowKind::Root, RowKind::Root) => true,
+        (RowKind::Placeholder(a), RowKind::Placeholder(b)) => a == b,
         _ => false,
-    })
+    }
 }
 
-/// The folder row that row `index` sits in; `None` at depth 0 or for an index past the end.
-pub fn parent_index(rows: &[TreeRow], index: usize) -> Option<usize> {
-    let depth = rows.get(index)?.depth;
+pub fn row_index<R: AsRef<TreeRow>>(rows: &[R], kind: &RowKind) -> Option<usize> {
+    rows.iter()
+        .position(|row| same_kind(&row.as_ref().kind, kind))
+}
+
+/// The folder (or root) row that row `index` sits in; `None` at depth 0 or for an index past the
+/// end.
+pub fn parent_index<R: AsRef<TreeRow>>(rows: &[R], index: usize) -> Option<usize> {
+    let depth = rows.get(index)?.as_ref().depth;
     if depth == 0 {
         return None;
     }
-    rows[..index]
-        .iter()
-        .rposition(|row| row.depth == depth - 1 && matches!(row.kind, RowKind::Folder(_)))
+    rows[..index].iter().rposition(|row| {
+        let row = row.as_ref();
+        row.depth == depth - 1 && matches!(row.kind, RowKind::Folder(_) | RowKind::Root)
+    })
 }
 
 /// The first row at or after `from`, wrapping around, whose name starts with `prefix` ignoring
 /// case. The caller passes the row after the selection for a new prefix, and the selection
 /// itself while the user keeps typing the same one.
-pub fn type_ahead(rows: &[TreeRow], from: usize, prefix: &str) -> Option<usize> {
+pub fn type_ahead<R: AsRef<TreeRow>>(rows: &[R], from: usize, prefix: &str) -> Option<usize> {
     if prefix.is_empty() || rows.is_empty() {
         return None;
     }
     let start = from % rows.len();
-    (start..rows.len())
-        .chain(0..start)
-        .find(|&index| starts_with_ignore_case(&rows[index].name, prefix))
+    (start..rows.len()).chain(0..start).find(|&index| {
+        let row = rows[index].as_ref();
+        // A placeholder's text is a message, not a name.
+        !matches!(row.kind, RowKind::Placeholder(_)) && starts_with_ignore_case(&row.name, prefix)
+    })
 }
 
 /// The folders that contain `path`, outermost first: `a\b\c.md` gives `a` and `a\b`.

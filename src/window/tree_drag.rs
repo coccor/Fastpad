@@ -7,6 +7,7 @@
 use crate::document::DocumentId;
 use crate::library::model::same_path;
 use crate::library::tree::{self, RowKind, TreeRow};
+use crate::window::library_host::NotebookId;
 use crate::window::tree_copy;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -65,6 +66,8 @@ pub(crate) struct Drag {
     pub(crate) target: Option<PathBuf>,
     /// The collapsed folder row the pointer rests on, and since when (spec §3.3).
     pub(crate) resting: Option<(PathBuf, Instant)>,
+    /// Why the pointer's place refuses the item, when it is a reason worth a hint.
+    pub(crate) refused: Option<Reason>,
 }
 
 impl Drag {
@@ -80,15 +83,16 @@ impl Drag {
             pointer: (x, y),
             target: None,
             resting: None,
+            refused: None,
         })
     }
 
     /// The pointer moved to `point`, over `hover`: the target and the resting folder follow.
     /// `root` is the notebook's folder on disk. True when the target changed, so the highlight
     /// repaints.
-    pub(crate) fn hover(
+    pub(crate) fn hover<R: AsRef<TreeRow>>(
         &mut self,
-        rows: &[TreeRow],
+        rows: &[R],
         root: &Path,
         point: (i32, i32),
         hover: Hover,
@@ -119,7 +123,7 @@ pub(crate) fn past_threshold(origin: (i32, i32), point: (i32, i32), cx: i32, cy:
 pub(crate) fn source_path(kind: &RowKind) -> Option<&Path> {
     match kind {
         RowKind::Note(path) | RowKind::Folder(path) => Some(path),
-        RowKind::Draft => None,
+        RowKind::Draft | RowKind::Root | RowKind::Placeholder(_) => None,
     }
 }
 
@@ -130,12 +134,12 @@ fn parent_of(path: &Path) -> PathBuf {
 /// The folder a drop over `hover` goes into (spec §3.2): a folder row's folder, a note row's
 /// folder, the root for the truncated row, the space below the rows and the root row; `None`
 /// outside the panel and on the draft row.
-pub(crate) fn drop_folder(rows: &[TreeRow], hover: Hover) -> Option<PathBuf> {
+pub(crate) fn drop_folder<R: AsRef<TreeRow>>(rows: &[R], hover: Hover) -> Option<PathBuf> {
     match hover {
-        Hover::Row(index) => match rows.get(index).map(|row| &row.kind) {
+        Hover::Row(index) => match rows.get(index).map(|row| &row.as_ref().kind) {
             Some(RowKind::Folder(path)) => Some(path.clone()),
             Some(RowKind::Note(path)) => Some(parent_of(path)),
-            None => Some(PathBuf::new()),
+            None | Some(RowKind::Root | RowKind::Placeholder(_)) => Some(PathBuf::new()),
             Some(RowKind::Draft) => None,
         },
         Hover::Below | Hover::Header => Some(PathBuf::new()),
@@ -143,9 +147,54 @@ pub(crate) fn drop_folder(rows: &[TreeRow], hover: Hover) -> Option<PathBuf> {
     }
 }
 
+/// Why a drop is refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Reason {
+    /// The folder is in another notebook than the dragged row: moving between notebooks is not
+    /// supported yet (multi-root notebooks spec §4.5).
+    OtherNotebook,
+    /// The folder is not a place the row can go (spec §3.2).
+    NotThere,
+}
+
+impl Reason {
+    /// What the drag says about the refusal; `None` when the cursor says enough.
+    pub(crate) fn hint(self) -> Option<&'static str> {
+        match self {
+            Self::OtherNotebook => Some(crate::window::drag_label::OTHER_NOTEBOOK_HINT),
+            Self::NotThere => None,
+        }
+    }
+}
+
+/// Whether a drop is taken.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Verdict {
+    Accepted,
+    Rejected(Reason),
+}
+
+/// Whether `folder`, a folder of the notebook `dest`, takes `source`, a row of the notebook
+/// `from`: only inside one notebook (multi-root notebooks spec §4.5), and then by
+/// `accepts_here`.
+pub(crate) fn accepts(
+    from: NotebookId,
+    dest: NotebookId,
+    source: &RowKind,
+    folder: &Path,
+) -> Verdict {
+    if from != dest {
+        Verdict::Rejected(Reason::OtherNotebook)
+    } else if accepts_here(source, folder) {
+        Verdict::Accepted
+    } else {
+        Verdict::Rejected(Reason::NotThere)
+    }
+}
+
 /// Whether `folder` takes `source` (spec §3.2): not its own folder, where nothing would change,
 /// and for a folder, not itself or a folder inside it. Ignores letter case, as NTFS does.
-pub(crate) fn accepts(source: &RowKind, folder: &Path) -> bool {
+pub(crate) fn accepts_here(source: &RowKind, folder: &Path) -> bool {
     let Some(path) = source_path(source) else {
         return false;
     };
@@ -160,7 +209,7 @@ pub(crate) fn accepts(source: &RowKind, folder: &Path) -> bool {
 /// §4.3). `root` is the notebook's folder on disk.
 pub(crate) fn source_accepts(source: &DragSource, root: &Path, folder: &Path) -> bool {
     match source {
-        DragSource::Row(kind) => accepts(kind, folder),
+        DragSource::Row(kind) => accepts_here(kind, folder),
         DragSource::Tab {
             path: Some(path), ..
         }
@@ -187,15 +236,15 @@ pub(crate) enum Highlight {
 }
 
 /// What dropping into `folder` highlights; `None` when the folder has no row now.
-pub(crate) fn highlight(rows: &[TreeRow], folder: &Path) -> Option<Highlight> {
+pub(crate) fn highlight<R: AsRef<TreeRow>>(rows: &[R], folder: &Path) -> Option<Highlight> {
     if folder.as_os_str().is_empty() {
         return Some(Highlight::Root);
     }
     let start = tree::row_index(rows, &RowKind::Folder(folder.to_path_buf()))?;
-    let depth = rows[start].depth;
+    let depth = rows[start].as_ref().depth;
     let end = rows[start + 1..]
         .iter()
-        .position(|row| row.depth <= depth)
+        .position(|row| row.as_ref().depth <= depth)
         .map_or(rows.len(), |offset| start + 1 + offset);
     Some(Highlight::Rows { start, end })
 }
@@ -225,9 +274,9 @@ pub(crate) fn scroll_step(y: i32, top: i32, bottom: i32, row_height: i32) -> i32
 
 /// The collapsed folder the pointer rests on, keeping its first time while it stays the same
 /// row. Only a folder that takes the drag rests: expanding a refused one would help nothing.
-fn rest_on(
+fn rest_on<R: AsRef<TreeRow>>(
     resting: Option<(PathBuf, Instant)>,
-    rows: &[TreeRow],
+    rows: &[R],
     hover: Hover,
     target: Option<&Path>,
     now: Instant,
@@ -235,7 +284,7 @@ fn rest_on(
     let Hover::Row(index) = hover else {
         return None;
     };
-    let row = rows.get(index)?;
+    let row = rows.get(index)?.as_ref();
     let RowKind::Folder(path) = &row.kind else {
         return None;
     };
@@ -332,34 +381,58 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_of_another_notebook_refuses_with_a_reason_and_a_hint() {
+        // Break caught: a cross-notebook move accepted, or refused with no word on why.
+        let (a, b) = (NotebookId(1), NotebookId(2));
+        let note = RowKind::Note("a.md".into());
+        assert_eq!(
+            accepts(a, b, &note, Path::new("work")),
+            Verdict::Rejected(Reason::OtherNotebook)
+        );
+        assert_eq!(accepts(a, a, &note, Path::new("work")), Verdict::Accepted);
+        assert_eq!(
+            accepts(a, a, &note, Path::new("")),
+            Verdict::Rejected(Reason::NotThere)
+        );
+        assert_eq!(
+            Reason::OtherNotebook.hint(),
+            Some("Moving between notebooks isn't supported yet")
+        );
+        assert_eq!(Reason::NotThere.hint(), None);
+    }
+
+    #[test]
     fn a_folder_refuses_its_own_items_and_a_folder_refuses_itself_and_its_insides() {
         assert!(
-            !accepts(&note(r"work\b.md"), Path::new("work")),
+            !accepts_here(&note(r"work\b.md"), Path::new("work")),
             "its own folder"
         );
         assert!(
-            !accepts(&note(r"work\b.md"), Path::new("WORK")),
+            !accepts_here(&note(r"work\b.md"), Path::new("WORK")),
             "in any letter case"
         );
         assert!(
-            !accepts(&note("a.md"), Path::new("")),
+            !accepts_here(&note("a.md"), Path::new("")),
             "a top-level note on the root"
         );
-        assert!(accepts(&note("a.md"), Path::new("work")));
-        assert!(accepts(&note(r"work\b.md"), Path::new("")));
-        assert!(!accepts(&folder("work"), Path::new("work")), "itself");
+        assert!(accepts_here(&note("a.md"), Path::new("work")));
+        assert!(accepts_here(&note(r"work\b.md"), Path::new("")));
+        assert!(!accepts_here(&folder("work"), Path::new("work")), "itself");
         assert!(
-            !accepts(&folder("work"), Path::new(r"work\inner")),
+            !accepts_here(&folder("work"), Path::new(r"work\inner")),
             "inside itself"
         );
-        assert!(!accepts(&folder("work"), Path::new(r"Work\Inner\deep")));
+        assert!(!accepts_here(
+            &folder("work"),
+            Path::new(r"Work\Inner\deep")
+        ));
         assert!(
-            !accepts(&folder(r"work\inner"), Path::new("work")),
+            !accepts_here(&folder(r"work\inner"), Path::new("work")),
             "its own parent"
         );
-        assert!(accepts(&folder(r"work\inner"), Path::new("")));
+        assert!(accepts_here(&folder(r"work\inner"), Path::new("")));
         assert!(
-            accepts(&folder("work"), Path::new("workshop")),
+            accepts_here(&folder("work"), Path::new("workshop")),
             "a name prefix is not inside"
         );
     }

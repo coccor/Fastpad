@@ -34,8 +34,7 @@ fn the_first_save_of_an_untitled_note_asks_for_a_name_in_the_folder_prefilled_fr
     assert!(
         app_mut(window.hwnd)
             .library
-            .state
-            .as_ref()
+            .default_state()
             .unwrap()
             .notes
             .iter()
@@ -284,7 +283,7 @@ fn closing_the_notebook_saves_its_notes_keeps_the_tabs_and_is_remembered_as_clos
         Some(path.as_path())
     );
     assert_eq!(crate::window::library_host::folder(window.hwnd), None);
-    assert!(app_mut(window.hwnd).library.state.is_none());
+    assert!(app_mut(window.hwnd).library.default_state().is_none());
     let folders =
         crate::library::local::read_folders(&crate::library::local::folders_file(&scratch.data()));
     assert!(folders.closed);
@@ -408,7 +407,7 @@ fn opening_a_listed_notebook_that_is_missing_says_so_and_changes_nothing() {
         crate::window::library_host::folder(window.hwnd),
         Some(scratch.folder())
     );
-    assert!(app_mut(window.hwnd).library.state.is_some());
+    assert!(app_mut(window.hwnd).library.default_state().is_some());
     let folders =
         crate::library::local::read_folders(&crate::library::local::folders_file(&scratch.data()));
     assert!(!folders.folders.contains(&missing));
@@ -426,16 +425,25 @@ fn opening_a_listed_notebook_switches_once_the_worker_finds_it() {
     app_mut(window.hwnd).library.data_dir = Some(first.data());
     first.install(window.hwnd);
 
+    let roots = || {
+        crate::window::library_host::notebooks(window.hwnd)
+            .into_iter()
+            .map(|(_, folder)| folder)
+            .collect::<Vec<_>>()
+    };
     crate::window::library_host::open_listed_notebook(window.hwnd, &second.folder());
+    assert_eq!(
+        roots(),
+        [first.folder()],
+        "nothing changes before the check lands"
+    );
+    pump_until(window.hwnd, || roots().len() == 2);
+    assert_eq!(roots(), [first.folder(), second.folder()]);
     assert_eq!(
         crate::window::library_host::folder(window.hwnd),
         Some(first.folder()),
-        "nothing changes before the check lands"
+        "the first notebook stays the default"
     );
-    pump_until(window.hwnd, || {
-        crate::window::library_host::folder(window.hwnd) == Some(second.folder())
-    });
-    pump_until(window.hwnd, || app_mut(window.hwnd).library.state.is_some());
     assert_eq!(
         crate::window::library_host::recent_notebooks(window.hwnd).first(),
         Some(&second.folder())
@@ -567,8 +575,7 @@ fn files_outside_the_folder_and_folders_with_autosave_off_are_not_autosaved() {
     assert!(
         !app_mut(window.hwnd)
             .library
-            .state
-            .as_ref()
+            .default_state()
             .unwrap()
             .local
             .autosave
@@ -672,13 +679,12 @@ fn a_folder_whose_state_has_not_loaded_is_not_autosaved() {
     assert!(
         !app_mut(window.hwnd)
             .library
-            .state
-            .as_ref()
+            .default_state()
             .unwrap()
             .local
             .autosave
     );
-    app_mut(window.hwnd).library.state = None;
+    app_mut(window.hwnd).library.default_slot().unwrap().state = None;
     editor.set_text("two").unwrap();
     assert_eq!(
         crate::window::library_host::autosave_active(window.hwnd),
@@ -697,7 +703,7 @@ fn an_edit_made_while_the_folder_loads_autosaves_once_it_has_loaded() {
     let window = ProductionWindow::new(make_app());
     let editor = install_test_editor(&window);
     let path = open_note(&window, &scratch, "a.md", "one");
-    app_mut(window.hwnd).library.state = None;
+    app_mut(window.hwnd).library.default_slot().unwrap().state = None;
     editor.replace_target(0..0, "x").unwrap();
     let waited = std::time::Instant::now();
     while waited.elapsed() < std::time::Duration::from_millis(1_300) {
@@ -815,4 +821,270 @@ fn switching_to_another_app_autosaves_the_active_note() {
     crate::window::library_host::activation_changed(window.hwnd, false);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "two");
     assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
+}
+
+/// Two notebooks, A (the default, installed) and B (opened after it), each with one note.
+fn two_notebooks(
+    label: &str,
+) -> (
+    LibraryScratch,
+    LibraryScratch,
+    ProductionWindow,
+    crate::editor::Editor,
+    crate::window::library_host::NotebookId,
+) {
+    let a = LibraryScratch::new(&format!("{label}-a"));
+    a.note("a.md", "a");
+    let b = LibraryScratch::new(&format!("{label}-b"));
+    b.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(a.data());
+    a.install(window.hwnd);
+    let b_id = open_and_load(&window, &b);
+    assert_ne!(
+        crate::window::library_host::default_notebook(window.hwnd),
+        Some(b_id),
+        "B is not the default"
+    );
+    (a, b, window, editor, b_id)
+}
+
+/// The idle timer's tick, as the window procedure gets it.
+fn fire_autosave_timer(hwnd: HWND) {
+    unsafe {
+        SendMessageW(
+            hwnd,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_TIMER,
+            crate::window::library_host::AUTOSAVE_TIMER_ID,
+            0,
+        );
+    }
+}
+
+#[test]
+fn autosave_saves_a_note_in_a_non_default_notebook() {
+    // Break caught: autosave deciding from the default notebook's folder and switch, so a note
+    // of any other open notebook is never autosaved.
+    let _scintilla = load_native_scintilla();
+    let (_a, b, window, editor, _b_id) = two_notebooks("ms-autosave");
+    let note = b.folder().join("b.md");
+    super::super::open_path(window.hwnd, &note).unwrap();
+
+    editor.set_text("two").unwrap();
+    fire_autosave_timer(window.hwnd);
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), "two");
+
+    editor.set_text("three").unwrap();
+    assert_eq!(
+        crate::window::library_host::autosave_active(window.hwnd),
+        crate::window::library_host::Autosave::Saved
+    );
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), "three");
+    assert!(!app_mut(window.hwnd).tabs.active().unwrap().dirty);
+}
+
+#[test]
+fn turning_autosave_off_in_one_notebook_leaves_the_other_autosaving() {
+    // Break caught: one notebook's autosave switch applying to another's notes.
+    let _scintilla = load_native_scintilla();
+    let (a, b, window, editor, b_id) = two_notebooks("ms-switch");
+    let a_id = crate::window::library_host::default_notebook(window.hwnd).unwrap();
+    let a_note = a.folder().join("a.md");
+    let b_note = b.folder().join("b.md");
+    let set = |id, on| {
+        crate::window::library_host::with_notebook(window.hwnd, id, |state| {
+            state.local.autosave = on;
+        })
+        .unwrap();
+    };
+
+    set(b_id, false);
+    super::super::open_path(window.hwnd, &a_note).unwrap();
+    editor.set_text("a2").unwrap();
+    fire_autosave_timer(window.hwnd);
+    assert_eq!(std::fs::read_to_string(&a_note).unwrap(), "a2");
+    super::super::open_path(window.hwnd, &b_note).unwrap();
+    editor.set_text("b2").unwrap();
+    fire_autosave_timer(window.hwnd);
+    assert_eq!(std::fs::read_to_string(&b_note).unwrap(), "b");
+    assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+
+    // And the other way round: the default notebook off, B on.
+    set(a_id, false);
+    set(b_id, true);
+    fire_autosave_timer(window.hwnd);
+    assert_eq!(std::fs::read_to_string(&b_note).unwrap(), "b2");
+    super::super::open_path(window.hwnd, &a_note).unwrap();
+    editor.set_text("a3").unwrap();
+    fire_autosave_timer(window.hwnd);
+    assert_eq!(std::fs::read_to_string(&a_note).unwrap(), "a2");
+    assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+}
+
+#[test]
+fn pinning_a_note_writes_to_its_own_notebook() {
+    // Break caught: a pin of one notebook's note refused, or recorded in the default notebook's
+    // library.ini.
+    let _scintilla = load_native_scintilla();
+    let (a, b, window, _editor, _b_id) = two_notebooks("ms-pin");
+    let note = b.folder().join("b.md");
+    super::super::open_path(window.hwnd, &note).unwrap();
+
+    execute_command(window.hwnd, CommandId::NoteTogglePin);
+    crate::window::library_host::flush_now(window.hwnd);
+
+    let reloaded = crate::library::load(&b.folder(), &b.root.join("x.ini"), 0).unwrap();
+    assert!(reloaded.is_pinned(&note), "B's library.ini has the pin");
+    let a_ini = crate::library::store::library_file(&a.folder());
+    assert!(
+        std::fs::read_to_string(&a_ini).map_or(true, |text| !text.contains("b.md")),
+        "A's library.ini does not"
+    );
+}
+
+#[test]
+fn first_save_names_a_new_note_in_the_notebook_it_was_created_in() {
+    // Break caught: a note created in one notebook saving into, or listed in, the default one.
+    let _scintilla = load_native_scintilla();
+    let (a, b, window, editor, b_id) = two_notebooks("ms-first-save");
+
+    crate::window::library_host::new_note_in(window.hwnd, &b.folder());
+    editor.set_text("Idea").unwrap();
+    pump_posted_messages(window.hwnd);
+    execute_command(window.hwnd, CommandId::Save);
+    crate::window::library_host::name_box_submit(window.hwnd);
+
+    let saved = b.folder().join("Idea.md");
+    assert_eq!(std::fs::read_to_string(&saved).unwrap(), "Idea");
+    assert!(!a.folder().join("Idea.md").exists());
+    let listed = crate::window::library_host::with_notebook(window.hwnd, b_id, |state| {
+        state
+            .notes
+            .iter()
+            .any(|note| note.path == std::path::Path::new("Idea.md"))
+    });
+    assert_eq!(listed, Some(true), "B lists the new note");
+    assert!(
+        !app_mut(window.hwnd)
+            .library
+            .default_state()
+            .unwrap()
+            .notes
+            .iter()
+            .any(|note| note.path.ends_with("Idea.md"))
+    );
+}
+
+#[test]
+fn a_tab_rejoins_its_notebook_when_it_reopens() {
+    // Break caught: a tab remembering which notebook it belonged to, so it stays a plain file
+    // once the notebook opens again, or keeps autosaving after it closed.
+    let _scintilla = load_native_scintilla();
+    let (_a, b, window, editor, b_id) = two_notebooks("ms-rejoin");
+    let note = b.folder().join("b.md");
+    super::super::open_path(window.hwnd, &note).unwrap();
+    assert!(crate::window::library_host::close_notebook_of(
+        window.hwnd,
+        b_id
+    ));
+
+    editor.set_text("plain").unwrap();
+    assert_eq!(
+        crate::window::library_host::autosave_active(window.hwnd),
+        crate::window::library_host::Autosave::NotEligible
+    );
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), "b");
+
+    open_and_load(&window, &b);
+    editor.set_text("rejoined").unwrap();
+    assert_eq!(
+        crate::window::library_host::autosave_active(window.hwnd),
+        crate::window::library_host::Autosave::Saved
+    );
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), "rejoined");
+}
+
+#[test]
+fn first_save_after_its_notebook_closed_saves_as_a_plain_file() {
+    // Break caught: an untitled note whose notebook closed saving into the default notebook, or
+    // listing itself in a notebook that no longer owns it.
+    let _scintilla = load_native_scintilla();
+    let (a, b, window, editor, b_id) = two_notebooks("ms-closed-first-save");
+    crate::window::library_host::new_note_in(window.hwnd, &b.folder());
+    editor.set_text("Draft").unwrap();
+    pump_posted_messages(window.hwnd);
+    assert!(crate::window::library_host::close_notebook_of(
+        window.hwnd,
+        b_id
+    ));
+    let a_notes = app_mut(window.hwnd)
+        .library
+        .default_state()
+        .unwrap()
+        .notes
+        .len();
+
+    execute_command(window.hwnd, CommandId::Save);
+    crate::window::library_host::name_box_submit(window.hwnd);
+
+    let saved = b.folder().join("Draft.md");
+    assert_eq!(std::fs::read_to_string(&saved).unwrap(), "Draft");
+    assert!(!a.folder().join("Draft.md").exists());
+    assert_eq!(
+        app_mut(window.hwnd)
+            .library
+            .default_state()
+            .unwrap()
+            .notes
+            .len(),
+        a_notes,
+        "A is unchanged"
+    );
+    assert_eq!(crate::window::library_host::notebooks(window.hwnd).len(), 1);
+}
+
+#[test]
+fn the_breadcrumb_shows_the_active_notes_own_notebook() {
+    // Break caught: the editor toolbar naming the default notebook's location for a note of
+    // another notebook, or none at all.
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("ms-crumb-a");
+    a.note("a.md", "a");
+    let b = LibraryScratch::new("ms-crumb-b");
+    let work = b.root.join("Work");
+    std::fs::create_dir_all(work.join("plans")).unwrap();
+    let note = work.join("plans").join("Q3.md");
+    std::fs::write(&note, "q3").unwrap();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(a.data());
+    a.install(window.hwnd);
+    open_and_load_folder(&window, &work);
+    super::super::open_path(window.hwnd, &note).unwrap();
+
+    let group = app_mut(window.hwnd).tabs.active_group();
+    let segments = crate::window::editor_toolbar::location(window.hwnd, group);
+    assert_eq!(segments.first().map(String::as_str), Some("Work"));
+    assert_eq!(segments.len(), 3, "{segments:?}");
+}
+
+#[test]
+fn opening_a_note_clears_its_changed_mark_in_its_own_notebook() {
+    // Break caught: opening a note of a notebook that is not the default leaving its "changed
+    // outside FastPad" mark, because the mark was cleared in the default notebook.
+    let _scintilla = load_native_scintilla();
+    let (_a, b, window, _editor, b_id) = two_notebooks("ms-seen");
+    let note = b.folder().join("b.md");
+    crate::window::library_host::with_notebook(window.hwnd, b_id, |state| {
+        assert!(state.mark_changed(std::path::Path::new("b.md")));
+    })
+    .unwrap();
+
+    super::super::open_path(window.hwnd, &note).unwrap();
+
+    let marked = crate::window::library_host::with_notebook(window.hwnd, b_id, |state| {
+        state.local.is_changed(std::path::Path::new("b.md"))
+    });
+    assert_eq!(marked, Some(false));
 }

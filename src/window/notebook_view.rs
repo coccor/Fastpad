@@ -11,6 +11,7 @@ use crate::window::design::text_scale::scale_text;
 use crate::window::drag_label::DragLabel;
 use crate::window::icon_sets::images::IconImages;
 use crate::window::inline_name::InlineName;
+use crate::window::library_host::NotebookId;
 use crate::window::open_editors::OpenEditors;
 use crate::window::panel_cursor::Cursor;
 use crate::window::row_list::RowListState;
@@ -47,7 +48,120 @@ const GAP: i32 = 6;
 const PIN_BOX: i32 = 24;
 const TYPE_AHEAD_RESET: Duration = Duration::from_secs(1);
 
+/// Selects the root row of the open notebook `id` and scrolls it into view (opening a notebook
+/// that is already open does this).
+pub(crate) fn reveal_notebook(hwnd: HWND, id: NotebookId) {
+    crate::window::side_panel::refresh(hwnd);
+    with_view(hwnd, |view| {
+        let root = view_row_index(&view.rows, id, &RowKind::Root)
+            .or_else(|| view.rows.iter().position(|row| row.notebook == id));
+        if let Some(index) = root {
+            view.cursor = Cursor::Tree;
+            view.select(index);
+        }
+    });
+    crate::window::inline_name::place(hwnd);
+}
+
 pub(crate) const TRUNCATED_ROW: &str = "Showing the first 10,000 notes";
+
+/// What a placeholder row says (multi-root notebooks spec §4.3).
+pub(crate) const PLACEHOLDER_LOADING: &str = "Loading…";
+pub(crate) const PLACEHOLDER_FAILED: &str = "Couldn't load. Retry";
+pub(crate) const PLACEHOLDER_EMPTY: &str = "No notes yet";
+/// The default root's marker's tooltip (spec §4.2).
+pub(crate) const DEFAULT_MARKER_TIP: &str = "Default notebook";
+
+/// What a root row's label shows (multi-root notebooks spec §4.2): the notebook's name, the
+/// parent folder hint when two open notebooks share that name, and the default marker's tooltip
+/// on the default notebook.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RootLabel {
+    pub(crate) name: String,
+    pub(crate) hint: Option<String>,
+    pub(crate) marker: Option<&'static str>,
+}
+
+/// The root row label of the open notebook `id`, as the view last built it.
+#[cfg(test)]
+pub(crate) fn root_label(hwnd: HWND, id: NotebookId) -> Option<RootLabel> {
+    with_view(hwnd, |view| view.root(id).map(|root| root.label.clone())).flatten()
+}
+
+/// The text of the tooltip tool a tooltip control picks at `(x, y)`: the first tool, in the
+/// order they are added, whose rectangle holds the point.
+#[cfg(test)]
+pub(crate) fn tooltip_at(hwnd: HWND, x: i32, y: i32) -> Option<String> {
+    let fonts = crate::window::main_window::ui_fonts(hwnd);
+    with_view(hwnd, |view| {
+        view.tooltip_tools(fonts)
+            .into_iter()
+            .find(|(_, rect, text)| {
+                !text.is_empty()
+                    && x >= rect.left
+                    && x < rect.right
+                    && y >= rect.top
+                    && y < rect.bottom
+            })
+            .map(|(_, _, text)| text)
+    })
+    .flatten()
+}
+
+/// The default marker's tooltip rectangle on the hovered root row.
+#[cfg(test)]
+pub(crate) fn marker_tool_rect(hwnd: HWND) -> Option<RECT> {
+    let fonts = crate::window::main_window::ui_fonts(hwnd);
+    with_view(hwnd, |view| {
+        view.tooltip_tools(fonts)
+            .into_iter()
+            .find(|(id, rect, _)| *id == TOOL_DEFAULT && rect.right > rect.left)
+            .map(|(_, rect, _)| rect)
+    })
+    .flatten()
+}
+
+/// What the view knows of one open notebook, for its root row (multi-root notebooks spec §4.2).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RootInfo {
+    pub(crate) id: NotebookId,
+    pub(crate) folder: PathBuf,
+    pub(crate) label: RootLabel,
+    pub(crate) favorite: bool,
+    /// Some folder of it is expanded: its toggle button offers Collapse all.
+    pub(crate) folders_open: bool,
+}
+
+/// What one root's rows depend on besides its library state (multi-root notebooks spec §4.1).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RootKey {
+    pub(crate) id: NotebookId,
+    pub(crate) folder: PathBuf,
+    /// Its state has arrived from the worker.
+    pub(crate) loaded: bool,
+    /// Its last load failed (`library_host::load_failed_of`).
+    pub(crate) failed: bool,
+    /// `library_host::expansion_revision`, bumped whenever a folder or root is expanded or
+    /// collapsed.
+    pub(crate) expansion: u64,
+    /// `library_host::root_expanded_of`.
+    pub(crate) root_expanded: bool,
+    /// Its scan stopped at the limit: a row after its last says so.
+    pub(crate) truncated: bool,
+}
+
+/// The root `…` menu's "Set as default notebook", a local action on a reused command id.
+pub(crate) const ROOT_MENU_SET_DEFAULT: crate::window::commands::CommandId =
+    crate::window::commands::CommandId::ShowNotebookView;
+
+pub(crate) const fn placeholder_text(placeholder: tree::Placeholder) -> &'static str {
+    match placeholder {
+        tree::Placeholder::Loading => PLACEHOLDER_LOADING,
+        tree::Placeholder::Failed => PLACEHOLDER_FAILED,
+        tree::Placeholder::Empty => PLACEHOLDER_EMPTY,
+        tree::Placeholder::Truncated => TRUNCATED_ROW,
+    }
+}
 
 /// The panel's timer while a drag is under way (tree drag spec §3.3).
 pub(crate) const DRAG_TIMER: usize = 0x4452;
@@ -66,8 +180,8 @@ const GLYPH_FOLDER: &str = "\u{E8B7}";
 const GLYPH_PIN: &str = "\u{E840}";
 /// The tilted pin's head fill (PinFill), with no needle: drawn under `GLYPH_PIN`.
 const GLYPH_PINNED: &str = "\u{E842}";
-const GLYPH_STAR: &str = "\u{E734}";
-const GLYPH_STAR_FILLED: &str = "\u{E735}";
+/// Segoe's Home: the default notebook's marker after its root row's name.
+const GLYPH_DEFAULT: &str = "\u{E80F}";
 const GLYPH_ADD: &str = "\u{E710}";
 const GLYPH_MORE: &str = "\u{E712}";
 const GLYPH_NEW_FOLDER: &str = "\u{E8F4}";
@@ -79,33 +193,30 @@ const GLYPH_EXPAND_ALL: &str = "\u{E972}";
 // Tooltip tool IDs.
 const TOOL_ROW: usize = 1;
 const TOOL_TITLE: usize = 2;
-const TOOL_FAVORITE: usize = 3;
+/// The default root's marker.
+const TOOL_DEFAULT: usize = 3;
 const TOOL_NEW: usize = 4;
 const TOOL_MORE: usize = 5;
 const TOOL_NEW_FOLDER: usize = 6;
 const TOOL_REFRESH: usize = 7;
 const TOOL_TOGGLE_FOLDERS: usize = 8;
 
-/// What the view shows.
+/// What the view shows (multi-root notebooks spec §4.1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Mode {
     /// No notebook: "Open a notebook to see its notes.", "Open notebook…", "New notebook…" and
     /// the RECENT list.
     NoNotebook,
-    /// A notebook is open but its state has not arrived from the worker.
-    Loading,
-    /// Loaded, with no notes.
-    Empty,
+    /// One root row per open notebook, each with its tree or a placeholder under it.
     Tree,
-    /// The notebook's load failed: a message, "Retry" and "Open notebook…".
-    Failed,
 }
 
+/// What the Search view says about a target notebook whose load failed.
 pub(crate) const LOAD_FAILED: &str = "Couldn't load this notebook.";
 
+/// A root row's buttons (multi-root notebooks spec §4.2).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HeaderButton {
-    Favorite,
     NewNote,
     NewFolder,
     /// Scans the notebook's folder again.
@@ -140,14 +251,13 @@ enum Hit {
         index: usize,
         close: bool,
     },
-    /// The root row's chevron or name: toggles the tree.
-    Root,
-    /// A root row button.
-    Header(HeaderButton),
-    /// "Open notebook…" (no notebook), "New note" (empty notebook) or "Retry" (failed load).
+    /// The root row of a notebook, off its buttons: toggles that notebook's tree.
+    Root(NotebookId),
+    /// A button of the root row of a notebook.
+    Header(NotebookId, HeaderButton),
+    /// "Open notebook…", with no notebook open.
     StateButton,
-    /// "New notebook…" under "Open notebook…" (no notebook), or "Open notebook…" under "Retry"
-    /// (failed load).
+    /// "New notebook…" under "Open notebook…", with no notebook open.
     SecondButton,
     /// The scroll thumb, with where on it the press landed.
     Thumb(i32),
@@ -162,9 +272,39 @@ enum Hit {
 #[derive(Clone, Debug)]
 enum Target {
     Recent(PathBuf),
-    Row(TreeRow),
+    /// A row of the open notebook `NotebookId`: its root row, a placeholder, a folder or a note.
+    Row(NotebookId, TreeRow),
     Truncated,
     Nothing,
+}
+
+/// One row of the Notebook view's list (multi-root notebooks spec §4.1): a row of an open
+/// notebook's tree, its root row or a placeholder, and the notebook it belongs to. Paths stay
+/// relative to that notebook.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ViewRow {
+    pub(crate) notebook: NotebookId,
+    pub(crate) row: TreeRow,
+}
+
+impl std::ops::Deref for ViewRow {
+    type Target = TreeRow;
+
+    fn deref(&self) -> &TreeRow {
+        &self.row
+    }
+}
+
+impl AsRef<TreeRow> for ViewRow {
+    fn as_ref(&self) -> &TreeRow {
+        &self.row
+    }
+}
+
+/// The index of the row of notebook `id` that shows `kind`.
+pub(crate) fn view_row_index(rows: &[ViewRow], id: NotebookId, kind: &RowKind) -> Option<usize> {
+    rows.iter()
+        .position(|row| row.notebook == id && tree::same_kind(&row.kind, kind))
 }
 
 // windows-sys RECT is only Clone + Copy, so the layout structs are too.
@@ -271,19 +411,35 @@ pub(crate) fn state_layout(body: RECT, dpi: u32) -> StateLayout {
     }
 }
 
-/// The row that stands for `kind` after a rebuild: the same path if it is still there, else the
-/// row that took its index (clamped to the list). Nothing selected stays nothing.
+/// The row that stands for `kind` of notebook `id` after a rebuild: the same path in the same
+/// notebook if it is still there, else the row that took its index (clamped to the list) when
+/// that row is the same notebook's, else the nearest end of that notebook's rows: a row of
+/// another notebook would change the target notebook silently. Nothing selected stays nothing.
 pub(crate) fn follow(
-    rows: &[TreeRow],
-    kind: Option<&RowKind>,
+    rows: &[ViewRow],
+    kind: Option<(NotebookId, &RowKind)>,
     old: Option<usize>,
 ) -> Option<usize> {
-    let kind = kind?;
-    if let Some(index) = tree::row_index(rows, kind) {
+    let (id, kind) = kind?;
+    if let Some(index) = view_row_index(rows, id, kind) {
         return Some(index);
     }
     let last = rows.len().checked_sub(1)?;
-    Some(old.unwrap_or(0).min(last))
+    let at = old.unwrap_or(0).min(last);
+    if rows[at].notebook == id {
+        return Some(at);
+    }
+    let Some(first) = rows.iter().position(|row| row.notebook == id) else {
+        return Some(at);
+    };
+    if at < first {
+        return Some(first);
+    }
+    Some(
+        rows.iter()
+            .rposition(|row| row.notebook == id)
+            .unwrap_or(first),
+    )
 }
 
 /// How `flatten` keys an expanded folder: the same lowercasing as `model::same_path`.
@@ -330,7 +486,7 @@ pub(crate) fn changed_rows(tree: &NoteTree, changed: &[PathBuf]) -> Vec<TreeRow>
     rows.retain(|row| match &row.kind {
         RowKind::Note(_) => row.changed,
         RowKind::Folder(path) => folder_keys.contains(&expanded_key(path)),
-        RowKind::Draft => false,
+        RowKind::Draft | RowKind::Root | RowKind::Placeholder(_) => false,
     });
     rows
 }
@@ -357,19 +513,16 @@ impl TypeAhead {
 }
 
 /// Everything the rows depend on besides the library itself, whose changes always come through
-/// `side_panel::refresh` (a full rebuild). A tab switch that leaves this unchanged re-selects a
-/// row without flattening the tree again.
+/// `side_panel::refresh` (a full rebuild): one key per open notebook, in sidebar order, the
+/// default notebook and the changed-notes filter. A tab switch that leaves this unchanged
+/// re-selects a row without flattening the trees again.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RebuildKey {
-    root: Option<PathBuf>,
-    loaded: bool,
-    /// The last load failed (`library_host::load_failed`).
-    failed: bool,
-    /// `library_host::expansion_revision`, bumped whenever a folder is expanded or collapsed.
-    expansion: u64,
-    /// `library_host::root_expanded`: collapsing the root row is a rebuild.
-    root_expanded: bool,
-    /// `library_host::changed_only`: the view shows only notes changed outside FastPad.
+    roots: Vec<RootKey>,
+    /// The default notebook, whose root row shows the marker.
+    default: Option<NotebookId>,
+    /// `library_host::changed_only`: the view shows only notes changed outside FastPad, in
+    /// every notebook.
     changed_only: bool,
 }
 
@@ -377,19 +530,16 @@ struct RebuildKey {
 pub(crate) struct NotebookView {
     pub(crate) panel: HWND,
     pub(crate) mode: Mode,
-    pub(crate) rows: Vec<TreeRow>,
-    /// The scan stopped at its limit: one more row, after the last, says so.
-    pub(crate) truncated: bool,
+    /// Root by root: each open notebook's root row, then its tree or one placeholder while it
+    /// is expanded (multi-root notebooks spec §4.1).
+    pub(crate) rows: Vec<ViewRow>,
     pub(crate) list: RowListState,
     /// The no-notebook state's RECENT notebooks and their display names.
     pub(crate) recent: Vec<PathBuf>,
     recent_names: Vec<(String, Option<String>)>,
-    root: Option<PathBuf>,
-    name: String,
-    favorite: bool,
-    /// Some folder is expanded: the toggle button reads Collapse all, else Expand all.
-    folders_open: bool,
-    /// The header button (or state button) under the pointer.
+    /// The open notebooks, in sidebar order, as the rows were last built.
+    pub(crate) roots: Vec<RootInfo>,
+    /// The root row button (or state button) under the pointer.
     hover: Option<Hit>,
     /// The pointer is over the hovered row's pin button.
     pub(crate) hover_pin: bool,
@@ -401,6 +551,8 @@ pub(crate) struct NotebookView {
     /// distance, which moves or copies (tree drag spec §3, open editors spec §4.3); or an
     /// Explorer drag over the panel.
     pub(crate) drag: Option<Drag>,
+    /// The notebook `drag` moves or copies within (multi-root notebooks spec §4.5).
+    pub(crate) drag_notebook: Option<NotebookId>,
     /// The right press that cancelled a drag: its release opens no menu.
     pub(crate) eat_right_up: bool,
     /// The label following the pointer while a drag is under way (tree drag spec §3.2).
@@ -419,12 +571,10 @@ pub(crate) struct NotebookView {
     pub(crate) editors: OpenEditors,
     /// The Open Editors section is expanded (`main_window::open_editors_expanded`).
     editors_expanded: bool,
-    /// The notebook's root row is expanded (`library_host::root_expanded`).
-    root_expanded: bool,
     /// The tab under a middle press on an Open Editors row: its release there closes it.
     middle_press: Option<DocumentId>,
-    /// The one keyboard selection through the header rows, the Open Editors rows and the tree
-    /// (open editors spec §3.5). `Cursor::Tree` leaves it to `list.selected`.
+    /// The one keyboard selection through the Open Editors rows and the tree (open editors spec
+    /// §3.5). `Cursor::Tree` leaves it to `list.selected`.
     pub(crate) cursor: Cursor,
     /// Full rebuilds so far, for the tests that check a tab switch skips one.
     #[cfg(test)]
@@ -454,21 +604,42 @@ const fn contains(rect: RECT, x: i32, y: i32) -> bool {
 const LINE: u32 = DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX;
 const CENTERED: u32 = DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX;
 
+/// A row of the notebook `notebook` at `depth`.
+fn view_row(notebook: NotebookId, kind: RowKind, depth: u16, name: String) -> ViewRow {
+    ViewRow {
+        notebook,
+        row: TreeRow {
+            kind,
+            depth,
+            name,
+            pinned: false,
+            expanded: false,
+            changed: false,
+        },
+    }
+}
+
+/// A placeholder row under the root of `notebook` (multi-root notebooks spec §4.3).
+fn placeholder_row(notebook: NotebookId, placeholder: tree::Placeholder) -> ViewRow {
+    view_row(
+        notebook,
+        RowKind::Placeholder(placeholder),
+        1,
+        placeholder_text(placeholder).to_owned(),
+    )
+}
+
 impl NotebookView {
     pub(crate) fn new(panel: HWND) -> Self {
         let dpi = unsafe { GetDpiForWindow(panel) }.max(96);
         Self {
             panel,
-            mode: Mode::Loading,
+            mode: Mode::NoNotebook,
             rows: Vec::new(),
-            truncated: false,
             list: RowListState::new(sidebar_row(dpi)),
             recent: Vec::new(),
             recent_names: Vec::new(),
-            root: None,
-            name: String::new(),
-            favorite: false,
-            folders_open: false,
+            roots: Vec::new(),
             hover: None,
             hover_pin: false,
             tooltip: None,
@@ -476,6 +647,7 @@ impl NotebookView {
             typed: TypeAhead::default(),
             thumb_grab: None,
             drag: None,
+            drag_notebook: None,
             eat_right_up: false,
             drag_label: None,
             tracking_leave: false,
@@ -485,13 +657,13 @@ impl NotebookView {
             images: IconImages::new(),
             editors: OpenEditors::new(sidebar_row(dpi)),
             editors_expanded: true,
-            root_expanded: true,
             middle_press: None,
             cursor: Cursor::Tree,
             #[cfg(test)]
             rebuilds: 0,
         }
     }
+
     fn target(&self, index: usize) -> Target {
         match self.mode {
             Mode::NoNotebook => self
@@ -500,12 +672,23 @@ impl NotebookView {
                 .cloned()
                 .map_or(Target::Nothing, Target::Recent),
             Mode::Tree => match self.rows.get(index) {
-                Some(row) => Target::Row(row.clone()),
-                None if self.truncated && index == self.rows.len() => Target::Truncated,
+                Some(ViewRow {
+                    row:
+                        TreeRow {
+                            kind: RowKind::Placeholder(tree::Placeholder::Truncated),
+                            ..
+                        },
+                    ..
+                }) => Target::Truncated,
+                Some(row) => Target::Row(row.notebook, row.row.clone()),
                 None => Target::Nothing,
             },
-            Mode::Loading | Mode::Empty | Mode::Failed => Target::Nothing,
         }
+    }
+
+    /// The open notebook `id`'s root row information.
+    pub(crate) fn root(&self, id: NotebookId) -> Option<&RootInfo> {
+        self.roots.iter().find(|root| root.id == id)
     }
 
     fn select(&mut self, index: usize) {
@@ -514,26 +697,58 @@ impl NotebookView {
         self.invalidate();
     }
 
-    fn apply(&mut self, mut snapshot: Snapshot, names: Vec<(String, Option<String>)>) {
-        // A draft row needs the tree, even in a notebook with nothing listed yet (inline naming
-        // spec §3.1), as long as the draft lasts.
-        let empty = snapshot.mode == Mode::Empty;
-        if empty && self.inline.wants_draft() {
-            snapshot.mode = Mode::Tree;
-        }
-        // The edit ends with its notebook, when the tree goes, or when its folder or row is no
-        // longer listed (spec §5.4); `fit` puts the draft row back in. An empty notebook whose
-        // draft ended keeps its empty state.
-        if snapshot.root != self.root
-            || snapshot.mode != Mode::Tree
-            || !self.inline.fit(&mut snapshot.rows)
-        {
-            self.inline.end();
-            if empty {
-                snapshot.mode = Mode::Empty;
+    /// The rows, root by root (multi-root notebooks spec §4.1): each notebook's root row and,
+    /// while it is expanded, its tree one level under it, or one placeholder. The inline edit is
+    /// fitted to its own notebook's rows; it ends when that notebook, its folder or its row is
+    /// no longer shown (inline naming spec §5.4).
+    fn build_rows(&mut self, roots: Vec<RootSnapshot>) -> Vec<ViewRow> {
+        let edit_root = self.inline.root().map(Path::to_path_buf);
+        let mut fitted = edit_root.is_none();
+        let mut rows = Vec::new();
+        for root in roots {
+            let id = root.info.id;
+            let mut root_row = view_row(id, RowKind::Root, 0, root.info.label.name.clone());
+            root_row.row.expanded = root.expanded;
+            rows.push(root_row);
+            if !root.expanded {
+                continue;
+            }
+            let Some(mut tree_rows) = root.rows else {
+                let placeholder = if root.failed {
+                    tree::Placeholder::Failed
+                } else {
+                    tree::Placeholder::Loading
+                };
+                rows.push(placeholder_row(id, placeholder));
+                continue;
+            };
+            let edited = edit_root
+                .as_deref()
+                .is_some_and(|edited| crate::library::model::same_path(edited, &root.info.folder));
+            if edited && self.inline.fit(&mut tree_rows) {
+                fitted = true;
+                self.inline.shift(rows.len());
+            }
+            if tree_rows.is_empty() {
+                rows.push(placeholder_row(id, tree::Placeholder::Empty));
+            }
+            rows.extend(tree_rows.into_iter().map(|mut row| {
+                row.depth = row.depth.saturating_add(1);
+                ViewRow { notebook: id, row }
+            }));
+            // The scan stopped at its limit: said after its root's last row.
+            if root.truncated {
+                rows.push(placeholder_row(id, tree::Placeholder::Truncated));
             }
         }
-        let reset = snapshot.mode != self.mode || snapshot.root != self.root;
+        if !fitted {
+            self.inline.end();
+        }
+        rows
+    }
+
+    fn apply(&mut self, snapshot: Snapshot, names: Vec<(String, Option<String>)>) {
+        let reset = snapshot.mode != self.mode;
         if reset {
             self.list = RowListState::new(self.list.row_height);
             self.typed = TypeAhead::default();
@@ -542,52 +757,48 @@ impl NotebookView {
             .list
             .selected
             .and_then(|index| self.rows.get(index))
-            .map(|row| row.kind.clone());
+            .map(|row| (row.notebook, row.kind.clone()));
         let top = (!reset)
-            .then(|| self.rows.get(self.list.top).map(|row| row.kind.clone()))
+            .then(|| {
+                self.rows
+                    .get(self.list.top)
+                    .map(|row| (row.notebook, row.kind.clone()))
+            })
             .flatten();
         let (old_selected, old_top) = (self.list.selected, self.list.top);
+        let old_order: Vec<NotebookId> = self.roots.iter().map(|root| root.id).collect();
+        let infos: Vec<RootInfo> = snapshot
+            .roots
+            .iter()
+            .map(|root| root.info.clone())
+            .collect();
+        let rows = self.build_rows(snapshot.roots);
         let reordered = reset
             || snapshot.recent != self.recent
-            || snapshot.rows.len() != self.rows.len()
-            || snapshot
-                .rows
+            || rows.len() != self.rows.len()
+            || rows
                 .iter()
                 .zip(&self.rows)
-                .any(|(new, old)| new.kind != old.kind);
+                .any(|(new, old)| new.notebook != old.notebook || new.kind != old.kind);
         if reordered {
             self.order = self.order.wrapping_add(1);
+            // The rows moved under a pointer that has not: the old hover names another row, and
+            // a hot root button another root's.
+            self.list.hover = None;
+            self.hover = None;
         }
         self.mode = snapshot.mode;
-        self.root_expanded = snapshot.root_expanded;
         let expanding = snapshot.editors_expanded && !self.editors_expanded;
         self.editors_expanded = snapshot.editors_expanded;
-        // The keyboard selection leaves a row that is gone: a tree row hidden by its collapsed
-        // root to the root row (open editors spec §3.5); the root row with its notebook and a tab
-        // row with its section to the Open Editors header, which is always there.
-        if self.cursor == Cursor::Tree && self.tree_hidden() {
-            self.cursor = Cursor::Root;
-        }
-        let gone = match self.cursor {
-            Cursor::Root => self.mode == Mode::NoNotebook,
-            Cursor::Editor(_) => !self.editors_expanded,
-            Cursor::EditorsHeader | Cursor::Tree => false,
-        };
-        if gone {
+        // A tab row's keyboard selection goes with its section to the Open Editors header,
+        // which is always there.
+        if matches!(self.cursor, Cursor::Editor(_)) && !self.editors_expanded {
             self.cursor = Cursor::EditorsHeader;
         }
         // The section's rows fit its height again, the active row in view once it shows.
         self.fit_editors(expanding);
-        self.name = snapshot
-            .root
-            .as_deref()
-            .map(super::library_host::notebook_name)
-            .unwrap_or_default();
-        self.root = snapshot.root;
-        self.favorite = snapshot.favorite;
-        self.folders_open = snapshot.folders_open;
-        self.rows = snapshot.rows;
-        self.truncated = snapshot.truncated;
+        self.roots = infos;
+        self.rows = rows;
         self.recent = snapshot.recent;
         self.recent_names = names;
         self.built = Some(snapshot.key);
@@ -596,19 +807,53 @@ impl NotebookView {
             self.rebuilds += 1;
         }
         let count = match self.mode {
-            Mode::Tree => self.rows.len() + usize::from(self.truncated),
+            Mode::Tree => self.rows.len(),
             Mode::NoNotebook => self.recent.len(),
-            Mode::Loading | Mode::Empty | Mode::Failed => 0,
         };
         self.list.set_count(count);
         // Measured in the new mode's list area.
         let height = self.list_height();
         if self.mode == Mode::Tree {
-            self.list.selected = follow(&self.rows, selected.as_ref(), old_selected);
-            self.list.top = follow(&self.rows, top.as_ref(), Some(old_top)).unwrap_or(0);
+            self.list.selected = self.follow_selection(selected.as_ref(), old_selected, &old_order);
+            self.list.top = follow(
+                &self.rows,
+                top.as_ref().map(|(id, kind)| (*id, kind)),
+                Some(old_top),
+            )
+            .unwrap_or(0);
             self.list.scroll_lines(0, height);
         }
         self.hover_pin = false;
+    }
+
+    /// Where the selection goes after a rebuild: its row if still shown; the root row of its
+    /// notebook when a collapsed root hid it (open editors spec §3.5); else the row that took
+    /// its place.
+    fn follow_selection(
+        &self,
+        selected: Option<&(NotebookId, RowKind)>,
+        old: Option<usize>,
+        old_order: &[NotebookId],
+    ) -> Option<usize> {
+        let (id, kind) = selected?;
+        // The selected row's notebook closed: the next notebook's root row, else the previous
+        // one's, else nothing. Taking whatever row now sits at that index could change the
+        // target notebook silently.
+        if view_row_index(&self.rows, *id, &RowKind::Root).is_none() {
+            let at = old_order.iter().position(|open| open == id)?;
+            let root_of = |open: &NotebookId| view_row_index(&self.rows, *open, &RowKind::Root);
+            return old_order[at + 1..]
+                .iter()
+                .find_map(root_of)
+                .or_else(|| old_order[..at].iter().rev().find_map(root_of));
+        }
+        if view_row_index(&self.rows, *id, kind).is_none()
+            && let Some(root) = view_row_index(&self.rows, *id, &RowKind::Root)
+            && !self.rows[root].expanded
+        {
+            return Some(root);
+        }
+        follow(&self.rows, Some((*id, kind)), old)
     }
 }
 

@@ -313,7 +313,7 @@ fn open_editors_a_tab_and_an_explorer_file_copy_into_an_empty_notebook() {
         std::fs::write(&outside, "t").unwrap();
         let (window, _editor) = notebook_window(&scratch);
         super::super::open_path(window.hwnd, &outside).unwrap();
-        assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+        assert!(shows_empty(window.hwnd));
         let panel = sidebar_windows(window.hwnd).1;
 
         let tab = notebook_view(window.hwnd)
@@ -345,7 +345,7 @@ fn open_editors_a_tab_and_an_explorer_file_copy_into_an_empty_notebook() {
     let dropped = scratch.root.join("dropped.md");
     std::fs::write(&dropped, "d").unwrap();
     let (window, _editor) = notebook_window(&scratch);
-    assert_eq!(notebook_view(window.hwnd).mode, Mode::Empty);
+    assert!(shows_empty(window.hwnd));
     let panel = sidebar_windows(window.hwnd).1;
     crate::window::side_panel::accept_file_drops(window.hwnd);
     let root = notebook_view(window.hwnd).root_rect();
@@ -368,11 +368,20 @@ fn inline_name_a_new_note_or_rename_with_the_root_collapsed_expands_it_and_shows
     let collapse = || {
         crate::window::library_host::set_root_expanded(window.hwnd, false);
         crate::window::notebook_view::rebuild(window.hwnd);
-        assert!(!notebook_view(window.hwnd).tree_shown());
+        assert_eq!(
+            view_rows(window.hwnd),
+            [(first_id(window.hwnd), RowKind::Root)]
+        );
     };
     collapse();
     let panel = sidebar_windows(window.hwnd).1;
     let root = notebook_view(window.hwnd).root_rect();
+    mouse(
+        panel,
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE,
+        0,
+        centre(root),
+    );
     let (_, new_note) = crate::window::notebook_layout::root_parts(root, 96)
         .buttons
         .into_iter()
@@ -382,14 +391,18 @@ fn inline_name_a_new_note_or_rename_with_the_root_collapsed_expands_it_and_shows
     mouse(panel, WM_LBUTTONUP, 0, centre(new_note));
     assert!(inline_open(window.hwnd));
     assert!(crate::window::library_host::root_expanded(window.hwnd));
-    assert!(notebook_view(window.hwnd).tree_shown());
+    assert!(view_rows(window.hwnd).len() > 1, "the root shows its rows");
     assert!(is_shown(inline_field(window.hwnd)), "the name field shows");
     field_key(window.hwnd, VK_ESCAPE);
 
     collapse();
-    crate::window::inline_name::rename(window.hwnd, &RowKind::Note("a.md".into()));
+    crate::window::inline_name::rename(
+        window.hwnd,
+        first_id(window.hwnd),
+        &RowKind::Note("a.md".into()),
+    );
     assert!(inline_open(window.hwnd));
-    assert!(notebook_view(window.hwnd).tree_shown());
+    assert!(view_rows(window.hwnd).len() > 1, "the root shows its rows");
     assert!(
         is_shown(inline_field(window.hwnd)),
         "the rename field shows"
@@ -399,7 +412,7 @@ fn inline_name_a_new_note_or_rename_with_the_root_collapsed_expands_it_and_shows
     collapse();
     crate::window::inline_name::rename_note_at(window.hwnd, &scratch.folder().join("a.md"));
     assert!(inline_open(window.hwnd));
-    assert!(notebook_view(window.hwnd).tree_shown());
+    assert!(view_rows(window.hwnd).len() > 1, "the root shows its rows");
     assert!(
         is_shown(inline_field(window.hwnd)),
         "the revealed row's field shows"
@@ -424,15 +437,15 @@ fn open_editors_a_collapsed_root_takes_the_keyboard_off_the_hidden_tree() {
 
     crate::window::library_host::set_root_expanded(window.hwnd, false);
     crate::window::notebook_view::rebuild(window.hwnd);
-    assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Root);
+    // The hidden rows are gone from the list: the selection moved to their root row.
+    assert_eq!(notebook_view(window.hwnd).cursor, Cursor::Tree);
+    assert_eq!(selected_kind(window.hwnd), Some(RowKind::Root));
 
-    // Even a selection left in the tree some other way acts on nothing hidden.
-    notebook_view(window.hwnd).cursor = Cursor::Tree;
     let panel = sidebar_windows(window.hwnd).1;
     unsafe { SendMessageW(panel, WM_CHAR, 'b' as usize, 0) };
     assert_eq!(
         selected_kind(window.hwnd),
-        Some(RowKind::Note("a.md".into())),
+        Some(RowKind::Root),
         "type-ahead selects no hidden row"
     );
     let _ = crate::window::modal::take_last_confirm();
@@ -612,4 +625,73 @@ fn a_tab_label_is_painted_without_the_sidebar() {
     )
     .expect("label image");
     assert!(image.size.cx > image.size.cy);
+}
+
+#[test]
+fn files_dropped_from_outside_copy_into_the_root_under_the_cursor() {
+    // Break caught: every outside drop landing in the default notebook, whichever root the
+    // pointer is over (multi-root notebooks spec §4.5).
+    use windows_sys::Win32::System::Ole::DROPEFFECT_COPY;
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("drop-cross-root", "a", "b");
+    let hwnd = ab.window.hwnd;
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, false);
+    crate::window::notebook_view::rebuild(hwnd);
+    let panel = sidebar_windows(hwnd).1;
+    crate::window::side_panel::accept_file_drops(hwnd);
+    let dropped = ab.scratch.root.join("dropped.md");
+    std::fs::write(&dropped, "d").unwrap();
+
+    let on_b = notebook_view(hwnd)
+        .row_rect_at(row_in(hwnd, ab.b_id, &RowKind::Root))
+        .unwrap();
+    let effects = explorer_drop(
+        panel,
+        on_b.left + 40,
+        (on_b.top + on_b.bottom) / 2,
+        &[&dropped],
+    );
+    assert_eq!(effects, [DROPEFFECT_COPY; 3]);
+    pump_until(hwnd, || ab.b.join("dropped.md").exists());
+    crate::window::copy_host::wait_for_copies(hwnd);
+    assert!(!ab.a.join("dropped.md").exists(), "A was not the target");
+    let listed = crate::window::library_host::with_notebook(hwnd, ab.b_id, |state| {
+        state.is_listed(std::path::Path::new("dropped.md"))
+    });
+    assert_eq!(listed, Some(true), "B's state lists the copy");
+}
+
+#[test]
+fn an_open_editors_tab_dropped_on_a_root_copies_into_that_notebook() {
+    // Break caught: a tab drop going to the default notebook.
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("tab-cross-root", "a", "b");
+    let hwnd = ab.window.hwnd;
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, false);
+    crate::window::notebook_view::rebuild(hwnd);
+    let outside = ab.scratch.root.join("tab.md");
+    std::fs::write(&outside, "t").unwrap();
+    super::super::open_path(hwnd, &outside).unwrap();
+    let panel = sidebar_windows(hwnd).1;
+    let tab = notebook_view(hwnd)
+        .editors
+        .rows
+        .iter()
+        .position(|entry| {
+            entry
+                .row()
+                .is_some_and(|row| row.path.as_deref() == Some(outside.as_path()))
+        })
+        .unwrap();
+    start_tab_drag(hwnd, panel, tab);
+    let on_b = centre(
+        notebook_view(hwnd)
+            .row_rect_at(row_in(hwnd, ab.b_id, &RowKind::Root))
+            .unwrap(),
+    );
+    drag_over(panel, on_b);
+    drop_at(panel, on_b);
+    crate::window::copy_host::wait_for_copies(hwnd);
+    assert!(ab.b.join("tab.md").exists());
+    assert!(!ab.a.join("tab.md").exists());
 }
