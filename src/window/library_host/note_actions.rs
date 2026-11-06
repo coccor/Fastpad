@@ -56,7 +56,7 @@ pub(crate) fn move_to_notebook(hwnd: HWND, path: &Path) {
     let Some(source) = note_root(hwnd, path) else {
         push_notice(
             hwnd,
-            "Only notes in the open notebook can be moved to another notebook.".to_owned(),
+            "Only notes in an open notebook can be moved to another notebook.".to_owned(),
         );
         return;
     };

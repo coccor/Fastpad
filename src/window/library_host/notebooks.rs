@@ -141,6 +141,26 @@ pub(super) fn add_root(hwnd: HWND, path: &Path) -> Option<NotebookId> {
         return None;
     }
     let id = host(hwnd, |host| {
+        // An unavailable notebook that opens again is written where the sidebar shows it, and
+        // one nested with the folder the user opens gives way to it: `open=` never lists both,
+        // which the next start would resolve by dropping one silently (spec §6.1).
+        let gives_way = |gone: &PathBuf| {
+            library::model::same_path(gone, path)
+                || library::roots::nesting(std::slice::from_ref(gone), path).is_some()
+        };
+        let dropped: Vec<PathBuf> = host
+            .unavailable
+            .iter()
+            .filter(|gone| gives_way(gone))
+            .cloned()
+            .collect();
+        let was_dropped = |folder: &PathBuf| {
+            dropped
+                .iter()
+                .any(|gone| library::model::same_path(gone, folder))
+        };
+        host.unavailable.retain(|gone| !was_dropped(gone));
+        host.open_order.retain(|folder| !was_dropped(folder));
         let id = host.add_notebook(path.to_path_buf());
         // The user moved on: any check still in flight for a listed notebook is stale now.
         host.check_request = host.check_request.wrapping_add(1);

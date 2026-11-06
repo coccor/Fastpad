@@ -76,7 +76,13 @@ pub(crate) fn follow_wiki(hwnd: HWND, from: Option<&Path>, target: &str, heading
     let Some((id, root)) =
         link_notebook(hwnd, from).and_then(|id| notebook_folder(hwnd, id).map(|root| (id, root)))
     else {
-        push_notice(hwnd, "Open a notebook to follow links.".to_owned());
+        // With notebooks open, the note is outside all of them: opening one would not help.
+        let notice = if notebooks(hwnd).is_empty() {
+            "Open a notebook to follow links."
+        } else {
+            "This note isn't in an open notebook, so its links can't be followed."
+        };
+        push_notice(hwnd, notice.to_owned());
         return;
     };
     let from = from

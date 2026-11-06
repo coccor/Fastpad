@@ -227,8 +227,9 @@ fn a_missing_notebook_stays_remembered_when_another_is_opened_later() {
 }
 
 #[test]
-fn a_remembered_notebook_that_comes_back_opens_once_in_its_place() {
-    // Break caught: opening a folder that was unavailable at startup listing it twice in open=.
+fn a_remembered_notebook_that_comes_back_opens_once_in_sidebar_order() {
+    // Break caught: opening a folder that was unavailable at startup listing it twice in open=,
+    // or writing it back in its old place rather than where the sidebar shows it (spec §6.1).
     let _scintilla = load_native_scintilla();
     let a = LibraryScratch::new("startup13-a");
     a.note("a.md", "a");
@@ -243,7 +244,29 @@ fn a_remembered_notebook_that_comes_back_opens_once_in_its_place() {
     pump_until(window.hwnd, || all_loaded(&window, 2));
 
     assert_eq!(open_folders(&window), [a.folder(), gone.clone()]);
-    assert_eq!(saved_open(&a), [gone, a.folder()]);
+    assert_eq!(saved_open(&a), [a.folder(), gone]);
+}
+
+#[test]
+fn opening_a_folder_nested_with_an_unavailable_notebook_replaces_it() {
+    // Break caught: open= listing both an unavailable D:\Notes and the D:\Notes\Work the user
+    // then opened, so the next start silently drops one of them.
+    let _scintilla = load_native_scintilla();
+    let a = LibraryScratch::new("startup17-a");
+    a.note("a.md", "a");
+    let gone = a.root.join("gone");
+    write_open(&a.data(), &[gone.clone(), a.folder()], None);
+    let (window, _editor) = start(&a);
+
+    crate::window::library_host::open_library_step(window.hwnd);
+    pump_until(window.hwnd, || all_loaded(&window, 1));
+    let inside = gone.join("work");
+    std::fs::create_dir_all(&inside).unwrap();
+    crate::window::library_host::open_folder(window.hwnd, &inside);
+    pump_until(window.hwnd, || all_loaded(&window, 2));
+
+    assert_eq!(open_folders(&window), [a.folder(), inside.clone()]);
+    assert_eq!(saved_open(&a), [a.folder(), inside]);
 }
 
 fn launch_with(window: &ProductionWindow, folder: &std::path::Path) {

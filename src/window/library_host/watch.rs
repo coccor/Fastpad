@@ -13,17 +13,6 @@ const OWN_WRITE_GRACE: Duration = Duration::from_secs(2);
 /// changes counted as FastPad's own.
 const OWN_WRITE_LIMIT: Duration = Duration::from_secs(60);
 
-/// Starts watching the default notebook (a shim until every caller names its notebook).
-#[allow(
-    dead_code,
-    reason = "single-notebook shim; loads start the watcher of their own slot"
-)]
-pub(super) fn ensure_watcher(hwnd: HWND) {
-    if let Some(id) = default_notebook(hwnd) {
-        ensure_watcher_of(hwnd, id);
-    }
-}
-
 /// Starts watching the notebook `id`, once its state has loaded, unless notes mode is off, one
 /// is already running, or watching it failed before.
 pub(super) fn ensure_watcher_of(hwnd: HWND, id: NotebookId) {
@@ -264,14 +253,7 @@ fn mark_outside_changes_of(hwnd: HWND, id: NotebookId, paths: &[PathBuf]) {
     })
     .unwrap_or(false);
     if marked {
-        save_local_of(
-            hwnd,
-            id,
-            LocalWrite {
-                wait: false,
-                force: false,
-            },
-        );
+        save_local_soon_of(hwnd, id);
         crate::window::side_panel::refresh(hwnd);
     }
 }
@@ -295,14 +277,7 @@ pub(super) fn clear_visible_marks_of(hwnd: HWND, id: NotebookId) {
         .filter(|path| with_notebook(hwnd, id, |state| state.clear_changed(path)).unwrap_or(false))
         .count();
     if cleared > 0 {
-        save_local_of(
-            hwnd,
-            id,
-            LocalWrite {
-                wait: false,
-                force: false,
-            },
-        );
+        save_local_soon_of(hwnd, id);
     }
 }
 

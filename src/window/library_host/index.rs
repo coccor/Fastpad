@@ -166,17 +166,6 @@ pub(crate) fn index_ready(hwnd: HWND, lparam: isize) {
     }
 }
 
-/// Forgets the default notebook's index (a shim until every caller names its notebook).
-#[allow(
-    dead_code,
-    reason = "single-notebook shim; stopping a watcher resets its own slot"
-)]
-pub(crate) fn reset_index(hwnd: HWND) {
-    if let Some(id) = default_notebook(hwnd) {
-        reset_index_of(hwnd, id);
-    }
-}
-
 /// Forgets the notebook `id`'s index: it closed or switched, or notes mode went off. A build
 /// still running is dropped when it lands.
 pub(crate) fn reset_index_of(hwnd: HWND, id: NotebookId) {

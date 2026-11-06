@@ -100,16 +100,22 @@ pub(crate) fn toggle_pin(hwnd: HWND, path: &Path) {
     let owner = notebook_of(hwnd, path).filter(|id| {
         notebook_folder(hwnd, *id).is_some_and(|folder| library::is_inside(&folder, path))
     });
-    if !ready_library_of(hwnd, owner.or_else(|| default_notebook(hwnd))) {
-        return;
-    }
+    // A file outside every open notebook is refused as such, whatever state the notebooks are
+    // in: "Loading notebook…" would suggest the pin works once one has loaded.
     let Some(id) = owner else {
-        push_notice(
-            hwnd,
-            "Only notes in the open notebook can be pinned.".to_owned(),
-        );
+        if notebooks(hwnd).is_empty() {
+            ready_library_of(hwnd, None);
+        } else {
+            push_notice(
+                hwnd,
+                "Only notes in an open notebook can be pinned.".to_owned(),
+            );
+        }
         return;
     };
+    if !ready_library_of(hwnd, Some(id)) {
+        return;
+    }
     let mut now_on = false;
     let result = apply_op_of(hwnd, id, |state, ids| {
         now_on = !state.is_pinned(path);

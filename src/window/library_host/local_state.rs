@@ -81,14 +81,7 @@ pub(crate) fn set_expanded_of(hwnd: HWND, id: NotebookId, path: &Path, expanded:
         host(hwnd, |host| {
             host.expansion_revision = host.expansion_revision.wrapping_add(1);
         });
-        save_local_of(
-            hwnd,
-            id,
-            LocalWrite {
-                wait: false,
-                force: false,
-            },
-        );
+        save_local_soon_of(hwnd, id);
     }
 }
 
@@ -108,14 +101,7 @@ pub(crate) fn set_all_expanded_of(hwnd: HWND, id: NotebookId, expanded: bool) {
         host(hwnd, |host| {
             host.expansion_revision = host.expansion_revision.wrapping_add(1);
         });
-        save_local_of(
-            hwnd,
-            id,
-            LocalWrite {
-                wait: false,
-                force: false,
-            },
-        );
+        save_local_soon_of(hwnd, id);
     }
 }
 
@@ -166,14 +152,7 @@ pub(crate) fn set_root_expanded_of(hwnd: HWND, id: NotebookId, expanded: bool) {
         host(hwnd, |host| {
             host.expansion_revision = host.expansion_revision.wrapping_add(1);
         });
-        save_local_of(
-            hwnd,
-            id,
-            LocalWrite {
-                wait: false,
-                force: false,
-            },
-        );
+        save_local_soon_of(hwnd, id);
     }
 }
 
@@ -341,10 +320,17 @@ pub(super) fn flush_reporting(hwnd: HWND, wait: bool) {
                 }
             }
             Ok(_) => {}
-            Err(error) => push_notice(
-                hwnd,
-                format!("FastPad could not save this notebook's pins: {error}"),
-            ),
+            Err(error) => {
+                // With several notebooks open, the notice says whose pins were not saved.
+                let folder = notebook_folder(hwnd, id).unwrap_or_default();
+                push_notice(
+                    hwnd,
+                    format!(
+                        "FastPad could not save the pins of the notebook {}: {error}",
+                        folder.display()
+                    ),
+                );
+            }
         }
     }
 }

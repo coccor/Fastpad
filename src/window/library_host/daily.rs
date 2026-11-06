@@ -40,18 +40,6 @@ pub(crate) fn notebook_settings_of(hwnd: HWND, id: NotebookId) -> NotebookSettin
     slot(hwnd, id, |slot| slot.notebook.clone()).unwrap_or_default()
 }
 
-/// Reads the default notebook's `notebook.ini` again (a shim until every caller names its
-/// notebook).
-#[allow(
-    dead_code,
-    reason = "single-notebook shim; loads and watchers reload their own slot"
-)]
-pub(crate) fn reload_notebook_settings(hwnd: HWND) {
-    if let Some(id) = default_notebook(hwnd) {
-        reload_notebook_settings_of(hwnd, id);
-    }
-}
-
 /// Reads the notebook `id`'s `notebook.ini` again (on load, after a rescan, and when the watcher
 /// reports it). A file whose text changed reports its bad lines, once.
 pub(crate) fn reload_notebook_settings_of(hwnd: HWND, id: NotebookId) {
@@ -81,19 +69,6 @@ pub(crate) fn reload_notebook_settings_of(hwnd: HWND, id: NotebookId) {
         );
     }
     crate::window::side_panel::index_changed(hwnd);
-}
-
-/// Forgets the default notebook's conventions and closes the template picker's record (a shim
-/// until every caller names its notebook).
-#[allow(
-    dead_code,
-    reason = "single-notebook shim; stopping a watcher forgets its own slot's"
-)]
-pub(crate) fn forget_notebook_settings(hwnd: HWND) {
-    host(hwnd, |host| host.shown_templates = None);
-    if let Some(id) = default_notebook(hwnd) {
-        forget_notebook_settings_of(hwnd, id);
-    }
 }
 
 /// Forgets the notebook `id`'s conventions: it closed or another opened.

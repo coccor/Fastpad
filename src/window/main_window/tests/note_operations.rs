@@ -55,11 +55,60 @@ fn pinning_a_file_outside_the_open_notebook_is_refused() {
     assert!(
         notices(window.hwnd)
             .iter()
-            .any(|n| n == "Only notes in the open notebook can be pinned.")
+            .any(|n| n == "Only notes in an open notebook can be pinned.")
     );
     let state = app_mut(window.hwnd).library.default_state().unwrap();
     assert!(state.pending.is_empty());
     assert!(state.library.notes.is_empty());
+}
+
+#[test]
+fn a_failed_pin_write_names_the_notebook_it_failed_for() {
+    // Break caught: with two notebooks open, "could not save this notebook's pins" not saying
+    // which notebook's pins were lost (multi-root notebooks spec §3.4, §7).
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("pins-flush-fail", "a", "b");
+    let hwnd = ab.window.hwnd;
+    super::super::open_path(hwnd, &ab.a.join("a.md")).unwrap();
+    execute_command(hwnd, CommandId::NoteTogglePin);
+    super::super::open_path(hwnd, &ab.b.join("b.md")).unwrap();
+    execute_command(hwnd, CommandId::NoteTogglePin);
+    app_mut(hwnd).notifications.dismiss_all();
+    // B's library.ini replaced by bytes FastPad cannot read: its write fails, A's does not.
+    let ini = crate::library::store::library_file(&ab.b);
+    std::fs::create_dir_all(ini.parent().unwrap()).unwrap();
+    std::fs::write(&ini, [0xff, 0xfe, 0x00, 0x01]).unwrap();
+
+    crate::window::library_host::flush_now(hwnd);
+
+    let failures: Vec<String> = notices(hwnd)
+        .into_iter()
+        .filter(|notice| notice.contains("could not save"))
+        .collect();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+        failures[0].contains(&ab.b.display().to_string()),
+        "{failures:?}"
+    );
+}
+
+#[test]
+fn pinning_a_file_outside_every_notebook_does_not_say_loading() {
+    // Break caught: a file outside every open notebook reporting "Loading notebook…" while the
+    // default notebook loads, as if the pin would work once it has.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("pin-outside-loading");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.assume_folder(scratch.folder());
+    let outside = scratch.root.join("outside.md");
+    std::fs::write(&outside, "x").unwrap();
+    super::super::open_path(window.hwnd, &outside).unwrap();
+    execute_command(window.hwnd, CommandId::NoteTogglePin);
+    assert_eq!(
+        notices(window.hwnd),
+        ["Only notes in an open notebook can be pinned."]
+    );
 }
 
 #[test]

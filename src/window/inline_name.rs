@@ -1409,7 +1409,6 @@ fn commit_rename_folder(
     library_host::notes_moved_of(hwnd, id, &moves);
 }
 
-#[cfg(test)]
 /// The folder of the notebook the open edit acts in.
 #[cfg(test)]
 pub(crate) fn edit_root(hwnd: HWND) -> Option<PathBuf> {
