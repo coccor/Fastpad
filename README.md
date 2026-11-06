@@ -194,7 +194,8 @@ Open any folder and it becomes a notebook: a tree in the sidebar, folders as the
 pinned notes first. Notes are plain files, so nothing is locked in. **File → New notebook…** names
 a new folder and opens it as a notebook in one step.
 
-Opening another notebook adds it to the sidebar instead of replacing the first. Each open notebook
+The **+** at the top right of the Notebook view opens a notebook, creates one, or reopens a recent
+one. Opening another notebook adds it to the sidebar instead of replacing the first. Each open notebook
 is a collapsible root row of its own, and the sidebar button and tooltip read "*N* notebooks" once
 several are open. Every root has its own `…` menu with **Close notebook** and **Add to
 Favorites** (or **Remove from Favorites**); the other notebooks' menus also offer **Set as default

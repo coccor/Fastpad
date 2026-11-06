@@ -67,7 +67,11 @@ impl NotebookView {
     /// root row that shows them (hovered or selected, multi-root notebooks spec §4.2), or the
     /// no-notebook state's own buttons.
     pub(crate) fn buttons(&self, client: RECT, dpi: u32) -> Vec<(String, RECT)> {
-        let mut buttons = Vec::new();
+        // The title band's "+" comes first, in every mode.
+        let mut buttons = vec![(
+            "Add notebook".to_owned(),
+            crate::window::notebook_layout::add_notebook_button(client, dpi),
+        )];
         match self.mode {
             Mode::Tree => {
                 let list = self.list_area(client, dpi);

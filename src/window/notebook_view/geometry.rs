@@ -238,7 +238,11 @@ impl NotebookView {
         let dpi = self.dpi();
         let layout = self.layout(area, dpi);
         if y < layout.title.bottom {
-            return Hit::Empty;
+            return if contains(self.add_button(), x, y) {
+                Hit::AddNotebook
+            } else {
+                Hit::Empty
+            };
         }
         if contains(layout.editors_header, x, y) {
             return Hit::EditorsHeader;

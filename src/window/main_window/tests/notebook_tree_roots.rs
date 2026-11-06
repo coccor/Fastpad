@@ -314,7 +314,7 @@ fn with_no_notebook_open_the_view_shows_the_open_a_notebook_panel() {
         .into_iter()
         .map(|(name, _)| name)
         .collect();
-    assert_eq!(names, ["Open notebook…", "New notebook…"]);
+    assert_eq!(names, ["Add notebook", "Open notebook…", "New notebook…"]);
 }
 
 #[test]
@@ -694,7 +694,7 @@ fn each_root_is_a_top_level_automation_item() {
         .collect();
     let first = items
         .iter()
-        .position(|item| item.name.starts_with("A"))
+        .position(|item| item.name == "A (default)")
         .expect("A's root item");
     let tree: Vec<_> = items[first..]
         .iter()

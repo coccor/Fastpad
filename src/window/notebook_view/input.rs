@@ -224,6 +224,7 @@ pub(super) fn mouse_move(hwnd: HWND, x: i32, y: i32) {
         let hot = matches!(
             hit,
             Hit::Header(..)
+                | Hit::AddNotebook
                 | Hit::StateButton
                 | Hit::SecondButton
                 | Hit::EditorsHeader
@@ -359,7 +360,12 @@ pub(super) fn left_down(hwnd: HWND, x: i32, y: i32) {
         Hit::Root(_) | Hit::Row { .. } => Some(Cursor::Tree),
         // A root row button acts as the header's did (open editors spec §3.3): New note and New
         // folder still go to the tree's selected folder, when it is in the button's notebook.
-        Hit::Header(..) | Hit::StateButton | Hit::SecondButton | Hit::Thumb(_) | Hit::Empty => None,
+        Hit::Header(..)
+        | Hit::AddNotebook
+        | Hit::StateButton
+        | Hit::SecondButton
+        | Hit::Thumb(_)
+        | Hit::Empty => None,
     };
     if let Some(cursor) = cursor {
         with_view(hwnd, |view| {
@@ -416,6 +422,7 @@ pub(super) fn left_down(hwnd: HWND, x: i32, y: i32) {
             set_root_expanded(hwnd, id, !expanded);
         }
         Hit::Header(id, button) => header_clicked(hwnd, id, button),
+        Hit::AddNotebook => crate::window::notebook_view::add_notebook_menu(hwnd),
         Hit::StateButton => state_button(hwnd),
         Hit::SecondButton => second_button(hwnd),
         Hit::Thumb(grab) => {

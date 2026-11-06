@@ -27,6 +27,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 
 mod accessibility;
+mod add_notebook;
 mod context_menu;
 mod drag;
 mod geometry;
@@ -34,6 +35,7 @@ mod input;
 mod paint;
 mod rebuild;
 
+pub(crate) use add_notebook::*;
 pub(crate) use context_menu::*;
 pub(crate) use drag::*;
 pub(crate) use input::*;
@@ -204,6 +206,7 @@ const TOOL_MORE: usize = 5;
 const TOOL_NEW_FOLDER: usize = 6;
 const TOOL_REFRESH: usize = 7;
 const TOOL_TOGGLE_FOLDERS: usize = 8;
+const TOOL_ADD_NOTEBOOK: usize = 9;
 
 /// What the view shows (multi-root notebooks spec §4.1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -259,6 +262,8 @@ enum Hit {
     Root(NotebookId),
     /// A button of the root row of a notebook.
     Header(NotebookId, HeaderButton),
+    /// The title band's "+": Open notebook…, New notebook… and recent notebooks.
+    AddNotebook,
     /// "Open notebook…", with no notebook open.
     StateButton,
     /// "New notebook…" under "Open notebook…", with no notebook open.
