@@ -8,6 +8,7 @@ pub mod capture_only;
 pub(crate) mod command_palette;
 pub mod commands;
 pub(crate) mod copy_host;
+pub(crate) mod cross_move_host;
 pub(crate) mod design;
 pub(crate) mod document_store;
 pub(crate) mod drag_label;

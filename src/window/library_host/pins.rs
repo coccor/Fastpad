@@ -85,6 +85,20 @@ pub(super) fn report(hwnd: HWND, result: Result<(), LibraryError>) {
     }
 }
 
+/// Pins the note at `path` (absolute) in the notebook `id`, as an operation (multi-root move
+/// spec §4.1: a moved note keeps its pin).
+pub(crate) fn pin_in(hwnd: HWND, id: NotebookId, path: &Path) {
+    report(
+        hwnd,
+        apply_op_of(hwnd, id, |state, ids| {
+            Some(PendingOp::SetPinned {
+                note: state.note_ref(ids, path),
+                value: true,
+            })
+        }),
+    );
+}
+
 /// Asks `question`; false also when the window went away meanwhile.
 pub(crate) fn confirmed(hwnd: HWND, question: &str, action: &str) -> bool {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {

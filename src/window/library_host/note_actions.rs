@@ -106,7 +106,7 @@ pub(super) fn tab_open_for(hwnd: HWND, path: &Path) -> bool {
 /// exists, because another tab already had the new one open. A file moved outside FastPad onto
 /// a path another tab has open reaches this through the rescan; `move_note_to` refuses such a
 /// move upfront, and `submit_rename` never calls `rebind_open_tab`.
-pub(super) fn report_rebind_failure(hwnd: HWND, old: &Path, new: &Path) {
+pub(crate) fn report_rebind_failure(hwnd: HWND, old: &Path, new: &Path) {
     push_notice(
         hwnd,
         format!(
@@ -239,7 +239,7 @@ pub(super) fn move_note_to(hwnd: HWND, note: &Path, destination: &Path) {
 /// Writes the unsaved edits of `note`'s tab, if it has one, so they move with the file. A tab
 /// that is not active is saved through a brief switch to it, as `autosave_all` does. False (and
 /// a notice) when the save failed: nothing may move then.
-pub(super) fn save_before_move(hwnd: HWND, note: &Path) -> bool {
+pub(crate) fn save_before_move(hwnd: HWND, note: &Path) -> bool {
     let tab = |hwnd: HWND| {
         unsafe { app_ptr(hwnd) }.and_then(|app| {
             let tabs = &unsafe { app.as_ref() }.tabs;

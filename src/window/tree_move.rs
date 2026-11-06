@@ -61,28 +61,72 @@ pub(crate) fn move_note(
     new: &Path,
 ) -> Result<Moved, MoveError> {
     let (old_path, new_path) = (root.join(old), root.join(new));
-    let case_only = library::model::same_path(&new_path, &old_path);
-    crate::platform::files::rename_no_replace(&old_path, &new_path)
-        .map_err(|error| disk_error(error, case_only, &old_path))?;
-    let mut stuck = Vec::new();
-    let rebound = match library_host::rebind_open_tab(hwnd, &old_path, new_path.clone()) {
-        Ok(rebound) => rebound,
-        Err(()) => {
-            // Undo, so the tab and the disk agree.
-            if library_host::rename_note_back(&new_path, &old_path).is_ok() {
-                return Err(MoveError::TabCantFollow);
-            }
-            // The disk is the truth: the move stands, and the tab left on the old path is named.
-            stuck.push(old_path.clone());
-            false
-        }
-    };
+    let moved = rename_item(hwnd, &old_path, &new_path, false)?;
     // The library of the notebook `root` follows, whichever notebook is the default.
     if let Some(id) = library_host::notebook_of(hwnd, root) {
         library_host::with_notebook(hwnd, id, |state| state.rename_note(&old_path, &new_path));
     }
     library_host::schedule_write(hwnd);
-    Ok(Moved { rebound, stuck })
+    Ok(moved)
+}
+
+/// The disk part of a move (absolute paths, never onto another name) and the open tabs that
+/// follow it: a note's tab, or every tab under a folder. A tab that cannot follow undoes the
+/// whole move; when the undo fails too, the move stands and `stuck` names the tabs left on their
+/// old paths. No library changes: the caller owns them, inside one notebook or across two.
+pub(crate) fn rename_item(
+    hwnd: HWND,
+    old_path: &Path,
+    new_path: &Path,
+    is_folder: bool,
+) -> Result<Moved, MoveError> {
+    let case_only = library::model::same_path(new_path, old_path);
+    crate::platform::files::rename_no_replace(old_path, new_path)
+        .map_err(|error| disk_error(error, case_only, old_path))?;
+    if !is_folder {
+        let mut stuck = Vec::new();
+        let rebound = match library_host::rebind_open_tab(hwnd, old_path, new_path.to_path_buf()) {
+            Ok(rebound) => rebound,
+            Err(()) => {
+                // Undo, so the tab and the disk agree.
+                if library_host::rename_note_back(new_path, old_path).is_ok() {
+                    return Err(MoveError::TabCantFollow);
+                }
+                // The disk is the truth: the move stands, and the tab left on the old path is
+                // named.
+                stuck.push(old_path.to_path_buf());
+                false
+            }
+        };
+        return Ok(Moved { rebound, stuck });
+    }
+    let tabs = library_host::tabs_under(hwnd, old_path);
+    let mut moved = Vec::with_capacity(tabs.len());
+    let mut stuck = Vec::new();
+    for (id, path, _) in tabs {
+        let target = new_path.join(library::record_path(old_path, &path));
+        let rebound = unsafe { app_ptr(hwnd) }
+            .is_some_and(|mut app| unsafe { app.as_mut() }.tabs.rebind_path(id, target).is_ok());
+        if rebound {
+            moved.push((id, path));
+        } else {
+            stuck.push(path);
+        }
+    }
+    if !stuck.is_empty() && library_host::rename_folder_back(new_path, old_path).is_ok() {
+        // Undone, so the tabs and the disk agree: the folder went back, then the tabs that moved.
+        for (id, path) in moved.into_iter().rev() {
+            if let Some(mut app) = unsafe { app_ptr(hwnd) } {
+                let _ = unsafe { app.as_mut() }.tabs.rebind_path(id, path);
+            }
+        }
+        return Err(MoveError::TabCantFollow);
+    }
+    library_host::reroot_save_folders(hwnd, old_path, new_path);
+    Ok(Moved {
+        rebound: false,
+        stuck,
+    })
 }
 
 /// Moves the folder `old` to `new`, both relative to the notebook `root`, never onto another
@@ -101,42 +145,14 @@ pub(crate) fn move_folder(
             "not a folder inside the notebook",
         )));
     }
-    let case_only = library::model::same_path(new, old);
     let (old_path, new_path) = (root.join(old), root.join(new));
-    crate::platform::files::rename_no_replace(&old_path, &new_path)
-        .map_err(|error| disk_error(error, case_only, &old_path))?;
-    let tabs = library_host::tabs_under(hwnd, &old_path);
-    let mut moved = Vec::with_capacity(tabs.len());
-    let mut stuck = Vec::new();
-    for (id, path, _) in tabs {
-        let target = new_path.join(library::record_path(&old_path, &path));
-        let rebound = unsafe { app_ptr(hwnd) }
-            .is_some_and(|mut app| unsafe { app.as_mut() }.tabs.rebind_path(id, target).is_ok());
-        if rebound {
-            moved.push((id, path));
-        } else {
-            stuck.push(path);
-        }
-    }
-    if !stuck.is_empty() && library_host::rename_folder_back(&new_path, &old_path).is_ok() {
-        // Undone, so the tabs and the disk agree: the folder went back, then the tabs that moved.
-        for (id, path) in moved.into_iter().rev() {
-            if let Some(mut app) = unsafe { app_ptr(hwnd) } {
-                let _ = unsafe { app.as_mut() }.tabs.rebind_path(id, path);
-            }
-        }
-        return Err(MoveError::TabCantFollow);
-    }
-    library_host::reroot_save_folders(hwnd, &old_path, &new_path);
+    let moved = rename_item(hwnd, &old_path, &new_path, true)?;
     if let Some(id) = library_host::notebook_of(hwnd, root) {
         library_host::with_notebook(hwnd, id, |state| state.rename_folder(old, new));
         library_host::save_local_soon_of(hwnd, id);
     }
     library_host::schedule_write(hwnd);
-    Ok(Moved {
-        rebound: false,
-        stuck,
-    })
+    Ok(moved)
 }
 
 /// The notice for a drop onto a name `folder` already has (tree drag spec §5).

@@ -40,6 +40,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 mod about_and_settings_dialog;
 mod command_palette;
 mod copy_host_and_panel_drop;
+mod cross_move;
 mod daily_notes_and_templates;
 mod editing_shortcuts;
 mod external_changes;
