@@ -200,7 +200,9 @@ several are open. Every root has its own `…` menu with **Close notebook** and 
 Favorites** (or **Remove from Favorites**); the other notebooks' menus also offer **Set as default
 notebook**. New notes and folders go to
 the notebook you're working in, otherwise the default one, and quick capture always uses the
-default. Search, Quick Open and Tags cover the notebook you're working in, wikilinks stay inside
+default. Search, Replace in files, Quick Open and Tags cover every open notebook, and each result
+names its notebook (`Work › projects`); the **All notebooks ▾** button in the Search view narrows a
+search to one notebook. Wikilinks stay inside
 their own notebook, and notes can't be dragged between notebooks yet: **Note: Move to notebook…**
 (**`Ctrl+Shift+M`**) moves a note to another notebook. FastPad reopens the same
 notebooks next time (`folders.ini` keeps them as `open=` lines, with the default marked
@@ -234,7 +236,7 @@ Call Dana about the #budget.
 ```
 
 - **The Tags view** (the tag button in the activity bar, or **View: Show tags**) lists every tag
-  in the notebook with how many notes use it. Nested tags like `#project/atlas` sit under
+  in every open notebook with how many notes use it. Nested tags like `#project/atlas` sit under
   `#project`. Expand a tag to see its notes; click one to open it.
 - **In the preview**, front matter shows as a table of its properties, and each `#tag` is a chip
   you can click to see the tag's notes.

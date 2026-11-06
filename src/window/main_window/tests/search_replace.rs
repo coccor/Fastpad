@@ -126,7 +126,7 @@ fn a_hidden_search_view_searches_again_only_once_it_shows() {
 
     crate::window::side_panel::show_view(window.hwnd, SidebarView::Notebook, false);
     let added = scratch.note("planning.md", "planning");
-    crate::window::library_host::with_state(window.hwnd, |state| state.add_note(&added));
+    crate::window::library_host::with_default_state(window.hwnd, |state| state.add_note(&added));
     let before = search_generation(window.hwnd);
     crate::window::side_panel::refresh(window.hwnd);
     // Past the debounce, so a re-run wrongly scheduled would have started.
@@ -478,7 +478,7 @@ fn replace_all_writes_the_closed_notes_updates_the_library_and_searches_again() 
     assert_eq!(std::fs::read_to_string(&b).unwrap(), "pin\n");
     assert_eq!(std::fs::read_to_string(&c).unwrap(), "nothing");
     let size = |relative: &str| {
-        crate::window::library_host::with_state(window.hwnd, |state| {
+        crate::window::library_host::with_default_state(window.hwnd, |state| {
             state
                 .notes
                 .iter()

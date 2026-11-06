@@ -649,27 +649,27 @@ fn tree_drag_a_rebuild_or_view_switch_mid_drag_cancels_or_retargets() {
         panel,
         row_lparam(window.hwnd, &RowKind::Folder("work".into())),
     );
-    crate::window::library_host::with_state(window.hwnd, |state| {
+    crate::window::library_host::with_default_state(window.hwnd, |state| {
         state.remove_folder_for_test(std::path::Path::new("work"));
     });
     crate::window::notebook_view::rebuild(window.hwnd);
     let drag = notebook_view(window.hwnd).drag.clone().unwrap();
     assert_eq!(drag.target, None, "the target folder's row is gone");
 
-    crate::window::library_host::with_state(window.hwnd, |state| state.remove_note(&a));
+    crate::window::library_host::with_default_state(window.hwnd, |state| state.remove_note(&a));
     crate::window::notebook_view::rebuild(window.hwnd);
     assert!(
         notebook_view(window.hwnd).drag.is_some(),
         "b.md is still there"
     );
-    crate::window::library_host::with_state(window.hwnd, |state| {
+    crate::window::library_host::with_default_state(window.hwnd, |state| {
         state.remove_note(&scratch.folder().join("b.md"))
     });
     crate::window::notebook_view::rebuild(window.hwnd);
     assert!(notebook_view(window.hwnd).drag.is_none());
     assert!(unsafe { GetCapture() }.is_null());
 
-    crate::window::library_host::with_state(window.hwnd, |state| {
+    crate::window::library_host::with_default_state(window.hwnd, |state| {
         let _ = state.add_note(&a);
     });
     crate::window::notebook_view::rebuild(window.hwnd);
@@ -791,7 +791,7 @@ fn tree_drag_a_rebuild_mid_drag_retargets_the_band_from_the_still_pointer() {
 
     // A folder appears above "work", sorted before it: "work"'s row shifts down one, so the
     // still pointer is now over the new folder's row instead.
-    crate::window::library_host::with_state(window.hwnd, |state| {
+    crate::window::library_host::with_default_state(window.hwnd, |state| {
         state.add_folder(std::path::Path::new("AAA"));
     });
     crate::window::notebook_view::rebuild(window.hwnd);

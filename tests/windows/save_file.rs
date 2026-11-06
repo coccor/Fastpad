@@ -668,6 +668,6 @@ fn new_notebook_shows_a_create_dialog_and_opens_the_folder_it_names() {
     assert_eq!(title, "New notebook");
     assert_eq!(ok, "Create");
     assert!(target.is_dir(), "{:?}", notices(&main));
-    let opened = window::library_host::folder(main.hwnd).unwrap();
+    let opened = window::library_host::default_folder(main.hwnd).unwrap();
     assert_eq!(opened.file_name(), target.file_name());
 }

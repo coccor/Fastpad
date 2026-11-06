@@ -503,7 +503,7 @@ fn moving_a_note_to_another_notebook_moves_the_file_drops_its_pin_and_its_tab_fo
         app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
         Some(moved.as_path())
     );
-    crate::window::library_host::with_state(window.hwnd, |state| {
+    crate::window::library_host::with_default_state(window.hwnd, |state| {
         assert!(!state.is_pinned(&a));
         assert!(state.record_for(&a).is_none());
         assert!(
@@ -650,7 +650,7 @@ fn the_context_menu_acts_on_its_row_not_the_active_tab() {
     };
 
     menu(&RowKind::Note("b.md".into()), CommandId::NoteTogglePin);
-    crate::window::library_host::with_state(window.hwnd, |state| {
+    crate::window::library_host::with_default_state(window.hwnd, |state| {
         assert!(state.is_pinned(&scratch.folder().join("b.md")));
         assert!(!state.is_pinned(&a));
     });
@@ -914,7 +914,7 @@ fn note_rename_on_a_recorded_row_that_left_the_library_renames_nothing() {
         .query_hwnd();
     let typed = crate::platform::wide_null("Note: Rename");
     unsafe { SetWindowTextW(query, typed.as_ptr()) };
-    crate::window::library_host::with_state(window.hwnd, |state| state.remove_note(&row));
+    crate::window::library_host::with_default_state(window.hwnd, |state| state.remove_note(&row));
     unsafe { SendMessageW(query, WM_KEYDOWN, VK_RETURN as usize, 0) };
 
     assert!(!inline_open(window.hwnd));
@@ -965,7 +965,7 @@ fn a_note_rename_whose_tab_cannot_follow_and_cannot_be_undone_stands() {
         app_mut(window.hwnd).tabs.find_stored_path(&a).is_some(),
         "a's tab is left on its old path"
     );
-    crate::window::library_host::with_state(window.hwnd, |state| {
+    crate::window::library_host::with_default_state(window.hwnd, |state| {
         let notes: Vec<_> = state.notes.iter().map(|note| note.path.clone()).collect();
         assert!(
             notes.contains(&std::path::PathBuf::from("c.md")),
@@ -1023,7 +1023,7 @@ fn palette_commands_act_on_the_row_focused_when_the_palette_opened() {
     unsafe { SetWindowTextW(query, typed.as_ptr()) };
     unsafe { SendMessageW(query, WM_KEYDOWN, VK_RETURN as usize, 0) };
 
-    crate::window::library_host::with_state(window.hwnd, |state| {
+    crate::window::library_host::with_default_state(window.hwnd, |state| {
         assert!(state.is_pinned(&scratch.folder().join("row.md")));
         assert!(!state.is_pinned(&active_path));
     });

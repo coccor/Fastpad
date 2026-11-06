@@ -37,7 +37,7 @@ fn a_new_notebook_is_created_opened_and_left_empty() {
         .collect();
     assert_eq!(open, vec![scratch.folder(), created.clone()]);
     assert_eq!(
-        crate::window::library_host::folder(window.hwnd),
+        crate::window::library_host::default_folder(window.hwnd),
         Some(scratch.folder()),
         "the open notebook stays the default"
     );
@@ -72,7 +72,10 @@ fn naming_an_existing_folder_asks_before_opening_it() {
         crate::window::modal::take_last_confirm()
             .is_some_and(|question| question.contains("already exists"))
     );
-    assert_eq!(crate::window::library_host::folder(window.hwnd), None);
+    assert_eq!(
+        crate::window::library_host::default_folder(window.hwnd),
+        None
+    );
 
     answer_next_new_notebook_dialog({
         let existing = existing.clone();
@@ -85,7 +88,7 @@ fn naming_an_existing_folder_asks_before_opening_it() {
         Some("Open")
     );
     assert_eq!(
-        crate::window::library_host::folder(window.hwnd),
+        crate::window::library_host::default_folder(window.hwnd),
         Some(existing)
     );
     pump_until(window.hwnd, || {
@@ -124,7 +127,10 @@ fn naming_a_file_or_an_unreachable_place_explains_why_and_changes_nothing() {
         notices(window.hwnd)
     );
     assert!(!scratch.root.join("missing").exists());
-    assert_eq!(crate::window::library_host::folder(window.hwnd), None);
+    assert_eq!(
+        crate::window::library_host::default_folder(window.hwnd),
+        None
+    );
 }
 
 #[test]
@@ -138,7 +144,10 @@ fn cancel_changes_nothing_and_notes_mode_off_shows_no_dialog() {
 
     answer_next_new_notebook_dialog(|_| None);
     execute_command(window.hwnd, CommandId::NewNotebook);
-    assert_eq!(crate::window::library_host::folder(window.hwnd), None);
+    assert_eq!(
+        crate::window::library_host::default_folder(window.hwnd),
+        None
+    );
     assert!(
         notices(window.hwnd).is_empty(),
         "{:?}",
@@ -200,7 +209,7 @@ fn the_no_notebook_panel_offers_new_notebook_under_open_notebook() {
         SendMessageW(panel, WM_LBUTTONUP, 0, lparam);
     }
     assert_eq!(
-        crate::window::library_host::folder(window.hwnd),
+        crate::window::library_host::default_folder(window.hwnd),
         Some(created)
     );
     pump_until(window.hwnd, || {

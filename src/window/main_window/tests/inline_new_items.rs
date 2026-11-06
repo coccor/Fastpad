@@ -440,7 +440,7 @@ fn the_palette_offers_new_note_and_new_folder_only_while_a_notebook_is_open() {
         super::super::close_command_palette(window.hwnd, false);
         listed
     };
-    assert!(crate::window::library_host::folder(window.hwnd).is_none());
+    assert!(crate::window::library_host::default_folder(window.hwnd).is_none());
     assert!(!listed(CommandId::NoteNew));
     assert!(!listed(CommandId::NoteNewFolder));
     scratch.install(window.hwnd);
@@ -686,7 +686,7 @@ fn a_draft_whose_folder_goes_in_a_notebook_left_empty_shows_the_empty_state() {
 
     // The library drops the folder (deleted in Explorer, say): nothing is left to list.
     std::fs::remove_dir(scratch.folder().join("Fresh")).unwrap();
-    crate::window::library_host::with_state(window.hwnd, |state| {
+    crate::window::library_host::with_default_state(window.hwnd, |state| {
         state.remove_folder(std::path::Path::new("Fresh"), 0)
     });
     crate::window::notebook_view::rebuild(window.hwnd);

@@ -257,7 +257,7 @@ fn typing_waits_for_the_debounce_and_gives_sorted_results_with_the_selection_kep
         .list
         .selected = Some(2);
     let added = scratch.note("a.md", "needle first");
-    crate::window::library_host::with_state(window.hwnd, |state| state.add_note(&added));
+    crate::window::library_host::with_default_state(window.hwnd, |state| state.add_note(&added));
     let before = search_generation(window.hwnd);
     crate::window::side_panel::refresh(window.hwnd);
     wait_for_search(window.hwnd, before);
@@ -646,7 +646,7 @@ fn a_narrowed_search_still_counts_the_notes_the_last_one_skipped() {
     let _editor = install_test_editor(&window);
     scratch.install(window.hwnd);
     let relative = crate::library::record_path(&scratch.folder(), &cloud);
-    crate::window::library_host::with_state(window.hwnd, |state| {
+    crate::window::library_host::with_default_state(window.hwnd, |state| {
         for note in state.notes.iter_mut() {
             note.online_only = note.path == relative;
         }

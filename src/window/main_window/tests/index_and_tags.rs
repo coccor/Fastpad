@@ -4,7 +4,7 @@ use super::*;
 use crate::window::tags_view::TagRowKind;
 
 fn tags_of(hwnd: HWND, path: &str) -> Vec<String> {
-    crate::window::library_host::note_index(hwnd)
+    crate::window::library_host::default_note_index(hwnd)
         .facts(std::path::Path::new(path))
         .map(|facts| facts.tags.iter().map(|tag| tag.name.clone()).collect())
         .unwrap_or_default()

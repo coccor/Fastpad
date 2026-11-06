@@ -201,18 +201,19 @@ pub(super) fn scope_menu(hwnd: HWND, panel: HWND) {
     set_scope(hwnd, scope);
 }
 
+/// The scope menu under test: answered by `answer_next_scope_menu`, never shown.
+#[cfg(test)]
+fn choose_scope(_hwnd: HWND, _panel: HWND, items: &[(String, bool)]) -> Option<usize> {
+    let answer = SCOPE_ANSWERS
+        .with(|answers| answers.borrow_mut().pop_front())
+        .expect("a test opened the scope menu without queuing an answer");
+    answer(items)
+}
+
 /// Shows the scope menu and returns the index of the item picked (0 for all notebooks), or
-/// `None` when it was dismissed. Tests answer it with `answer_next_scope_menu`.
+/// `None` when it was dismissed.
+#[cfg(not(test))]
 fn choose_scope(hwnd: HWND, panel: HWND, items: &[(String, bool)]) -> Option<usize> {
-    #[cfg(test)]
-    {
-        let _ = (hwnd, panel);
-        let answer = SCOPE_ANSWERS
-            .with(|answers| answers.borrow_mut().pop_front())
-            .expect("a test opened the scope menu without queuing an answer");
-        return answer(items);
-    }
-    #[cfg(not(test))]
     {
         use crate::platform::wide_null;
         use windows_sys::Win32::Foundation::POINT;

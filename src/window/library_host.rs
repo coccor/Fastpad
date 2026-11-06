@@ -175,15 +175,19 @@ fn notes_mode(hwnd: HWND) -> bool {
     unsafe { app_ptr(hwnd) }.is_some_and(|app| unsafe { app.as_ref() }.settings.notes_mode)
 }
 
-/// The default notebook's folder (a shim until every caller names its notebook).
-pub(crate) fn folder(hwnd: HWND) -> Option<PathBuf> {
+/// The default notebook's folder, for tests that open one notebook. Production code names the
+/// notebook it means (multi-root search spec §7).
+#[cfg(test)]
+pub(crate) fn default_folder(hwnd: HWND) -> Option<PathBuf> {
     notebook_folder(hwnd, default_notebook(hwnd)?)
 }
 
-/// Runs `f` on the default notebook's loaded state (a shim until every caller names its
-/// notebook).
+/// Runs `f` on the default notebook's loaded state, for tests that open one notebook.
 #[cfg(test)]
-pub(crate) fn with_state<R>(hwnd: HWND, f: impl FnOnce(&mut LibraryState) -> R) -> Option<R> {
+pub(crate) fn with_default_state<R>(
+    hwnd: HWND,
+    f: impl FnOnce(&mut LibraryState) -> R,
+) -> Option<R> {
     with_notebook(hwnd, default_notebook(hwnd)?, f)
 }
 

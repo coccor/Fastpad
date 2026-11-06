@@ -428,7 +428,7 @@ fn a_folder_renamed_while_a_rescan_runs_keeps_its_new_name_once_the_rescan_lands
     );
     pump_until(window.hwnd, || !app_mut(window.hwnd).library.scanning());
 
-    crate::window::library_host::with_state(window.hwnd, |state| {
+    crate::window::library_host::with_default_state(window.hwnd, |state| {
         assert!(state.is_folder(std::path::Path::new("Moved")));
         assert!(!state.is_folder(std::path::Path::new("sub")));
         let notes: Vec<_> = state.notes.iter().map(|note| note.path.clone()).collect();
@@ -510,7 +510,7 @@ fn deleting_a_folder_recycles_it_closes_its_tabs_and_removes_its_rows() {
         selected_kind(window.hwnd),
         Some(RowKind::Note("top.md".into()))
     );
-    crate::window::library_host::with_state(window.hwnd, |state| {
+    crate::window::library_host::with_default_state(window.hwnd, |state| {
         let record = state.record_for(&a).unwrap();
         assert!(record.deleted);
         assert!(state.local.missing_since(record.id).is_some());
@@ -605,8 +605,10 @@ fn folder_commands_on_an_empty_or_escaping_path_touch_no_disk() {
     ensure_sidebar(window.hwnd);
     scratch.install(window.hwnd);
     crate::window::modal::take_last_confirm();
-    let notes =
-        || crate::window::library_host::with_state(window.hwnd, |state| state.notes.len()).unwrap();
+    let notes = || {
+        crate::window::library_host::with_default_state(window.hwnd, |state| state.notes.len())
+            .unwrap()
+    };
 
     crate::window::answer_next_confirm(|_| true);
     crate::window::library_host::delete_folder(window.hwnd, std::path::Path::new(""));
@@ -814,7 +816,7 @@ fn a_folder_rename_that_cannot_be_undone_stands_and_names_the_tab_left_behind() 
     let tabs = &app_mut(window.hwnd).tabs;
     assert_eq!(tabs.document(b_id).unwrap().path, Some(moved.join("b.md")));
     assert_eq!(tabs.document(a_id).unwrap().path, Some(a.clone()));
-    crate::window::library_host::with_state(window.hwnd, |state| {
+    crate::window::library_host::with_default_state(window.hwnd, |state| {
         assert!(state.is_folder(std::path::Path::new("Moved")));
         assert!(!state.is_folder(std::path::Path::new("sub")));
     });

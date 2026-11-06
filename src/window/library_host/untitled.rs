@@ -13,7 +13,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::KillTimer;
 /// Notes mode was toggled: load the last folder, or flush and forget the library.
 pub(crate) fn notes_mode_changed(hwnd: HWND, enabled: bool) {
     if enabled {
-        if folder(hwnd).is_none() {
+        if notebooks(hwnd).is_empty() {
             open_library_step(hwnd);
         }
         return;
@@ -306,8 +306,10 @@ pub(crate) fn save_as_command(hwnd: HWND) {
     let _ = crate::window::main_window::save_active_document_as(hwnd);
 }
 
+/// The name of the notebook an untitled note is first saved into: the default notebook.
 pub(super) fn folder_display_name(hwnd: HWND) -> String {
-    folder(hwnd)
+    default_notebook(hwnd)
+        .and_then(|id| notebook_folder(hwnd, id))
         .map(|f| notebook_name(&f))
         .unwrap_or_else(|| "the notebook".to_owned())
 }

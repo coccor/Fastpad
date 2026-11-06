@@ -535,7 +535,7 @@ fn with_no_notebook_open_the_picker_shows_one_row_that_cannot_be_picked() {
     let _scintilla = load_native_scintilla();
     let window = ProductionWindow::new(make_app());
     let _editor = install_test_editor(&window);
-    assert!(crate::window::library_host::folder(window.hwnd).is_none());
+    assert!(crate::window::library_host::default_folder(window.hwnd).is_none());
 
     execute_command(window.hwnd, CommandId::QuickOpen);
     let rows = || with_command_palette(window.hwnd, |p| p.shown_picker_rows().to_vec()).unwrap();
@@ -633,7 +633,7 @@ fn a_note_removed_from_the_library_after_listing_reports_it_and_opens_nothing() 
     execute_command(window.hwnd, CommandId::QuickOpen);
     type_query(window.hwnd, "gam");
     assert_eq!(quick_open_names(window.hwnd), ["gamma.md"]);
-    crate::window::library_host::with_state(window.hwnd, |state| state.remove_note(&gamma));
+    crate::window::library_host::with_default_state(window.hwnd, |state| state.remove_note(&gamma));
     std::fs::remove_file(&gamma).unwrap();
     press_enter_in_palette(window.hwnd);
 

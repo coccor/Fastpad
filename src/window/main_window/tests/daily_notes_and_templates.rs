@@ -40,7 +40,7 @@ fn ctrl_alt_d_makes_todays_note_once_and_then_opens_it() {
     assert_eq!(std::fs::read_to_string(&today).unwrap(), text);
     assert_eq!(active_path(window.hwnd).as_deref(), Some(today.as_path()));
     assert_eq!(caret(&editor), text.len(), "the caret starts at the end");
-    crate::window::library_host::with_state(window.hwnd, |state| {
+    crate::window::library_host::with_default_state(window.hwnd, |state| {
         assert!(state.is_listed(std::path::Path::new(r"journal\2026-10-16.md")));
     });
 

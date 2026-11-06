@@ -142,7 +142,10 @@ fn tag_names(hwnd: HWND, from: Option<&std::path::Path>) -> Vec<String> {
     let mut names = Vec::new();
     let index = match from {
         Some(from) => crate::window::library_host::note_index_for(hwnd, from),
-        None => crate::window::library_host::note_index(hwnd),
+        // An untitled tab's links resolve in the default notebook (`link_notebook`).
+        None => crate::window::library_host::link_notebook(hwnd, None)
+            .map(|id| crate::window::library_host::note_index_of(hwnd, id))
+            .unwrap_or_default(),
     };
     walk(&index.tags(), &mut names);
     names.sort_by(|a, b| crate::library::tree::natural_cmp(a, b));
