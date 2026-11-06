@@ -210,7 +210,9 @@ pub(crate) fn drop_into_of(
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
-    if super::cross_move_host::refuse_if_moving(hwnd, &root.join(folder)) {
+    if super::cross_move_host::refuse_if_moving(hwnd, &root.join(folder))
+        || super::cross_move_host::refuse_item_if_moving(hwnd, &root.join(old))
+    {
         return;
     }
     let is_folder = matches!(source, RowKind::Folder(_));

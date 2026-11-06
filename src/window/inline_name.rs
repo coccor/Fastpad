@@ -771,16 +771,27 @@ pub(crate) fn place_for(
 
 /// A root row's New folder, "New folder here" (`place`) and Notebook: New folder… (spec §3.2).
 pub(crate) fn new_folder(hwnd: HWND, place: Option<(library_host::NotebookId, PathBuf)>) {
-    if let Some((id, parent)) = place_for(hwnd, place) {
+    if let Some((id, parent)) = place_for(hwnd, place)
+        && !refused_while_moving(hwnd, id, &parent)
+    {
         start(hwnd, id, Purpose::NewFolder(parent));
     }
 }
 
 /// A root row's "+", "New note here" (`place`) and Notebook: New note… (spec §3.1).
 pub(crate) fn new_note(hwnd: HWND, place: Option<(library_host::NotebookId, PathBuf)>) {
-    if let Some((id, parent)) = place_for(hwnd, place) {
+    if let Some((id, parent)) = place_for(hwnd, place)
+        && !refused_while_moving(hwnd, id, &parent)
+    {
         start(hwnd, id, Purpose::NewNote(parent));
     }
+}
+
+/// A new note or folder never goes into a folder moving to another drive (final review 2).
+fn refused_while_moving(hwnd: HWND, id: library_host::NotebookId, parent: &Path) -> bool {
+    library_host::notebook_folder(hwnd, id).is_some_and(|root| {
+        crate::window::cross_move_host::refuse_if_moving(hwnd, &root.join(parent))
+    })
 }
 
 /// Notes: New note from template… once a template is chosen (second brain phase 1 spec §9.4):
@@ -808,7 +819,7 @@ pub(crate) fn rename(hwnd: HWND, id: library_host::NotebookId, row: &RowKind) {
     if let (Some(root), Some(relative)) = (
         library_host::notebook_folder(hwnd, id),
         crate::window::tree_drag::source_path(row),
-    ) && crate::window::cross_move_host::refuse_if_moving(hwnd, &root.join(relative))
+    ) && crate::window::cross_move_host::refuse_item_if_moving(hwnd, &root.join(relative))
     {
         return;
     }

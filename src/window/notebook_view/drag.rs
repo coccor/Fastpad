@@ -151,7 +151,7 @@ pub(super) fn arm_drag(
     // A row moving to another drive stays put until the move ends (multi-root move spec §3.3).
     if row_path
         .as_deref()
-        .is_some_and(|path| crate::window::cross_move_host::holds(hwnd, path))
+        .is_some_and(|path| crate::window::cross_move_host::blocks(hwnd, path))
     {
         return;
     }

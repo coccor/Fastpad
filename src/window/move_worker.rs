@@ -26,9 +26,11 @@ pub(crate) struct Job {
 /// How a job ended.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum Outcome {
-    /// Every file copied and checked: the original may go.
+    /// Every file copied and checked: the original may go, once it still holds exactly
+    /// `before` (a file added since the copy read its folder is in neither).
     Copied {
         files: usize,
+        before: files::Snapshot,
     },
     Cancelled,
     Failed(String),
@@ -69,11 +71,26 @@ pub(crate) fn fail_next_copy() {
     FAIL_NEXT_COPY.store(true, Ordering::SeqCst);
 }
 
-/// Starts `job` on its own thread.
-pub(crate) fn spawn(job: Job) -> std::thread::JoinHandle<()> {
+/// Runs one job here, posting nowhere, for the worker's own tests.
+#[cfg(test)]
+pub(crate) fn run_for_test(source: &std::path::Path, destination: &std::path::Path) -> Outcome {
+    run(&Job {
+        target: 0,
+        generation: 0,
+        source: source.to_path_buf(),
+        destination: destination.to_path_buf(),
+        cancel: Arc::new(AtomicBool::new(false)),
+    })
+}
+
+/// Starts `job` on its own thread. The thread returns whether it posted a checked copy, so a
+/// window that goes away before reading the post can remove that copy (final review 4).
+pub(crate) fn spawn(job: Job) -> std::thread::JoinHandle<bool> {
     std::thread::spawn(move || {
         let outcome = run(&job);
+        let copied = matches!(outcome, Outcome::Copied { .. });
         post_done(job.target, job.generation, outcome);
+        copied
     })
 }
 
@@ -107,9 +124,6 @@ fn post_done(target: isize, generation: u64, outcome: Outcome) {
 }
 
 fn run(job: &Job) -> Outcome {
-    let remove = || {
-        let _ = std::fs::remove_dir_all(&job.destination);
-    };
     let before = match files::snapshot(&job.source) {
         Ok(before) => before,
         Err(error) => return Outcome::Failed(error.to_string()),
@@ -119,6 +133,13 @@ fn run(job: &Job) -> Outcome {
     if FAIL_NEXT_COPY.swap(false, Ordering::SeqCst) {
         return Outcome::Failed("the destination refused the copy".to_owned());
     }
+    // Something already at the destination is never written into, and never removed.
+    if job.destination.exists() {
+        return Outcome::Failed(format!(
+            "{} already exists there",
+            job.destination.display()
+        ));
+    }
     let mut last = Instant::now();
     let copied = files::copy_tree_reporting(&job.source, &job.destination, &job.cancel, &mut |n| {
         if last.elapsed() >= PROGRESS_EVERY {
@@ -126,6 +147,13 @@ fn run(job: &Job) -> Outcome {
             post_progress(job.target, job.generation, n, total);
         }
     });
+    // Only a folder this job created is ever removed (final review 1).
+    let created = copied.created;
+    let remove = || {
+        if created {
+            let _ = std::fs::remove_dir_all(&job.destination);
+        }
+    };
     if job.cancel.load(Ordering::SeqCst) {
         remove();
         return Outcome::Cancelled;
@@ -145,6 +173,7 @@ fn run(job: &Job) -> Outcome {
     match files::verify_copy(&job.source, &job.destination, &before) {
         Ok(()) => Outcome::Copied {
             files: copied.files,
+            before,
         },
         Err(files::Mismatch::Changed(_)) => {
             remove();

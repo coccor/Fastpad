@@ -129,6 +129,8 @@ pub fn copy_file_no_replace(from: &Path, to: &Path) -> Result<()> {
 pub struct Copied {
     pub files: usize,
     pub error: Option<(std::path::PathBuf, crate::FastPadError)>,
+    /// The copy created `to` itself: only then may a clean-up remove it.
+    pub created: bool,
 }
 
 /// Copies the file or folder `from` to `to`, which must not exist: a folder is created with
@@ -149,6 +151,7 @@ pub fn copy_tree_reporting(
     let mut copied = Copied {
         files: 0,
         error: None,
+        created: false,
     };
     let fail = |copied: &mut Copied, path: &Path, error: crate::FastPadError| {
         copied.error = Some((path.to_path_buf(), error));
@@ -157,6 +160,7 @@ pub fn copy_tree_reporting(
         match copy_file_no_replace(from, to) {
             Ok(()) => {
                 copied.files = 1;
+                copied.created = true;
                 progress(1);
             }
             Err(error) => fail(&mut copied, from, error),
@@ -171,6 +175,9 @@ pub fn copy_tree_reporting(
         if let Err(error) = std::fs::create_dir(&target) {
             fail(&mut copied, &target, error.into());
             break;
+        }
+        if target == to {
+            copied.created = true;
         }
         let entries = match std::fs::read_dir(&source) {
             Ok(entries) => entries,

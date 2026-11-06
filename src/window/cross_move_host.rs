@@ -33,7 +33,8 @@ pub(crate) struct Moving {
     /// Files copied of the total, as the worker last said.
     progress: (usize, usize),
     cancel: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    /// Returns whether it posted a checked copy.
+    thread: Option<std::thread::JoinHandle<bool>>,
 }
 
 impl std::fmt::Debug for Moving {
@@ -86,25 +87,61 @@ pub(crate) fn busy(hwnd: HWND, id: NotebookId) -> Option<String> {
     .flatten()
 }
 
-/// Whether `path` (absolute) is inside, or is, the folder moving to another drive: its tabs'
-/// writes wait, and it can't be renamed, deleted, dragged or moved meanwhile (spec §3.3).
+fn at_or_inside(folder: &Path, path: &Path) -> bool {
+    library::model::same_path(folder, path) || library::is_inside(folder, path)
+}
+
+/// Whether `path` (absolute) is, or is inside, the folder moving to another drive or the place
+/// its copy is being written (final review 3): its tabs' writes wait, and nothing new goes in
+/// (spec §3.3).
 pub(crate) fn holds(hwnd: HWND, path: &Path) -> bool {
     with_moving(hwnd, |moving| {
-        let source = moving.started.source();
-        library::model::same_path(&source, path) || library::is_inside(&source, path)
+        at_or_inside(&moving.started.source(), path)
+            || at_or_inside(&moving.started.destination(), path)
     })
     .unwrap_or(false)
 }
 
-/// `holds`, saying so: "Wait for the move of *work* to finish." True when it refused.
+/// `holds`, or `path` is a folder above either of those: what can't be renamed, deleted,
+/// dragged or moved while the move runs.
+fn blocks_item(hwnd: HWND, path: &Path) -> bool {
+    holds(hwnd, path)
+        || with_moving(hwnd, |moving| {
+            library::is_inside(path, &moving.started.source())
+                || library::is_inside(path, &moving.started.destination())
+        })
+        .unwrap_or(false)
+}
+
+fn wait_notice(hwnd: HWND) {
+    if let Some(name) = with_moving(hwnd, |moving| moving.started.name()) {
+        push_notice(hwnd, format!("Wait for the move of {name} to finish."));
+    }
+}
+
+/// `holds` for a place something would go into, saying so: "Wait for the move of *work* to
+/// finish." True when it refused.
 pub(crate) fn refuse_if_moving(hwnd: HWND, path: &Path) -> bool {
     if !holds(hwnd, path) {
         return false;
     }
-    if let Some(name) = with_moving(hwnd, |moving| moving.started.name()) {
-        push_notice(hwnd, format!("Wait for the move of {name} to finish."));
-    }
+    wait_notice(hwnd);
     true
+}
+
+/// `blocks_item` for an item about to be renamed, deleted or moved, saying so. True when it
+/// refused.
+pub(crate) fn refuse_item_if_moving(hwnd: HWND, path: &Path) -> bool {
+    if !blocks_item(hwnd, path) {
+        return false;
+    }
+    wait_notice(hwnd);
+    true
+}
+
+/// `blocks_item`, quietly: a drag of such a row doesn't arm.
+pub(crate) fn blocks(hwnd: HWND, path: &Path) -> bool {
+    blocks_item(hwnd, path)
 }
 
 /// The folder (relative) of the notebook `id` moving to another drive and its progress row's
@@ -123,6 +160,18 @@ pub(crate) fn moving_row(hwnd: HWND, id: NotebookId) -> Option<(PathBuf, String)
         })
     })
     .flatten()
+}
+
+/// Whether the running move's worker thread has ended (its outcome posted).
+#[cfg(test)]
+pub(crate) fn worker_finished(hwnd: HWND) -> bool {
+    with_moving(hwnd, |moving| {
+        moving
+            .thread
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
+    })
+    .unwrap_or(true)
 }
 
 /// The running move's files copied and total.
@@ -199,8 +248,12 @@ pub(crate) fn stop(hwnd: HWND) {
     let moving = library_host::with_moving(hwnd, |moving, _| moving.take()).flatten();
     if let Some(mut moving) = moving {
         moving.cancel.store(true, Ordering::SeqCst);
-        if let Some(thread) = moving.thread.take() {
-            let _ = thread.join();
+        // A checked copy already posted, which this window will never land: it goes, so the
+        // original stays the only one (final review 4).
+        if let Some(thread) = moving.thread.take()
+            && thread.join().unwrap_or(false)
+        {
+            let _ = std::fs::remove_dir_all(moving.started.destination());
         }
     }
 }
@@ -212,6 +265,18 @@ fn start_folder_move(hwnd: HWND, started: Started, plan: MovePlan) {
         return;
     }
     let (source, destination) = (started.source(), started.destination());
+    // Something took the name since the plan looked (final review 1).
+    if destination.exists() {
+        push_notice(
+            hwnd,
+            format!(
+                "{} already exists in {}. Nothing was moved.",
+                started.name(),
+                started.dest_label
+            ),
+        );
+        return;
+    }
     library_host::begin_own_writes(hwnd, [source.as_path(), destination.as_path()]);
     let cancel = Arc::new(AtomicBool::new(false));
     library_host::with_moving(hwnd, |moving, generation| {
@@ -242,10 +307,12 @@ pub(crate) fn move_progress(hwnd: HWND, wparam: usize, lparam: isize) {
             .as_mut()
             .filter(|moving| moving.generation == wparam as u64)?;
         moving.progress = super::move_worker::unpack(lparam);
-        Some(())
+        Some([moving.started.source(), moving.started.destination()])
     })
     .flatten();
-    if updated.is_some() {
+    if let Some(paths) = updated {
+        // The copy is still FastPad's own while it runs, however long (final review 3).
+        library_host::begin_own_writes(hwnd, paths.iter().map(PathBuf::as_path));
         notebook_view::rebuild(hwnd);
     }
 }
@@ -286,8 +353,8 @@ pub(crate) fn move_done(hwnd: HWND, lparam: isize) {
             // the original is the only one.
             let _ = std::fs::remove_dir_all(&destination);
         }
-        super::move_worker::Outcome::Copied { .. } => {
-            land(hwnd, &started, &moving.plan);
+        super::move_worker::Outcome::Copied { before, .. } => {
+            land(hwnd, &started, &moving.plan, &before);
             side_panel::refresh(hwnd);
             return;
         }
@@ -318,9 +385,20 @@ pub(crate) fn move_done(hwnd: HWND, lparam: isize) {
 /// A checked copy landed: the original goes to the Recycle Bin, then the tabs, the libraries
 /// and the tree follow, as for a move on one drive. An original that can't be recycled stays,
 /// and both notebooks list what they have.
-fn land(hwnd: HWND, started: &Started, plan: &MovePlan) {
+fn land(hwnd: HWND, started: &Started, plan: &MovePlan, before: &files::Snapshot) {
     let (source, destination) = (started.source(), started.destination());
     let name = started.name();
+    // The original must hold exactly what was copied: a file added since the copy read its
+    // folder would go to the Recycle Bin uncopied (final review 2).
+    if files::snapshot(&source).ok().as_ref() != Some(before) {
+        let _ = std::fs::remove_dir_all(&destination);
+        push_notice(
+            hwnd,
+            format!("{name} changed while it was being moved. Nothing was moved."),
+        );
+        save_held(hwnd, &source);
+        return;
+    }
     if !super::copy_host::recycle_path(hwnd, &source) {
         let folders = folders_on_disk(&started.dest_root, &started.landing);
         let notes: Vec<PathBuf> = plan.notes.iter().map(|(_, new)| new.clone()).collect();
@@ -328,6 +406,18 @@ fn land(hwnd: HWND, started: &Started, plan: &MovePlan) {
             state.arrive(&folders, &notes, &[]);
         });
         library_host::request_index_of(hwnd, started.dest);
+        // Part of the original may be gone (final review 5): tabs on files that went follow
+        // their copies, and the source notebook reads its disk again.
+        for (id, path, _) in library_host::tabs_under(hwnd, &source) {
+            let copy = destination.join(library::record_path(&source, &path));
+            if !path.exists()
+                && copy.exists()
+                && let Some(mut app) = unsafe { super::main_window::app_ptr(hwnd) }
+            {
+                let _ = unsafe { app.as_mut() }.tabs.rebind_path(id, copy);
+            }
+        }
+        library_host::request_rescan_of(hwnd, started.from);
         push_notice(
             hwnd,
             format!(
@@ -337,6 +427,7 @@ fn land(hwnd: HWND, started: &Started, plan: &MovePlan) {
             ),
         );
         save_held(hwnd, &source);
+        save_held(hwnd, &destination);
         return;
     }
     for (id, path, _) in library_host::tabs_under(hwnd, &source) {
@@ -356,6 +447,9 @@ fn land(hwnd: HWND, started: &Started, plan: &MovePlan) {
         &started.landing,
     );
     let done = [(started.item.clone(), started.landing.clone())];
+    // Edits held during the move are written first, so the image links below are rewritten in
+    // the text the user ends up with (final review 6).
+    save_held(hwnd, &destination);
     // The images stayed in the source: they come along now, as on one drive.
     let failed = if started.with_images {
         Facts::of(hwnd, started.from, &started.source_root).map_or(0, |source_facts| {
@@ -380,7 +474,6 @@ fn land(hwnd: HWND, started: &Started, plan: &MovePlan) {
         &done,
         failed,
     );
-    save_held(hwnd, &destination);
 }
 
 /// Saves the dirty tabs under `folder` (absolute) whose writes waited for a move.
@@ -488,7 +581,11 @@ pub(crate) fn move_items(hwnd: HWND, from: NotebookId, items: Vec<RowKind>, dest
         })
         .collect();
     // Nothing goes into a folder that is itself moving to another drive.
-    if refuse_if_moving(hwnd, &dest_root.join(&dest_folder)) {
+    if refuse_if_moving(hwnd, &dest_root.join(&dest_folder))
+        || items
+            .iter()
+            .any(|item| refuse_item_if_moving(hwnd, &source_root.join(item.path())))
+    {
         return;
     }
     if items.is_empty() {

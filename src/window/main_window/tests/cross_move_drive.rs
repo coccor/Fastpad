@@ -323,3 +323,239 @@ fn a_tab_edited_during_a_cancelled_move_saves_to_the_old_path() {
     );
     assert!(!t.b.join("work").exists());
 }
+
+#[test]
+fn a_folder_that_appears_at_the_destination_before_the_worker_starts_is_never_removed() {
+    // Break caught (final review 1): a same-named folder created at the destination while the
+    // question was open, deleted for good when the copy then failed on it.
+    let _scintilla = load_native_scintilla();
+    let t = two(
+        "xdrive-appeared",
+        &[(r"work\x.md", "x"), ("stay.md", r"[[work\x]]")],
+        &[],
+    );
+    let hwnd = t.window.hwnd;
+    let keep = t.b.join(r"work\keep.md");
+    force_other_volume_for_test(true);
+    crate::window::modal::answer_next_choice({
+        let keep = keep.clone();
+        move |_| {
+            std::fs::create_dir_all(keep.parent().unwrap()).unwrap();
+            std::fs::write(&keep, "theirs").unwrap();
+            0
+        }
+    });
+    cross_move_host::move_items(
+        hwnd,
+        t.a_id,
+        vec![RowKind::Folder("work".into())],
+        Destination::Open {
+            id: t.b_id,
+            folder: "".into(),
+        },
+    );
+    finish(&t);
+
+    assert_eq!(std::fs::read_to_string(&keep).unwrap(), "theirs");
+    assert!(t.a.join(r"work\x.md").exists());
+    assert!(has_notice(
+        hwnd,
+        "work already exists in B. Nothing was moved."
+    ));
+}
+
+#[test]
+fn the_worker_never_removes_a_destination_it_did_not_create() {
+    // Break caught (final review 1): the worker's own clean-up deleting a folder that was
+    // there before it started.
+    let scratch = LibraryScratch::new("xdrive-worker-existing");
+    let source = scratch.root.join("src");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("a.md"), "a").unwrap();
+    let destination = scratch.root.join("dest");
+    std::fs::create_dir_all(&destination).unwrap();
+    std::fs::write(destination.join("theirs.md"), "theirs").unwrap();
+    let outcome = move_worker::run_for_test(&source, &destination);
+    assert!(
+        matches!(outcome, move_worker::Outcome::Failed(_)),
+        "{outcome:?}"
+    );
+    assert!(destination.join("theirs.md").exists());
+}
+
+#[test]
+fn a_file_added_to_the_moving_folder_fails_the_move_instead_of_being_recycled() {
+    // Break caught (final review 2): a note saved into the folder during the copy, never
+    // copied, then sent to the Recycle Bin with the original.
+    let _scintilla = load_native_scintilla();
+    let t = start("xdrive-added", true);
+    let hwnd = t.window.hwnd;
+    copied(&t);
+    std::fs::write(t.a.join(r"work\deep\new.md"), "new").unwrap();
+    finish(&t);
+
+    assert_eq!(
+        std::fs::read_to_string(t.a.join(r"work\deep\new.md")).unwrap(),
+        "new"
+    );
+    assert!(!t.b.join("work").exists());
+    assert!(has_notice(
+        hwnd,
+        "work changed while it was being moved. Nothing was moved."
+    ));
+}
+
+#[test]
+fn nothing_new_goes_into_a_moving_folder_or_its_landing_place() {
+    // Break caught (final review 2, 3): a Ctrl copy, a cross move or a Save As into the
+    // folder being copied or into its partial copy, lost when the move ends.
+    let _scintilla = load_native_scintilla();
+    let t = start("xdrive-guarded", true);
+    let hwnd = t.window.hwnd;
+    copied(&t);
+    let wait = "Wait for the move of work to finish.";
+    let outside = t._scratch.root.join("outside.md");
+    std::fs::write(&outside, "outside").unwrap();
+    crate::window::copy_host::copy_into_of(hwnd, t.a_id, vec![outside], Path::new("work"), None);
+    assert!(has_notice(hwnd, wait), "a copy into the source");
+    app_mut(hwnd).notifications.dismiss_all();
+    cross_move_host::move_items(
+        hwnd,
+        t.b_id,
+        vec![RowKind::Note("b-note.md".into())],
+        Destination::Open {
+            id: t.b_id,
+            folder: "work".into(),
+        },
+    );
+    assert!(has_notice(hwnd, wait), "a move into the landing place");
+    finish(&t);
+    assert!(!t.a.join(r"work\outside.md").exists());
+}
+
+#[test]
+fn an_ancestor_of_the_landing_place_cannot_be_deleted_during_the_move() {
+    // Break caught (final review 3): the parent of the partial copy moved or deleted while the
+    // copy is written into it.
+    let _scintilla = load_native_scintilla();
+    let t = two(
+        "xdrive-ancestor",
+        &[(r"work\x.md", "x")],
+        &[(r"projects\keep.md", "")],
+    );
+    let hwnd = t.window.hwnd;
+    force_other_volume_for_test(true);
+    move_worker::pause_before_check(true);
+    cross_move_host::move_items(
+        hwnd,
+        t.a_id,
+        vec![RowKind::Folder("work".into())],
+        Destination::Open {
+            id: t.b_id,
+            folder: "projects".into(),
+        },
+    );
+    pump_until(hwnd, || {
+        cross_move_host::moving_progress(hwnd) == Some((1, 1))
+    });
+    library_host::delete_folder_of(hwnd, t.b_id, Path::new("projects"));
+    assert!(has_notice(hwnd, "Wait for the move of work to finish."));
+    assert!(t.b.join(r"projects\keep.md").exists());
+    finish(&t);
+    assert!(t.b.join(r"projects\work\x.md").exists());
+}
+
+#[test]
+fn a_window_closing_after_the_check_removes_the_copy_it_never_landed() {
+    // Break caught (final review 4): a full copy left in the destination when the window went
+    // away between the worker's "copied" and the UI handling it.
+    let _scintilla = load_native_scintilla();
+    let t = start("xdrive-stop", false);
+    let hwnd = t.window.hwnd;
+    // The worker finishes and posts; the window never reads the post.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !cross_move_host::worker_finished(hwnd) {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(t.b.join(r"work\x.md").exists(), "the copy is there");
+    cross_move_host::stop(hwnd);
+    force_other_volume_for_test(false);
+
+    assert!(!t.b.join("work").exists(), "the copy went");
+    assert!(t.a.join(r"work\x.md").exists());
+    // The late post finds no move and is dropped.
+    pump_posted_messages(hwnd);
+}
+
+#[test]
+fn an_original_only_partly_recycled_is_rescanned_and_its_tabs_follow_the_copy() {
+    // Break caught (final review 5): a source notebook still listing, and tabs still showing,
+    // notes the failed Recycle Bin step had already removed.
+    let _scintilla = load_native_scintilla();
+    let t = two(
+        "xdrive-partial",
+        &[(r"work\x.md", "x"), (r"work\y.md", "y")],
+        &[],
+    );
+    let hwnd = t.window.hwnd;
+    super::super::open_path(hwnd, &t.a.join(r"work\x.md")).unwrap();
+    crate::window::copy_host::fail_next_recycle_after_removing(t.a.join(r"work\x.md"));
+    force_other_volume_for_test(true);
+    cross_move_host::move_items(
+        hwnd,
+        t.a_id,
+        vec![RowKind::Folder("work".into())],
+        Destination::Open {
+            id: t.b_id,
+            folder: "".into(),
+        },
+    );
+    finish(&t);
+
+    assert_eq!(active_path(hwnd), Some(t.b.join(r"work\x.md")));
+    pump_until(hwnd, || !listed(hwnd, t.a_id, r"work\x.md"));
+    assert!(listed(hwnd, t.a_id, r"work\y.md"));
+}
+
+#[test]
+fn a_note_edited_during_a_move_with_images_keeps_its_edit_and_gets_the_new_link() {
+    // Break caught (final review 6): a held tab skipped by the link rewrite, then saved with
+    // the old link to an image that moved away.
+    let _scintilla = load_native_scintilla();
+    let t = two(
+        "xdrive-images",
+        &[
+            (r"work\plan.md", "![x](../attachments/x.png)\n"),
+            (r"attachments\x.png", "x-image"),
+        ],
+        &[(r"projects\keep.md", "")],
+    );
+    let hwnd = t.window.hwnd;
+    super::super::open_path(hwnd, &t.a.join(r"work\plan.md")).unwrap();
+    force_other_volume_for_test(true);
+    move_worker::pause_before_check(true);
+    crate::window::modal::answer_next_choice(|_| 0);
+    cross_move_host::move_items(
+        hwnd,
+        t.a_id,
+        vec![RowKind::Folder("work".into())],
+        Destination::Open {
+            id: t.b_id,
+            folder: "projects".into(),
+        },
+    );
+    pump_until(hwnd, || {
+        cross_move_host::moving_progress(hwnd) == Some((1, 1))
+    });
+    t.editor
+        .set_text("![x](../attachments/x.png)\nedited\n")
+        .unwrap();
+    finish(&t);
+
+    assert_eq!(
+        std::fs::read_to_string(t.b.join(r"projects\work\plan.md")).unwrap(),
+        "![x](../../attachments/x.png)\nedited\n"
+    );
+    assert!(t.b.join(r"attachments\x.png").exists());
+}

@@ -79,7 +79,7 @@ pub(crate) fn move_folder_to_notebook(hwnd: HWND, id: NotebookId, relative: &Pat
 /// Step 1 of Move to notebook…: the other notebooks for `path` (absolute), of the notebook at
 /// `source`.
 fn show_move_picker(hwnd: HWND, path: &Path, source: &Path) {
-    if crate::window::cross_move_host::refuse_if_moving(hwnd, path) {
+    if crate::window::cross_move_host::refuse_item_if_moving(hwnd, path) {
         return;
     }
     let destinations = move_destinations(hwnd, source);
@@ -326,7 +326,7 @@ pub(crate) fn delete_note(hwnd: HWND) {
 /// After a confirm, sends `path` to the Recycle Bin and closes its tab if it has one. Any record
 /// stays, flagged deleted and marked missing, so the 30-day purge removes it.
 pub(crate) fn delete_file(hwnd: HWND, path: &Path) {
-    if crate::window::cross_move_host::refuse_if_moving(hwnd, path) {
+    if crate::window::cross_move_host::refuse_item_if_moving(hwnd, path) {
         return;
     }
     // The callers checked the default notebook; a note of another one needs its own file.
