@@ -62,6 +62,82 @@ fn front_matter(source: &(impl SourceText + ?Sized)) -> usize {
     0
 }
 
+/// The front matter's spans (`text` is the front matter itself, from offset 0): each key bold
+/// and dimmed, and YAML's punctuation (the colon after a key, a list's `-`, brackets, commas
+/// and quotes) and comments dimmed. Values keep the code colour the line's body gives them.
+fn front_matter_spans(text: &str) -> Vec<Span> {
+    let mut out = Vec::new();
+    let dim = |out: &mut Vec<Span>, range: Range<usize>| {
+        if !range.is_empty() {
+            out.push(Span {
+                range,
+                kind: SpanKind::Dim,
+            });
+        }
+    };
+    let mut line_start = 0;
+    for line in text.split_inclusive('\n') {
+        let start = line_start;
+        line_start += line.len();
+        let body = line.trim_end_matches(['\r', '\n']);
+        if matches!(body.trim_end(), "---" | "...") {
+            continue;
+        }
+        let indent = body.len() - body.trim_start().len();
+        let mut at = indent;
+        if body[at..].starts_with('#') {
+            dim(&mut out, start + at..start + body.len());
+            continue;
+        }
+        // A block list's item: `- value`.
+        if body[at..].starts_with("- ") || &body[at..] == "-" {
+            dim(&mut out, start + at..start + at + 1);
+            at =
+                (at + 1 + body[at + 1..].len() - body[at + 1..].trim_start().len()).min(body.len());
+        }
+        // `key:` followed by a space or the line's end. A quoted value holding `: ` is not a key.
+        let rest = &body[at..];
+        if !rest.starts_with(['"', '\'', '[', '{'])
+            && let Some(colon) = rest
+                .match_indices(':')
+                .map(|(index, _)| index)
+                .find(|&index| rest[index + 1..].is_empty() || rest[index + 1..].starts_with(' '))
+            && colon > 0
+        {
+            out.push(Span {
+                range: start + at..start + at + colon,
+                kind: SpanKind::Bold,
+            });
+            dim(&mut out, start + at..start + at + colon + 1);
+            at += colon + 1;
+        }
+        // The value: brackets, commas and quotes dimmed, a trailing comment too.
+        let mut quote: Option<char> = None;
+        for (offset, c) in body[at..].char_indices() {
+            let index = start + at + offset;
+            match (quote, c) {
+                (Some(open), c) if c == open => {
+                    dim(&mut out, index..index + 1);
+                    quote = None;
+                }
+                (Some(_), _) => {}
+                (None, '"' | '\'') => {
+                    dim(&mut out, index..index + 1);
+                    quote = Some(c);
+                }
+                (None, '[' | ']' | '{' | '}' | ',') => dim(&mut out, index..index + 1),
+                (None, '#') if body[..at + offset].ends_with([' ', '\t']) => {
+                    dim(&mut out, index..start + body.len());
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    out.sort_by_key(|span| (span.range.start, span.range.end));
+    out
+}
+
 impl LiveDocument {
     pub fn parse(source: &str) -> Self {
         let index = BlockIndex::parse(source);
@@ -214,10 +290,12 @@ impl LiveDocument {
     pub fn spans_in(&self, source: &(impl SourceText + ?Sized), bytes: Range<usize>) -> Vec<Span> {
         let mut out = Vec::new();
         if self.front_matter > 0 && bytes.start < self.front_matter {
-            out.push(Span {
-                range: 0..self.front_matter,
-                kind: SpanKind::Dim,
-            });
+            let text = source.slice(0..self.front_matter);
+            out.extend(
+                front_matter_spans(&text)
+                    .into_iter()
+                    .filter(|span| span.range.end > bytes.start && span.range.start < bytes.end),
+            );
         }
         for (index, start) in self.blocks_in(bytes.clone()) {
             let relative = bytes.start.saturating_sub(start)..bytes.end.saturating_sub(start);
@@ -252,6 +330,21 @@ impl LiveDocument {
         source: &(impl SourceText + ?Sized),
         line: Range<usize>,
     ) -> Option<LineBlock> {
+        // The front matter shows like a code block: its `---` lines are the fences.
+        if line.start < self.front_matter {
+            let text = source.slice(line.clone());
+            let body = if matches!(text.trim_end(), "---" | "...") {
+                Body::Fence { info: None }
+            } else {
+                Body::Code
+            };
+            return Some(LineBlock {
+                start: line.start,
+                prefix: 0..0,
+                containers: Vec::new(),
+                body,
+            });
+        }
         let (index, start) = self
             .blocks_in(line.start..line.end.max(line.start + 1))
             .into_iter()
@@ -552,11 +645,18 @@ mod tests {
     }
 
     #[test]
-    fn front_matter_lines_have_no_block() {
+    fn front_matter_lines_are_a_code_block() {
+        // Break caught: `- a` in the front matter drawn as a list item.
         let text = "---\n- a\n---\n- b\n";
         let doc = LiveDocument::parse(text);
-        assert_eq!(doc.line_block(&StrSource(text), 4..7), None);
-        assert!(doc.line_block(&StrSource(text), 12..15).is_some());
+        let body = |line: Range<usize>| doc.line_block(&StrSource(text), line).map(|b| b.body);
+        assert_eq!(body(0..3), Some(Body::Fence { info: None }));
+        assert_eq!(body(4..7), Some(Body::Code));
+        assert_eq!(body(8..11), Some(Body::Fence { info: None }));
+        assert!(matches!(
+            doc.line_block(&StrSource(text), 12..15),
+            Some(LineBlock { ref containers, .. }) if !containers.is_empty()
+        ));
     }
 
     #[test]
@@ -625,16 +725,42 @@ mod tests {
     }
 
     #[test]
-    fn front_matter_is_one_dim_span() {
+    fn front_matter_keys_are_bold_and_its_punctuation_dim() {
+        // Break caught: the whole front matter one dim span, keys and values alike.
         let text = "---\ntitle: x\n---\n\n**b**\n";
         let doc = LiveDocument::parse(text);
         let all = spans(&doc, text);
-        assert_eq!(all[0], (0..16, SpanKind::Dim));
+        assert_eq!(
+            all[..2],
+            [(4..9, SpanKind::Bold), (4..10, SpanKind::Dim)],
+            "{all:?}"
+        );
         assert!(
-            all[1..].iter().all(|(range, _)| range.start >= 16),
+            all[2..].iter().all(|(range, _)| range.start >= 16),
             "{all:?}"
         );
         assert_eq!(doc.front_matter_end(), 16);
+    }
+
+    #[test]
+    fn front_matter_values_dim_their_brackets_quotes_and_comments() {
+        fn dims(text: &str) -> Vec<&str> {
+            front_matter_spans(text)
+                .into_iter()
+                .filter(|span| span.kind == SpanKind::Dim)
+                .map(|span| &text[span.range])
+                .collect()
+        }
+        assert_eq!(
+            dims("---\ntags: [a, \"b\"]\n---"),
+            ["tags:", "[", ",", "\"", "\"", "]"]
+        );
+        assert_eq!(dims("---\nt: x # note\n---"), ["t:", "# note"]);
+        assert_eq!(dims("---\n# all\n---"), ["# all"]);
+        assert_eq!(dims("---\nfiles:\n  - a.rs\n---"), ["files:", "-"]);
+        // A colon inside a quoted value or a URL is not a key's.
+        assert_eq!(dims("---\n\"a: b\"\n---"), ["\"", "\""]);
+        assert_eq!(dims("---\nurl: http://x\n---"), ["url:"]);
     }
 
     #[test]

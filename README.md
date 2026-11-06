@@ -176,7 +176,8 @@ typing. Both panes scroll together.
   blocks as their diagrams (or their code under the error, when one cannot be drawn) and local
   images as thumbnails (anything else shows its alt text; nothing is fetched). The block you are in
   (from blank line to blank line, a whole table or code block) shows its Markdown source, keeping
-  its formatting and highlighted; raw HTML, front matter, footnotes and math are dimmed. Ctrl+click
+  its formatting and highlighted; front matter shows like a code block with its keys in bold, and
+  raw HTML, footnotes and math are dimmed. Ctrl+click
   follows a link. Find and go to line reveal the block they land on, and switching to Split or
   Preview keeps your place. Right-click gives the usual edit menu plus Open link and
   Copy link address; dropped text lands where you drop it, and a selection can be dragged to move
@@ -245,7 +246,8 @@ Call Dana about the #budget.
 - **The Tags view** (the tag button in the activity bar, or **View: Show tags**) lists every tag
   in every open notebook with how many notes use it. Nested tags like `#project/atlas` sit under
   `#project`. Expand a tag to see its notes; click one to open it.
-- **In the preview**, front matter shows as a table of its properties, and each `#tag` is a chip
+- **In the preview**, front matter folds into a **Properties** panel (click it to see every
+  property, with list values as chips), and each `#tag` is a chip
   you can click to see the tag's notes.
 - Tags in code, links and HTML don't count, and neither do `#123` or `C#`.
 

@@ -247,7 +247,9 @@ pub fn line_style(
     let body = match body {
         None | Some(Body::Text) => BodyStyle::Text,
         Some(Body::Code) => {
-            runs = vec![(content.clone(), SpanKind::CodeBlock)];
+            // Code lines carry no inline spans, except the front matter's keys and punctuation.
+            runs.retain(|(_, kind)| matches!(kind, SpanKind::Bold | SpanKind::Dim));
+            runs.insert(0, (content.clone(), SpanKind::CodeBlock));
             BodyStyle::Code {
                 fence: false,
                 info: false,

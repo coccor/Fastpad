@@ -114,6 +114,7 @@ fn visit(kind: &BlockKind, block: usize, walk: &mut Walk, keys: &mut Vec<Details
         BlockKind::Paragraph { .. }
         | BlockKind::Code { .. }
         | BlockKind::Table { .. }
+        | BlockKind::Properties(_)
         | BlockKind::Rule => {}
     }
 }
@@ -145,6 +146,7 @@ pub fn count_nested(blocks: &[BlockKind]) -> (u32, usize) {
             BlockKind::Paragraph { .. }
             | BlockKind::Code { .. }
             | BlockKind::Table { .. }
+            | BlockKind::Properties(_)
             | BlockKind::Rule => (0, 0),
         };
         (headings + inner_headings, details + inner_details)

@@ -614,6 +614,10 @@ fn the_readme_fixture_renders_no_literal_markup() {
                     .chain(rows.iter().flatten())
                     .map(|cell| cell.text.clone()),
             ),
+            BlockKind::Properties(rows) => texts.extend(
+                rows.iter()
+                    .flat_map(|(key, value)| [key.text.clone(), value.text.clone()]),
+            ),
             BlockKind::Code { text, .. } => texts.push(text.clone()),
             BlockKind::Rule => {}
         }
@@ -643,22 +647,56 @@ fn the_readme_fixture_renders_no_literal_markup() {
 }
 
 #[test]
-fn front_matter_shows_as_a_table_of_its_properties() {
+fn front_matter_shows_as_collapsed_properties() {
     // Break caught: front matter drawn as a rule and a setext heading, its keys run together.
     assert_eq!(
-        kinds("---\ntitle: Plan\ntags: [a, b]\n---\n# Heading\n"),
+        kinds(
+            "---\ntitle: Plan\ntags: [a, \"#b\"]\nfiles: [x.rs, y.rs]\nat: 2026-11-05T12:50\n---\n# Heading\n"
+        ),
         vec![
-            BlockKind::Table {
-                alignments: vec![CellAlign::Left, CellAlign::Left],
-                head: vec![plain("Property"), plain("Value")],
-                rows: vec![
-                    vec![plain("title"), plain("Plan")],
-                    vec![plain("tags"), plain("a, b")],
-                ],
+            BlockKind::Details {
+                open: false,
+                summary: plain(PROPERTIES_SUMMARY),
+                children: vec![BlockKind::Properties(vec![
+                    (plain("title"), plain("Plan")),
+                    (
+                        plain("tags"),
+                        styled(
+                            "#a  #b",
+                            vec![
+                                span(0..2, InlineStyle::Tag("a".to_owned())),
+                                span(4..6, InlineStyle::Tag("b".to_owned())),
+                            ]
+                        )
+                    ),
+                    (
+                        plain("files"),
+                        styled(
+                            "x.rs  y.rs",
+                            vec![
+                                span(0..4, InlineStyle::Chip),
+                                span(6..10, InlineStyle::Chip)
+                            ]
+                        )
+                    ),
+                    (plain("at"), plain("2026-11-05 12:50")),
+                ])],
             },
             heading(1, plain("Heading")),
         ]
     );
+    // Tags written as one string are chips too; a date alone, or other text, is as written.
+    let BlockKind::Details { children, .. } =
+        &kinds("---\ntags: a b\nday: 2026-11-05\nnote: 2026-11-05Tea\n---\n")[0]
+    else {
+        panic!("expected the properties section");
+    };
+    let BlockKind::Properties(rows) = &children[0] else {
+        panic!("expected properties, got {children:?}");
+    };
+    assert_eq!(rows[0].1.plain_text(), "#a  #b");
+    assert_eq!(rows[1].1, plain("2026-11-05"));
+    assert_eq!(rows[2].1, plain("2026-11-05Tea"));
     // A rule further down is still a rule.
     assert_eq!(kinds("text\n\n---\n\nmore\n").len(), 3);
 }

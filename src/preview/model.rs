@@ -87,7 +87,13 @@ pub enum BlockKind {
         summary: RichText,
         children: Vec<BlockKind>,
     },
+    /// The front matter's properties, keys and values, drawn as a list of key-value rows. It
+    /// sits alone in a collapsed `Details` titled `PROPERTIES_SUMMARY`, which draws as a panel.
+    Properties(Vec<(RichText, RichText)>),
 }
+
+/// The summary of the section holding the front matter's properties.
+pub const PROPERTIES_SUMMARY: &str = "Properties";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AlertKind {
@@ -206,6 +212,8 @@ pub enum InlineStyle {
     /// An inline `#tag` (second brain phase 1 spec §6.3), by its name without `#`: drawn as a chip
     /// that shows the tag in the Tags view.
     Tag(String),
+    /// An item of a front matter list, drawn as a chip.
+    Chip,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1009,7 +1017,7 @@ impl Builder {
                 if let Some(table) = self
                     .metadata
                     .take()
-                    .and_then(|text| front_matter_table(&text))
+                    .and_then(|text| front_matter_block(&text))
                 {
                     self.add_block(table);
                 }
@@ -1334,22 +1342,91 @@ impl Builder {
     }
 }
 
-/// Front matter's text (between its `---` lines) as a two-column table of its properties, or
-/// `None` when it has none FastPad can read.
-fn front_matter_table(text: &str) -> Option<BlockKind> {
-    let front = crate::library::frontmatter::parse(&format!("---\n{text}\n---\n"))?;
+/// Front matter's text (between its `---` lines) as a collapsed "Properties" section holding its
+/// properties, or `None` when it has none FastPad can read.
+fn front_matter_block(text: &str) -> Option<BlockKind> {
+    let front = crate::library::frontmatter::parse(&format!(
+        "---
+{text}
+---
+"
+    ))?;
     if front.entries.is_empty() {
         return None;
     }
-    Some(BlockKind::Table {
-        alignments: vec![CellAlign::Left, CellAlign::Left],
-        head: vec![RichText::plain("Property"), RichText::plain("Value")],
-        rows: front
-            .entries
-            .iter()
-            .map(|(key, value)| vec![RichText::plain(key), RichText::plain(&value.display())])
-            .collect(),
+    let rows = front
+        .entries
+        .iter()
+        .map(|(key, value)| {
+            let tags = key.eq_ignore_ascii_case("tags") || key.eq_ignore_ascii_case("tag");
+            (RichText::plain(key), property_value(value, tags))
+        })
+        .collect();
+    Some(BlockKind::Details {
+        open: false,
+        summary: RichText::plain(PROPERTIES_SUMMARY),
+        children: vec![BlockKind::Properties(rows)],
     })
+}
+
+/// A front matter value as shown: a list's items as chips (tags as tag chips, which show the
+/// tag's notes), a date-time with a space for its `T`, anything else as written.
+fn property_value(value: &crate::library::frontmatter::Value, tags: bool) -> RichText {
+    use crate::library::frontmatter::Value;
+    let items = match value {
+        Value::List(items) => items.clone(),
+        Value::Text(text) if tags => text
+            .split([',', ' ', '\t'])
+            .filter(|item| !item.trim().is_empty())
+            .map(str::to_owned)
+            .collect(),
+        Value::Text(text) => return RichText::plain(&readable_date_time(text)),
+        Value::Raw(text) => return RichText::plain(text),
+    };
+    let mut rich = RichText::default();
+    for item in items
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+    {
+        if !rich.text.is_empty() {
+            // Two spaces: room between the chips' outlines.
+            rich.text.push_str("  ");
+            rich.utf16_len += 2;
+        }
+        let (shown, style) = if tags {
+            let name = item.trim_start_matches('#');
+            (format!("#{name}"), InlineStyle::Tag(name.to_owned()))
+        } else {
+            (item.to_owned(), InlineStyle::Chip)
+        };
+        let start = rich.utf16_len;
+        rich.text.push_str(&shown);
+        rich.utf16_len += shown.encode_utf16().count() as u32;
+        rich.spans.push(Span {
+            range: start..rich.utf16_len,
+            style,
+        });
+    }
+    rich
+}
+
+/// `2026-11-05T12:50` (an ISO 8601 date and time) as `2026-11-05 12:50`; other text unchanged.
+fn readable_date_time(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let date = bytes.len() >= 16
+        && bytes[..10].iter().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7) == (*byte == b'-')
+                && (matches!(index, 4 | 7) || byte.is_ascii_digit())
+        })
+        && bytes[10] == b'T'
+        && bytes[11..13].iter().all(u8::is_ascii_digit)
+        && bytes[13] == b':';
+    if date {
+        format!("{} {}", &text[..10], &text[11..])
+    } else {
+        text.to_owned()
+    }
 }
 
 fn finish_block(frame: Frame) -> Option<BlockKind> {
