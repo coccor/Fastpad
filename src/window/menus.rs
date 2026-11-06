@@ -105,9 +105,9 @@ pub(crate) struct MenuBar(HMENU);
 fn markdown_view() -> Vec<MenuEntry> {
     vec![
         MenuEntry::command("&Source", CommandId::MarkdownViewSource),
-        MenuEntry::command("&Live", CommandId::MarkdownViewLive),
         MenuEntry::command("S&plit", CommandId::MarkdownViewSplit),
         MenuEntry::command("P&review", CommandId::MarkdownViewPreview),
+        MenuEntry::command("&Live", CommandId::MarkdownViewLive),
     ]
 }
 

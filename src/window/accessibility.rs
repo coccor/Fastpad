@@ -1069,7 +1069,7 @@ mod tests {
             .iter()
             .filter_map(AccessibleChild::button_name)
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["Source", "Live", "Split", "Preview"]);
+        assert_eq!(names, vec!["Source", "Split", "Preview", "Live"]);
         let without = accessible_children(ProviderKind::GroupStrip, &["a"], &[]);
         assert_eq!(without.len(), 1);
         // Break caught: an SVG tab announcing a Live segment it does not show.
