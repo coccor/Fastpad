@@ -399,3 +399,26 @@ fn a_first_run_opens_the_documents_notebook_unless_a_folder_was_named() {
     pump_for_a_moment(&window);
     assert_eq!(open_folders(&window), [b.folder()]);
 }
+
+#[test]
+fn a_first_run_launched_with_a_file_still_opens_the_documents_notebook() {
+    // Break caught: double-clicking a note on a first run suppressing the Documents\FastPad
+    // fallback, so no notebook opens because the launch path was a file, not a folder.
+    let _scintilla = load_native_scintilla();
+    let documents =
+        crate::library::normalize_folder(&crate::platform::paths::default_notes_folder().unwrap());
+    let a = LibraryScratch::new("startup16-a");
+    let file = a.root.join("loose.txt");
+    std::fs::write(&file, "loose").unwrap();
+    let fresh = LibraryScratch::new("startup16-data");
+    let (window, _editor) = start(&fresh);
+    launch_with(&window, &file);
+
+    crate::window::library_host::open_library_step(window.hwnd);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    pump_until(window.hwnd, || {
+        all_loaded(&window, 1) || std::time::Instant::now() >= deadline
+    });
+    pump_for_a_moment(&window);
+    assert_eq!(open_folders(&window), std::slice::from_ref(&documents));
+}

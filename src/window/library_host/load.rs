@@ -58,6 +58,16 @@ pub(crate) fn open_library_step(hwnd: HWND) {
     } else {
         None
     };
+    // A first run launched with a path still opens `Documents\FastPad` when that path turns out
+    // not to be a folder (a note double-clicked, say): the launch worker decides, as only it
+    // checks the path.
+    let launch_fallback = if remembered.is_empty() && !recent.closed && launch.is_some() {
+        crate::platform::paths::default_notes_folder()
+            .ok()
+            .map(|folder| library::normalize_folder(&folder))
+    } else {
+        None
+    };
     let wanted: Vec<PathBuf> = remembered.iter().cloned().chain(fallback).collect();
     if wanted.is_empty() && launch.is_none() {
         // Nothing to open (`open=none`, or no Documents folder): no notebook, and no worker.
@@ -126,6 +136,7 @@ pub(crate) fn open_library_step(hwnd: HWND) {
             slots,
             remembered,
             launch,
+            launch_fallback,
             notice_generation,
         },
     );
@@ -223,6 +234,9 @@ struct StartupJobs {
     remembered: Vec<PathBuf>,
     /// The folder named on the command line and the generation of its load.
     launch: Option<(PathBuf, u64)>,
+    /// On a first run, the notebook that opens instead when the launch path is not a folder:
+    /// `Documents\FastPad`, answered under the launch's generation.
+    launch_fallback: Option<PathBuf>,
     /// The generation of the answer that carries the notice for missing notebooks.
     notice_generation: u64,
 }
@@ -248,6 +262,7 @@ fn spawn_startup(hwnd: HWND, data: PathBuf, jobs: StartupJobs) {
             slots,
             remembered,
             launch,
+            launch_fallback,
             notice_generation,
         } = jobs;
         let is_remembered = |folder: &Path| {
@@ -306,11 +321,26 @@ fn spawn_startup(hwnd: HWND, data: PathBuf, jobs: StartupJobs) {
                 });
             }
             if let Some((launch, generation)) = &launch {
-                let (data, slots) = (&data, &slots);
+                let (data, slots, launch_fallback) = (&data, &slots, &launch_fallback);
                 scope.spawn(move || {
                     if !library::folder_exists(launch) {
-                        // Not a folder: nothing to add.
-                        post_loaded(target, nothing_to_open(*generation));
+                        // Not a folder: nothing to add, unless this is a first run, which opens
+                        // `Documents\FastPad` as it would without a path.
+                        let Some(fallback) = launch_fallback else {
+                            post_loaded(target, nothing_to_open(*generation));
+                            return;
+                        };
+                        let result = load_folder(data, fallback);
+                        post_loaded(
+                            target,
+                            Loaded {
+                                generation: *generation,
+                                folder: fallback.clone(),
+                                result,
+                                notice: None,
+                                closed: false,
+                            },
+                        );
                         return;
                     }
                     let listed = slots
