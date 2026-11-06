@@ -63,7 +63,7 @@ The following stay on `LibraryHost`, because they belong to the window:
 
 - **`NotebookId`** is a `u32` counter handed out when a notebook opens. It is never reused within a session. Ids are not persisted.
 - **Worker results are matched to their slot by a generation value unique across the window.** These are `Loaded`, `IndexReady`, watcher `FileChanges` and `CopyDone`. No two slots, and no two kinds of work, ever share a generation, so the generation names the slot as carrying its id would. The handler looks up the slot by generation and drops the result in either case:
-  - no slot has that id any more, because the notebook was closed;
+  - no slot holds that generation any more, because the notebook was closed;
   - the slot's generation for that kind of work has moved on.
 - **`notebook_of(hwnd, path) -> Option<NotebookId>`** is the only way code decides which open notebook owns a file. It returns the slot whose folder contains `path`, using `library::is_inside`. §3.3 rules out nesting, so at most one slot can match.
 - **`with_notebook(hwnd, id, f)`** gives `f` the slot's `LibraryState`, and does nothing when the slot is missing or not yet loaded. Changes to one notebook go through it.
@@ -297,9 +297,9 @@ Existing lines keep their meaning:
 New lines:
 
 - **`open=<path>`:** one line per open notebook, in sidebar order.
+- **`default=<path>`:** the default notebook. It must also appear on an `open=` line, or it is ignored.
 
 **Unavailable roots.** A remembered notebook that is missing at startup (an unplugged drive) stays on its `open=` line, in its place, until it opens again (it is then written in sidebar order) or until the user closes the last open notebook, which records `open=none`. Opening a folder nested with an unavailable notebook (inside it or containing it) drops the unavailable one: the explicit open wins, so `open=` never lists both.
-- **`default=<path>`:** the default notebook. It must also appear on an `open=` line, or it is ignored.
 
 **Reading.**
 

@@ -195,7 +195,7 @@ notebook**. New notes and folders go to
 the notebook you're working in, otherwise the default one, and quick capture always uses the
 default. Search, Quick Open and Tags cover the notebook you're working in, wikilinks stay inside
 their own notebook, and notes can't be dragged between notebooks yet: **Note: Move to notebook…**
-(**`Ctrl+Shift+M`**) moves a note to another open notebook. FastPad reopens the same
+(**`Ctrl+Shift+M`**) moves a note to another notebook. FastPad reopens the same
 notebooks next time (`folders.ini` keeps them as `open=` lines, with the default marked
 `default=`). A notebook that isn't available at startup, such as one on an unplugged drive, is
 skipped with a notice but stays remembered until its drive returns.
