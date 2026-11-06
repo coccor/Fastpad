@@ -353,7 +353,10 @@ pub(super) fn drag_release(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) -> bool 
                 path: Some(path),
                 ..
             } => {
-                crate::window::copy_host::copy_tab_into(hwnd, *id, path, &folder);
+                // The notebook the drop landed in.
+                if let Some(dest) = notebook {
+                    crate::window::copy_host::copy_tab_into_of(hwnd, dest, *id, path, &folder);
+                }
             }
             DragSource::Tab { path: None, .. } | DragSource::GroupTab { .. } => {}
             DragSource::Files(_) => {}
@@ -530,23 +533,25 @@ pub(crate) fn external_drop(hwnd: HWND, x: i32, y: i32, paths: Vec<PathBuf>) -> 
         return false;
     }
     let opens = with_view(hwnd, |view| view.opens_at(x, y)).unwrap_or(false);
-    let folder = if opens {
+    // The folder, in the notebook under the pointer, the files go into.
+    let place = if opens {
         None
     } else {
         with_view(hwnd, |view| view.drag_to(x, y, Instant::now()))
             .filter(|&accepted| accepted)
             .and_then(|_| {
                 with_view(hwnd, |view| {
-                    view.drag.as_ref().and_then(|drag| drag.target.clone())
+                    let folder = view.drag.as_ref().and_then(|drag| drag.target.clone())?;
+                    Some((view.drag_notebook?, folder))
                 })
                 .flatten()
             })
     };
     external_leave(hwnd);
-    if !opens && folder.is_none() {
+    if !opens && place.is_none() {
         return false;
     }
-    crate::window::copy_host::post_panel_drop(hwnd, paths, folder)
+    crate::window::copy_host::post_panel_drop(hwnd, paths, place)
 }
 
 /// Screen point `point` in the panel's client coordinates, when it is over the panel.
@@ -628,7 +633,8 @@ pub(crate) fn strip_tab_leave(hwnd: HWND) {
     }
 }
 
-/// A strip tab dropped at screen point `point`: the folder under it that takes its file, if any.
+/// A strip tab dropped at screen point `point`: the folder under it, and its notebook, that takes
+/// its file, if any.
 /// The tree's band goes either way; the caller ends its drag before it copies, so a "Replace?"
 /// question never opens under the drag.
 pub(crate) fn strip_tab_drop_folder(
@@ -636,16 +642,17 @@ pub(crate) fn strip_tab_drop_folder(
     point: POINT,
     id: DocumentId,
     path: &Path,
-) -> Option<PathBuf> {
+) -> Option<(NotebookId, PathBuf)> {
     let accepted = strip_tab_over(hwnd, point, id, path);
-    let folder = accepted
+    let place = accepted
         .then(|| {
             with_view(hwnd, |view| {
-                view.drag.as_ref().and_then(|drag| drag.target.clone())
+                let folder = view.drag.as_ref().and_then(|drag| drag.target.clone())?;
+                Some((view.drag_notebook?, folder))
             })
         })
         .flatten()
         .flatten();
     strip_tab_leave(hwnd);
-    folder
+    place
 }

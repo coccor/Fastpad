@@ -174,6 +174,7 @@ pub(crate) fn folder(hwnd: HWND) -> Option<PathBuf> {
 
 /// Runs `f` on the default notebook's loaded state (a shim until every caller names its
 /// notebook).
+#[cfg(test)]
 pub(crate) fn with_state<R>(hwnd: HWND, f: impl FnOnce(&mut LibraryState) -> R) -> Option<R> {
     with_notebook(hwnd, default_notebook(hwnd)?, f)
 }

@@ -899,6 +899,23 @@ impl NotebookView {
                 if let Some(layout) = self.inline_layout_in(area, dpi) {
                     self.paint_inline(dc, layout, list, palette, fonts, dpi);
                 }
+                // Why the pointer's place refuses the dragged row: a strip along the list's
+                // bottom edge, clear of the pointer's label.
+                if let Some(hint) = self.drag_hint() {
+                    let height = self.list.row_height.min(height(list));
+                    let strip = RECT {
+                        top: list.bottom - height,
+                        ..list
+                    };
+                    let text = RECT {
+                        left: strip.left + scale(12, dpi),
+                        ..strip
+                    };
+                    unsafe {
+                        fill(dc, strip, palette.hover_background);
+                        draw_text(dc, hint, text, fonts.text, palette.muted_foreground, LINE);
+                    }
+                }
             }
         }
     }
@@ -1136,7 +1153,7 @@ pub(super) fn draw_root_row(
 }
 
 /// How wide `text` is in `font` on `dc`.
-fn text_extent(dc: HDC, text: &str, font: HFONT) -> i32 {
+pub(crate) fn text_extent(dc: HDC, text: &str, font: HFONT) -> i32 {
     let wide = text.encode_utf16().collect::<Vec<_>>();
     if wide.is_empty() {
         return 0;

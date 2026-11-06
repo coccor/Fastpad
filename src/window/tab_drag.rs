@@ -381,12 +381,12 @@ pub(crate) fn release(hwnd: HWND, window: HWND, x: i32, y: i32, buttons: WPARAM)
     let target = target_at(hwnd, screen);
     if target.is_none()
         && let Some(path) = tab_path(hwnd, drag.source.document)
-        && let Some(folder) =
+        && let Some((id, folder)) =
             super::notebook_view::strip_tab_drop_folder(hwnd, screen, drag.source.document, &path)
     {
         // The drag is gone before the copy can ask to replace a file.
         end_feedback(hwnd, drag);
-        super::copy_host::copy_tab_into(hwnd, drag.source.document, &path, &folder);
+        super::copy_host::copy_tab_into_of(hwnd, id, drag.source.document, &path, &folder);
         return true;
     }
     let action = source_of(hwnd, drag.source.group, drag.source.document)

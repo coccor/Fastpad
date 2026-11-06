@@ -338,7 +338,7 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
                     identity_of(&"pinned-notes")
                 }
                 crate::window::open_editors::EditorEntry::Pinned(row) => {
-                    identity_of(&("pinned-note", &row.path))
+                    identity_of(&("pinned-note", row.notebook.0, &row.path))
                 }
             });
         }

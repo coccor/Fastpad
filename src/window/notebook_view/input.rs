@@ -369,8 +369,8 @@ pub(super) fn left_down(hwnd: HWND, x: i32, y: i32) {
         }
         Hit::Editor { index, close } => {
             // The Pinned part's note opens as a click on its tree row does.
-            if let Some(path) = pinned_at(hwnd, index) {
-                open_pinned(hwnd, &path, Activation::Click);
+            if let Some((id, path)) = pinned_at(hwnd, index) {
+                open_pinned(hwnd, id, &path, Activation::Click);
                 return;
             }
             // A header row does nothing.
@@ -449,8 +449,8 @@ pub(super) fn left_down(hwnd: HWND, x: i32, y: i32) {
 /// `WM_LBUTTONDBLCLK`: a row's second press opens it as a normal tab, which also promotes its
 /// preview (spec §6.4). Anywhere else it is one more click.
 /// Opens the pinned note `relative` the way activating its tree row would.
-fn open_pinned(hwnd: HWND, relative: &Path, how: Activation) {
-    let Some(root) = crate::window::library_host::folder(hwnd) else {
+fn open_pinned(hwnd: HWND, id: NotebookId, relative: &Path, how: Activation) {
+    let Some(root) = crate::window::library_host::notebook_folder(hwnd, id) else {
         return;
     };
     let path = root.join(relative);
@@ -464,13 +464,13 @@ fn open_pinned(hwnd: HWND, relative: &Path, how: Activation) {
 }
 
 /// The pinned note at Open Editors entry `index`, if that entry is one.
-fn pinned_at(hwnd: HWND, index: usize) -> Option<PathBuf> {
+fn pinned_at(hwnd: HWND, index: usize) -> Option<(NotebookId, PathBuf)> {
     with_view(hwnd, |view| {
         view.editors
             .rows
             .get(index)?
             .pinned()
-            .map(|row| row.path.clone())
+            .map(|row| (row.notebook, row.path.clone()))
     })
     .flatten()
 }
@@ -481,8 +481,8 @@ pub(super) fn double_click(hwnd: HWND, x: i32, y: i32) {
         // The first press already toggled the root, as on a folder row.
         Some(Hit::Root(_)) => {}
         Some(Hit::Editor { index, .. }) if pinned_at(hwnd, index).is_some() => {
-            if let Some(path) = pinned_at(hwnd, index) {
-                open_pinned(hwnd, &path, Activation::Permanent);
+            if let Some((id, path)) = pinned_at(hwnd, index) {
+                open_pinned(hwnd, id, &path, Activation::Permanent);
             }
         }
         Some(_) => left_down(hwnd, x, y),
@@ -843,8 +843,8 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
 pub(super) fn section_key(hwnd: HWND, cursor: Cursor, key: u16) -> bool {
     match (cursor, key) {
         (Cursor::Editor(index), VK_RETURN) if pinned_at(hwnd, index).is_some() => {
-            if let Some(path) = pinned_at(hwnd, index) {
-                open_pinned(hwnd, &path, Activation::Permanent);
+            if let Some((id, path)) = pinned_at(hwnd, index) {
+                open_pinned(hwnd, id, &path, Activation::Permanent);
             }
         }
         (Cursor::Editor(index), VK_RETURN) => {

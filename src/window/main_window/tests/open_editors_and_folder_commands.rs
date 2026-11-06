@@ -1212,3 +1212,60 @@ fn a_pinned_note_gets_a_pinned_part_under_the_open_editors_and_unpinning_removes
             .contains(&EditorEntry::PinnedHeader)
     );
 }
+
+#[test]
+fn pinned_editors_list_every_notebooks_pins_with_their_names() {
+    // Break caught: the Pinned part showing only the default notebook's pins, or naming the
+    // notebook when only one is open (multi-root notebooks spec §4.6).
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("pins-all", "a", "b");
+    let hwnd = ab.window.hwnd;
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, false);
+    let pinned = |hwnd| {
+        notebook_view(hwnd)
+            .editors
+            .rows
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .pinned()
+                    .map(|row| (row.name.clone(), row.notebook_name.clone()))
+            })
+            .collect::<Vec<_>>()
+    };
+    crate::window::library_host::toggle_pin(hwnd, &ab.a.join("a.md"));
+    crate::window::library_host::toggle_pin(hwnd, &ab.b.join("b.md"));
+    crate::window::notebook_view::rebuild(hwnd);
+    assert_eq!(
+        pinned(hwnd),
+        [
+            ("a.md".to_owned(), Some("A".to_owned())),
+            ("b.md".to_owned(), Some("B".to_owned())),
+        ]
+    );
+    // Opening B's pin opens B's file.
+    let index = notebook_view(hwnd)
+        .editors
+        .rows
+        .iter()
+        .position(|entry| entry.pinned().is_some_and(|row| row.name == "b.md"))
+        .unwrap();
+    let rect = notebook_view(hwnd).editor_rect_at(index).unwrap();
+    click(
+        sidebar_windows(hwnd).1,
+        (rect.left + rect.right) / 2,
+        (rect.top + rect.bottom) / 2,
+    );
+    assert_eq!(
+        app_mut(hwnd).tabs.active().unwrap().path.as_deref(),
+        Some(ab.b.join("b.md").as_path())
+    );
+
+    crate::window::library_host::close_notebook_of(hwnd, ab.b_id);
+    crate::window::notebook_view::rebuild(hwnd);
+    assert_eq!(
+        pinned(hwnd),
+        [("a.md".to_owned(), None)],
+        "one notebook open: no secondary text"
+    );
+}

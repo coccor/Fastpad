@@ -216,13 +216,27 @@ fn kept_by_identity(source: &Path, destination: &Path, name: &str) -> Option<Str
 /// plans, asks about each clash, recycles each answered replace, and queues the copies.
 /// `dirty_tab` names the tab whose saved version is copied: its notice comes once that copy
 /// worked.
+#[cfg(test)]
 pub(crate) fn copy_into(
     hwnd: HWND,
     sources: Vec<PathBuf>,
     folder: &Path,
     dirty_tab: Option<String>,
 ) {
-    let Some(root) = library_host::folder(hwnd) else {
+    if let Some(id) = library_host::default_notebook(hwnd) {
+        copy_into_of(hwnd, id, sources, folder, dirty_tab);
+    }
+}
+
+/// `copy_into` for the notebook `id`: `folder` is a folder of that notebook.
+pub(crate) fn copy_into_of(
+    hwnd: HWND,
+    id: library_host::NotebookId,
+    sources: Vec<PathBuf>,
+    folder: &Path,
+    dirty_tab: Option<String>,
+) {
+    let Some(root) = library_host::notebook_folder(hwnd, id) else {
         return;
     };
     let planned = tree_copy::plan(&sources, &root, folder, &|path: &Path| path.exists());
@@ -290,7 +304,21 @@ pub(crate) fn copy_into(
 
 /// An Open Editors row dropped on `folder`: its file on disk is copied. A dirty tab's saved
 /// version goes, and the notice says so.
+#[cfg(test)]
 pub(crate) fn copy_tab_into(hwnd: HWND, id: DocumentId, path: &Path, folder: &Path) {
+    if let Some(dest) = library_host::default_notebook(hwnd) {
+        copy_tab_into_of(hwnd, dest, id, path, folder);
+    }
+}
+
+/// `copy_tab_into` for the notebook `dest`.
+pub(crate) fn copy_tab_into_of(
+    hwnd: HWND,
+    dest: library_host::NotebookId,
+    id: DocumentId,
+    path: &Path,
+    folder: &Path,
+) {
     let dirty = unsafe { app_ptr(hwnd) }
         .and_then(|app| {
             unsafe { app.as_ref() }
@@ -300,20 +328,25 @@ pub(crate) fn copy_tab_into(hwnd: HWND, id: DocumentId, path: &Path, folder: &Pa
         })
         .unwrap_or(false);
     let dirty_tab = dirty.then(|| tree_copy::item_name(path));
-    copy_into(hwnd, vec![path.to_path_buf()], folder, dirty_tab);
+    copy_into_of(hwnd, dest, vec![path.to_path_buf()], folder, dirty_tab);
 }
 
 /// `WM_FASTPAD_PANEL_DROPPED`'s payload: what an Explorer drop on the panel does.
 pub(crate) struct PanelDrop {
     paths: Vec<PathBuf>,
-    /// `None` opens the paths, as a drop on the window does.
-    folder: Option<PathBuf>,
+    /// The notebook, and the folder in it, the paths are copied into; `None` opens them, as a
+    /// drop on the window does.
+    place: Option<(library_host::NotebookId, PathBuf)>,
 }
 
 /// Posts an Explorer drop on the panel to the window, so Drop returns before anything is asked
 /// (open editors spec §6). False when the post failed; its payload is freed here then.
-pub(crate) fn post_panel_drop(hwnd: HWND, paths: Vec<PathBuf>, folder: Option<PathBuf>) -> bool {
-    let payload = Box::into_raw(Box::new(PanelDrop { paths, folder }));
+pub(crate) fn post_panel_drop(
+    hwnd: HWND,
+    paths: Vec<PathBuf>,
+    place: Option<(library_host::NotebookId, PathBuf)>,
+) -> bool {
+    let payload = Box::into_raw(Box::new(PanelDrop { paths, place }));
     let posted = unsafe {
         PostMessageW(
             hwnd,
@@ -339,8 +372,8 @@ pub(crate) fn panel_dropped(hwnd: HWND, lparam: LPARAM) {
     if super::modal::modal_active(hwnd) {
         return;
     }
-    match drop.folder {
-        Some(folder) => copy_into(hwnd, drop.paths, &folder, None),
+    match drop.place {
+        Some((id, folder)) => copy_into_of(hwnd, id, drop.paths, &folder, None),
         None => library_host::files_dropped(hwnd, drop.paths),
     }
 }

@@ -186,7 +186,7 @@ pub(crate) fn drop_into_of(
     ) else {
         return;
     };
-    if !tree_drag::accepts(source, folder) {
+    if tree_drag::accepts(id, id, source, folder) != tree_drag::Verdict::Accepted {
         return;
     }
     let name = old
