@@ -323,23 +323,36 @@ pub fn draw_ops(
                         );
                     }
                 }
-                DrawOp::Image { slot } => {
+                DrawOp::Image { slot, run } => {
                     let Some(slot) = slots.get(*slot) else {
                         continue;
                     };
                     let rect = slot.rect.offset(x, y);
-                    match slot
-                        .path
-                        .as_deref()
-                        .and_then(|path| cache.bitmap(target, path))
-                    {
-                        Some(bitmap) => target.DrawBitmap(
-                            &bitmap,
-                            Some(&rect.to_d2d()),
-                            1.0,
-                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                            None,
-                        ),
+                    let bitmap = match (&slot.diagram, slot.path.as_deref()) {
+                        (Some(key), _) => cache.diagram_bitmap(target, key),
+                        (None, Some(path)) => cache.bitmap(target, path),
+                        (None, None) => None,
+                    };
+                    match bitmap {
+                        Some(bitmap) => {
+                            target.DrawBitmap(
+                                &bitmap,
+                                Some(&rect.to_d2d()),
+                                1.0,
+                                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                                None,
+                            );
+                            // A diagram's source is selected: tint the diagram, which is opaque.
+                            if run
+                                .and_then(|run| (selection.range)(run))
+                                .is_some_and(|(start, end)| start < end)
+                            {
+                                let brush = brushes.get(selection.fill);
+                                brush.SetOpacity(0.35);
+                                target.FillRectangle(&rect.to_d2d(), brush);
+                                brush.SetOpacity(1.0);
+                            }
+                        }
                         None => {
                             target.DrawRectangle(
                                 &rect.inflate(-0.5).to_d2d(),

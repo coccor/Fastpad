@@ -119,6 +119,6 @@ pub use messages::{
     reason = "consumed by the source-linked save_file integration target"
 )]
 pub(crate) use modal::{
-    answer_next_close_prompt, answer_next_confirm, answer_next_folder_dialog,
-    answer_next_save_dialog,
+    allow_real_dialogs, answer_next_close_prompt, answer_next_confirm, answer_next_folder_dialog,
+    answer_next_open_dialog, answer_next_save_dialog,
 };

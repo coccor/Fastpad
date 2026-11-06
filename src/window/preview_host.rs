@@ -373,6 +373,30 @@ pub(crate) fn carry_mode(hwnd: HWND, from: GroupId, document: DocumentId, to: Gr
     });
 }
 
+/// Records `default` as the mode of every open Markdown tab that has not chosen one, so a new
+/// `markdown_view` setting changes only the tabs opened after it: the ones already open keep
+/// showing what they show. Nothing needs syncing.
+pub(crate) fn keep_open_markdown_modes(hwnd: HWND, default: ViewMode) {
+    let Some(mut app) = (unsafe { host_window::app_ptr(hwnd) }) else {
+        return;
+    };
+    let app = unsafe { app.as_mut() };
+    for id in app.tabs.group_ids() {
+        let markdown = app
+            .tabs
+            .group_documents(id)
+            .into_iter()
+            .filter(|document| document.language == Language::Markdown)
+            .map(|document| document.id)
+            .collect::<Vec<_>>();
+        if let Some(group) = app.group_mut(id) {
+            for document in markdown {
+                group.preview.modes.entry(document).or_insert(default);
+            }
+        }
+    }
+}
+
 /// Drops the modes of documents no longer among group `id`'s tabs.
 fn prune_modes(hwnd: HWND, id: GroupId) {
     let Some(mut app) = (unsafe { host_window::app_ptr(hwnd) }) else {

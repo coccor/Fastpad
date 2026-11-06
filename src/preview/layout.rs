@@ -1,13 +1,15 @@
 //! Blocks to positioned drawing operations using DirectWrite text layouts. A `LaidBlock` is valid
 //! for one content width, one `PreviewFonts`, one `Brushes` (links and muted spans use brush drawing
 //! effects), one colour scheme (`<picture>` sources), and one set of `<details>` states, so the view
-//! discards layouts when any of those change.
+//! discards layouts when any of those change. Mermaid code blocks also depend on the diagrams the
+//! image cache holds, so the view discards them when a diagram finishes (`LaidBlock::diagrams`).
 
 use crate::Result;
 use crate::preview::colors::ColorRole;
 use crate::preview::dwrite::{Graphics, ResolvedFamily, hresult_error, range_rects};
 use crate::preview::inline_object::inline_box;
 use crate::preview::links::resolve_image_path;
+use crate::preview::mermaid::{DiagramKey, is_mermaid};
 use crate::preview::model::{
     AlertKind, BlockKind, CellAlign, ColorScheme, ImageRef, InlineStyle, Length, ListItem,
     OBJECT_REPLACEMENT, RichText, TextAlign,
@@ -112,6 +114,8 @@ pub enum DrawOp {
     },
     Image {
         slot: usize,
+        /// The run the image stands for, tinted while selected: a diagram's hidden source.
+        run: Option<u32>,
     },
     /// Content wider than the pane: drawn clipped to `clip`, shifted by the block's horizontal
     /// scroll offset.
@@ -210,6 +214,8 @@ pub fn block_has_target(kind: &BlockKind) -> bool {
 
 pub struct ImageSlot {
     pub path: Option<PathBuf>,
+    /// A Mermaid diagram drawn in place of its code block; `path` is `None`.
+    pub diagram: Option<DiagramKey>,
     pub rect: RectF,
     /// Alt text, shown while the image is pending, remote, missing, or failed.
     pub alt: IDWriteTextLayout,
@@ -257,6 +263,24 @@ pub struct LaidBlock {
     pub scroll_width: f32,
     /// Laid-out headings: their document-order index within the block and their y.
     pub headings: Vec<(u32, f32)>,
+    /// The block holds a Mermaid code block, whose look depends on the diagrams the cache holds.
+    pub diagrams: bool,
+}
+
+/// How a Mermaid code block draws, as the view's diagram resolver decides.
+pub enum DiagramView {
+    /// The diagram, `width`×`height` DIPs: the source's own, or the last one this block drew
+    /// while the new source renders or fails. `error` is why the current source failed.
+    Ready {
+        key: DiagramKey,
+        width: f32,
+        height: f32,
+        error: Option<String>,
+    },
+    /// Not drawn yet: the code block, as without diagrams.
+    Pending,
+    /// The code block, below why the source could not be drawn.
+    Failed(String),
 }
 
 pub struct LayoutContext<'a> {
@@ -269,6 +293,8 @@ pub struct LayoutContext<'a> {
     dark: bool,
     /// `<details>` sections the user toggled away from their `open` attribute.
     details: &'a HashMap<DetailsKey, bool>,
+    /// What each Mermaid code block's source draws as; `None` draws them all as code.
+    diagram: Option<&'a dyn Fn(&str) -> DiagramView>,
     formats: RefCell<HashMap<(bool, u32, i32), IDWriteTextFormat>>,
     /// `fonts`' body and code names as DirectWrite knows them.
     body_family: ResolvedFamily,
@@ -311,6 +337,7 @@ impl<'a> LayoutContext<'a> {
             image_size,
             dark,
             details,
+            diagram: None,
             formats: RefCell::new(HashMap::new()),
             body_family: graphics.resolve_family(&fonts.body_family),
             code_family: graphics.resolve_family(&fonts.code_family),
@@ -325,6 +352,12 @@ impl<'a> LayoutContext<'a> {
         )?;
         context.line_height = metrics(&sample)?.height;
         Ok(context)
+    }
+
+    /// Draws Mermaid code blocks as `resolve` says.
+    pub fn with_diagrams(mut self, resolve: &'a dyn Fn(&str) -> DiagramView) -> Self {
+        self.diagram = Some(resolve);
+        self
     }
 
     pub fn line_height(&self) -> f32 {
@@ -559,6 +592,7 @@ struct Output<'k> {
     images: Vec<ImageSlot>,
     scroll_width: f32,
     headings: Vec<(u32, f32)>,
+    diagrams: bool,
     keys: &'k [DetailsKey],
     next_heading: u32,
     next_details: usize,
@@ -573,6 +607,7 @@ impl<'k> Output<'k> {
             images: Vec::new(),
             scroll_width: 0.0,
             headings: Vec::new(),
+            diagrams: false,
             keys,
             next_heading: 0,
             next_details: 0,
@@ -620,6 +655,7 @@ pub fn layout_block(
         images: output.images,
         scroll_width: output.scroll_width,
         headings: output.headings,
+        diagrams: output.diagrams,
     })
 }
 
@@ -692,6 +728,9 @@ fn layout_kind(
                 content: bottom - y,
                 margin,
             })
+        }
+        BlockKind::Code { language, text } if is_mermaid(language) => {
+            push_diagram(context, text, x, y, width, output, margin)
         }
         BlockKind::Code { text, .. } => push_code(context, text, x, y, width, output, margin),
         BlockKind::Rule => {
@@ -1009,11 +1048,13 @@ fn push_image_slot(
     };
     output.images.push(ImageSlot {
         path: image.path,
+        diagram: None,
         rect,
         alt,
         alt_origin: (padding, alt_top),
     });
     output.ops.push(DrawOp::Image {
+        run: None,
         slot: output.images.len() - 1,
     });
     Ok(())
@@ -1104,6 +1145,102 @@ fn push_code(
     }
     Ok(Extent {
         content: height,
+        margin,
+    })
+}
+
+/// A Mermaid code block: the diagram, centred and never wider than `width`, once the resolver has
+/// one; the code block until then; and a one-line reason above either when the source fails.
+fn push_diagram(
+    context: &LayoutContext<'_>,
+    text: &str,
+    x: f32,
+    y: f32,
+    width: f32,
+    output: &mut Output<'_>,
+    margin: f32,
+) -> Result<Extent> {
+    let Some(resolve) = context.diagram else {
+        return push_code(context, text, x, y, width, output, margin);
+    };
+    output.diagrams = true;
+    let view = resolve(text);
+    let error = match &view {
+        DiagramView::Ready { error, .. } => error.as_deref(),
+        DiagramView::Failed(error) => Some(error.as_str()),
+        DiagramView::Pending => None,
+    };
+    let unit = context.fonts.unit();
+    let mut top = y;
+    if let Some(error) = error {
+        let caption = context.plain_layout(
+            &format!("Mermaid diagram error: {error}"),
+            false,
+            context.fonts.body_size * SMALL_SCALE,
+            DWRITE_FONT_WEIGHT_NORMAL,
+            width,
+        )?;
+        let height = metrics(&caption)?.height;
+        // Decoration, like an alert title: not part of the selectable text.
+        output.ops.push(DrawOp::Text {
+            layout: caption,
+            x,
+            y: top,
+            role: ColorRole::Muted,
+            run: None,
+        });
+        top += height + 4.0 * unit;
+    }
+    let DiagramView::Ready {
+        key,
+        width: natural_width,
+        height: natural_height,
+        ..
+    } = view
+    else {
+        let code = push_code(context, text, x, top, width, output, margin)?;
+        return Ok(Extent {
+            content: code.content + (top - y),
+            margin,
+        });
+    };
+    let (natural_width, natural_height) = (natural_width.max(1.0), natural_height.max(1.0));
+    let box_width = natural_width.min(width).max(1.0);
+    let box_height = (natural_height * box_width / natural_width).clamp(1.0, MAX_IMAGE_HEIGHT);
+    let left = x + ((width - box_width) / 2.0).max(0.0);
+    let rect = RectF::new(left, top, left + box_width, top + box_height);
+    // The source stays the block's selectable text, laid out unseen over the diagram, so selection
+    // and copying see the code block that `selection::text_runs` reports.
+    let source = context.plain_layout(
+        text,
+        true,
+        context.fonts.body_size * CODE_SCALE,
+        DWRITE_FONT_WEIGHT_NORMAL,
+        box_width,
+    )?;
+    let len = text.encode_utf16().count() as u32;
+    let run = push_run(&source, len, left, top, false, output)?;
+    output.runs[run as usize].clip = Some(rect);
+    let alt = context.plain_layout(
+        "Mermaid diagram",
+        false,
+        context.fonts.body_size,
+        DWRITE_FONT_WEIGHT_NORMAL,
+        box_width,
+    )?;
+    output.images.push(ImageSlot {
+        path: None,
+        diagram: Some(key),
+        rect,
+        alt,
+        alt_origin: (8.0 * unit, 8.0 * unit),
+    });
+    output.ops.push(DrawOp::Image {
+        slot: output.images.len() - 1,
+        run: Some(run),
+    });
+    Ok(Extent {
+        content: box_height + (top - y),
         margin,
     })
 }
@@ -1297,7 +1434,12 @@ fn push_table(
     output.runs.append(&mut table_output.runs);
     for op in &mut table_output.ops {
         match op {
-            DrawOp::Image { slot } => *slot += base,
+            DrawOp::Image { slot, run } => {
+                *slot += base;
+                if let Some(run) = run {
+                    *run += run_base;
+                }
+            }
             DrawOp::Text { run: Some(run), .. } => *run += run_base,
             _ => {}
         }

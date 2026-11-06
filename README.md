@@ -62,8 +62,9 @@ There is no single trick. FastPad is fast because of everything it doesn't do be
   that post their results back. Direct2D, DirectWrite and the GPU driver load the first time you open the Markdown preview,
   and not before, which is a big part of why idle memory stays around 2 MB. Recovery snapshots are
   written on a timer, only once you've paused typing for two seconds.
-- **A small, pinned dependency tree.** Seven direct crates (`windows-sys`, `windows`, `serde_json`,
-  `pulldown-cmark`, `regex`, `resvg`, `windows-numerics`), each pinned to an exact version.
+- **A small, pinned dependency tree.** Eight direct crates (`windows-sys`, `windows`, `serde_json`,
+  `pulldown-cmark`, `regex`, `resvg`, `mermaid-rs-renderer`, `windows-numerics`), each pinned to an
+  exact version.
   [`tools/audit-dependencies.ps1`](tools/audit-dependencies.ps1) fails if anything else gets in.
   Release builds use fat LTO, one codegen unit and `panic = "abort"`. Code that never runs at
   startup, like the SVG renderer, is optimized for size instead of speed.
@@ -142,6 +143,11 @@ typing. Both panes scroll together.
   and tables.
 - Links just work: web links open in your browser, `#headings` jump inside the preview, and links to
   local files open in a new FastPad tab.
+- Mermaid diagrams: a ```` ```mermaid ```` code block draws as a diagram (flowcharts, sequence,
+  class, state, ER, pie, Gantt, journey, mindmap, timeline, Git graphs and more) in the preview's
+  own colors and font. It renders in Rust on a worker thread, with no browser or JavaScript. While you
+  edit, the last good diagram stays up, and a mistake shows its error above it. Copying a selection
+  across a diagram copies its source. Live draws them too, and shows the source when you click in.
 - Privacy by design: only local images are shown, and nothing is fetched from the internet.
 - The preview's graphics stack loads the first time you open a preview, so it never slows startup.
 - Writing helpers in Markdown files: `Ctrl+B`, `Ctrl+I`, ``Ctrl+` `` and `Ctrl+K` make the selection
@@ -166,7 +172,8 @@ typing. Both panes scroll together.
   file is only ever changed by what you type or a task checkbox you click. Headings, bold, italic,
   strike-through, inline code, links and `[[wikilinks]]` render in place with their markup hidden,
   and so do block elements: lists with bullets, numbers and clickable task checkboxes, quotes with
-  their bars, rules, code blocks on a full-width background, tables as aligned grids and local
+  their bars, rules, code blocks on a full-width background, tables as aligned grids, Mermaid
+  blocks as their diagrams (or their code under the error, when one cannot be drawn) and local
   images as thumbnails (anything else shows its alt text; nothing is fetched). The block you are in
   (from blank line to blank line, a whole table or code block) shows its Markdown source, keeping
   its formatting and highlighted; raw HTML, front matter, footnotes and math are dimmed. Ctrl+click
@@ -175,7 +182,9 @@ typing. Both panes scroll together.
   Copy link address; dropped text lands where you drop it, and a selection can be dragged to move
   it (Ctrl+drag copies). Screen readers see it as editable text. Commands that need the source
   view's own features (multiple cursors, column selection, folding) switch back to it with a
-  notice. Set `markdown_view=live` to open Markdown tabs in it.
+  notice. To open Markdown tabs in it, pick **Live** under **Markdown view** in Settings (or set
+  `markdown_view=live`). Tabs already open keep their view; the change applies to tabs you open
+  next.
 
 ### Notes and notebooks
 
@@ -446,7 +455,7 @@ line in a notification and applies the rest.
 | `always_on_top` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `false` |
 | `capture_hotkey` | A key like `Ctrl+Alt+N`; empty turns it off | `Ctrl+Alt+N` |
 | `capture_source` | `true`/`false`: note the window you were in when you pressed the capture hotkey | `false` |
-| `markdown_view` | `source`, `live`, `split`, `preview`: the view Markdown tabs open in | `source` |
+| `markdown_view` | `source`, `live`, `split`, `preview`: the view Markdown tabs open in (also **Settings > Markdown view**) | `source` |
 | `theme` | `system`, `light`, `dark`, `catppuccin`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha`, `paper-lamp`, `paper`, `lamp` | `system` |
 | `recovery_interval_seconds` | Seconds between recovery snapshots | `30` |
 | `restore_session` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |

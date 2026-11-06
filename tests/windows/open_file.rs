@@ -150,6 +150,8 @@ fn selected_canonical_duplicate_reuses_the_native_document() {
 }
 
 fn select_file(owner: HWND, path: &Path) {
+    // This test deliberately drives the real Open dialog; every other test must queue an answer.
+    let _real_dialogs = window::allow_real_dialogs();
     platform::dialogs::set_next_open_dialog_filename(path.to_path_buf());
     let expected = path.to_string_lossy().into_owned();
     let basename = path.file_name().unwrap().to_string_lossy().into_owned();

@@ -18,12 +18,13 @@ use crate::live::blocks::LiveDocument;
 use crate::live::layout::{LiveFonts, LiveLayout};
 use crate::live::reveal;
 use crate::live::scroll;
-use crate::live::styles::{ImageInfo, Paint, Styled, resolve_image};
+use crate::live::styles::{DiagramInfo, ImageInfo, LinePictures, Paint, Styled, resolve_image};
 use crate::live::text::{EditorText, LiveText};
 use crate::platform::{last_error, wide_null};
 use crate::preview::dwrite::Graphics;
-use crate::preview::images::ImageCache;
+use crate::preview::images::{DiagramState, ImageCache};
 use crate::preview::incremental::{Edit, EditLog, Pending, SourceText};
+use crate::preview::mermaid::{DiagramKey, DiagramStyle};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -76,6 +77,9 @@ pub struct LiveColors {
     pub dim: u32,
     /// Behind the block being edited (the revealed lines): the editor's current-line colour.
     pub active_block: u32,
+    /// The preview's colours for the same theme: what Mermaid diagrams are drawn in, so a
+    /// diagram looks the same in Live as in the preview.
+    pub diagram: crate::preview::colors::PreviewColors,
 }
 
 struct Brushes {
@@ -111,10 +115,12 @@ impl Brushes {
     }
 }
 
-/// The pictures image lines show: decoded on a worker, found relative to the document's folder.
+/// The pictures image lines show: decoded on a worker, found relative to the document's folder;
+/// and Mermaid blocks' diagrams, rendered on the same worker in the view's colors and font.
 struct Pictures {
     cache: ImageCache,
     folder: Option<PathBuf>,
+    diagram_style: DiagramStyle,
 }
 
 impl Pictures {
@@ -126,6 +132,30 @@ impl Pictures {
             |path| self.cache.is_failed(path),
         )
     }
+}
+
+impl LinePictures for Pictures {
+    fn image(&self, dest: &str) -> ImageInfo {
+        self.resolve(dest)
+    }
+
+    fn diagram(&self, source: &str) -> DiagramInfo {
+        let key = DiagramKey::new(source, &self.diagram_style);
+        match self.cache.diagram(&key) {
+            DiagramState::Ready(width, height) => DiagramInfo::Ready {
+                key,
+                size: (width, height),
+            },
+            DiagramState::Failed(error) => DiagramInfo::Failed(error.to_owned()),
+            DiagramState::Pending | DiagramState::Unknown => DiagramInfo::Pending(key),
+        }
+    }
+}
+
+/// How diagrams look in a Live view: the preview's colours for the theme, so a diagram looks the
+/// same in both, with labels in the prose font at Live's size (zoom included).
+fn diagram_style(colors: &LiveColors, fonts: &LiveFonts) -> DiagramStyle {
+    DiagramStyle::new(colors.diagram, &fonts.family, fonts.size)
 }
 
 struct ViewState {
@@ -198,6 +228,8 @@ pub struct PaintedDecorations {
     pub numbers: usize,
     pub checkboxes: usize,
     pub images: usize,
+    pub diagrams: usize,
+    pub labels: usize,
     /// Revealed lines drawn on the edited block's highlight.
     pub active_block: usize,
 }
@@ -219,6 +251,7 @@ impl LiveView {
         line_numbers: bool,
     ) -> Result<Self> {
         let hwnd = create_window(parent)?;
+        let diagram_style = diagram_style(&colors, &fonts);
         let layout = LiveLayout::new(Rc::clone(&graphics), fonts, 1.0);
         let layout = match layout {
             Ok(layout) => layout,
@@ -240,6 +273,7 @@ impl LiveView {
             pictures: Pictures {
                 cache: ImageCache::new(hwnd, crate::window::WM_FASTPAD_LIVE_IMAGE),
                 folder: None,
+                diagram_style,
             },
             colors,
             layout,
@@ -317,6 +351,12 @@ impl LiveView {
                 state.colors = colors;
                 state.brushes = None;
             }
+            let style = diagram_style(&colors, &fonts);
+            if state.pictures.diagram_style != style {
+                // Diagrams are drawn in the colours and font: their lines show the new ones.
+                state.pictures.diagram_style = style;
+                state.layout.drop_image_lines();
+            }
             let anchor = state.layout.anchor(state.scroll_y);
             let ViewState {
                 editor,
@@ -331,7 +371,7 @@ impl LiveView {
                 text: &source,
                 document,
                 revealed: revealed.clone(),
-                images: &|dest: &str| pictures.resolve(dest),
+                images: &*pictures,
             };
             if layout.set_fonts(&text, fonts).is_ok() {
                 state.scroll_y = state.layout.scroll_for_anchor(anchor);
@@ -389,7 +429,7 @@ impl LiveView {
                 text: &source,
                 document,
                 revealed: revealed.clone(),
-                images: &|dest: &str| pictures.resolve(dest),
+                images: &*pictures,
             };
             layout.edit(&text, first_line, lines_added);
             state.scroll_y = state.layout.scroll_for_anchor(anchor);
@@ -486,7 +526,7 @@ impl LiveView {
                 text: &source,
                 document,
                 revealed: revealed.clone(),
-                images: &|dest: &str| pictures.resolve(dest),
+                images: &*pictures,
             };
             let laid = layout.line(&text, line).ok()?;
             Some((
@@ -533,7 +573,7 @@ impl LiveView {
                 text: &source,
                 document,
                 revealed: revealed.clone(),
-                images: &|dest: &str| pictures.resolve(dest),
+                images: &*pictures,
             };
             let rect = layout.caret_rect(&text, position).ok()?;
             Some((
@@ -565,7 +605,7 @@ impl LiveView {
                 text: &source,
                 document,
                 revealed: revealed.clone(),
-                images: &|dest: &str| pictures.resolve(dest),
+                images: &*pictures,
             };
             let rect = layout.caret_rect(&text, position).ok()?;
             Some((
@@ -599,6 +639,12 @@ impl LiveView {
                 })
         })
         .flatten()
+    }
+
+    /// The colours diagrams are drawn in.
+    #[cfg(test)]
+    pub fn diagram_colors(&self) -> Option<crate::preview::colors::PreviewColors> {
+        self.with(|state| state.pictures.diagram_style.colors())
     }
 
     /// What the last frame drew besides text.
@@ -707,7 +753,7 @@ fn scroll_to_caret(state: &mut ViewState) {
         text: &source,
         document,
         revealed: revealed.clone(),
-        images: &|dest: &str| pictures.resolve(dest),
+        images: &*pictures,
     };
     let (_, caret) = text.selection();
     let Ok(rect) = layout.caret_rect(&text, caret) else {
@@ -741,7 +787,7 @@ fn load_document(state: &mut ViewState) {
         text: &source,
         document,
         revealed: revealed.clone(),
-        images: &|dest: &str| pictures.resolve(dest),
+        images: &*pictures,
     };
     layout.set_width(&text, width);
     layout.reset(&text);
@@ -845,7 +891,7 @@ fn flush(state: &mut ViewState) {
         text: &source,
         document,
         revealed: revealed.clone(),
-        images: &|dest: &str| pictures.resolve(dest),
+        images: &*pictures,
     };
     #[cfg(test)]
     record("flush: parse", started);
@@ -924,7 +970,7 @@ fn sync_reveal(state: &mut ViewState) -> bool {
                 text: &source,
                 document,
                 revealed: revealed.clone(),
-                images: &|dest: &str| pictures.resolve(dest),
+                images: &*pictures,
             },
             caret,
         )
@@ -934,7 +980,7 @@ fn sync_reveal(state: &mut ViewState) -> bool {
         text: &source,
         document,
         revealed: new.clone(),
-        images: &|dest: &str| pictures.resolve(dest),
+        images: &*pictures,
     };
     // Lines that changed state between the top of the view and the caret are laid out again
     // now: until then they keep their old heights, and the caret's new top would not show the
@@ -1077,7 +1123,7 @@ fn selection_span(state: &mut ViewState) -> Option<(f32, f32)> {
         text: &source,
         document,
         revealed: revealed.clone(),
-        images: &|dest: &str| pictures.resolve(dest),
+        images: &*pictures,
     };
     let (anchor, caret) = text.selection();
     let first_visible = layout.line_at_y(*scroll_y);

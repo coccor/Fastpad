@@ -7,11 +7,13 @@ use crate::platform::{last_error, wide_null};
 use crate::preview::colors::{ColorRole, PreviewColors};
 use crate::preview::dwrite::Graphics;
 use crate::preview::heights::{HeightIndex, estimate_height, line_for_offset, offset_for_line};
-use crate::preview::images::ImageCache;
+use crate::preview::images::{DiagramState, ImageCache};
 use crate::preview::incremental::{Edit, PreviewDocument, SourceText, Update};
 use crate::preview::layout::{
-    LaidBlock, LayoutContext, PreviewFonts, Target, TargetKind, block_has_target, layout_block,
+    DiagramView, LaidBlock, LayoutContext, PreviewFonts, Target, TargetKind, block_has_target,
+    layout_block,
 };
+use crate::preview::mermaid::{DiagramKey, DiagramStyle};
 use crate::preview::outline::{self, DetailsKey, Outline, details_open_attribute, has_details};
 use crate::preview::render::{Brushes, color_f, create_hwnd_target, draw_ops};
 use crate::window::{
@@ -19,6 +21,7 @@ use crate::window::{
     WM_FASTPAD_PREVIEW_IMAGE, WM_FASTPAD_PREVIEW_LINK, WM_FASTPAD_PREVIEW_REFRESH,
     WM_FASTPAD_PREVIEW_SCROLLED,
 };
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -165,6 +168,10 @@ struct ViewState {
     layout_width: f32,
     scroll_y: f32,
     h_scroll: HashMap<usize, f32>,
+    /// The diagram each Mermaid code block last drew, by block index and its order within the
+    /// block: drawn on while an edited source renders, or when it fails, so the block does not
+    /// collapse to code on every edit.
+    diagrams_shown: HashMap<(usize, u32), DiagramKey>,
     hover: Option<(usize, usize)>,
     pressed: Option<(usize, usize)>,
     focus: Option<(usize, usize)>,
@@ -232,6 +239,7 @@ impl PreviewView {
             layout_width: 0.0,
             scroll_y: 0.0,
             h_scroll: HashMap::new(),
+            diagrams_shown: HashMap::new(),
             hover: None,
             pressed: None,
             focus: None,
@@ -469,6 +477,7 @@ impl PreviewView {
             state.heights = HeightIndex::default();
             state.scroll_y = 0.0;
             state.h_scroll = HashMap::new();
+            state.diagrams_shown = HashMap::new();
             state.hover = None;
             state.pressed = None;
             state.focus = None;
@@ -510,6 +519,27 @@ impl PreviewView {
                     let path = slot.path.clone()?;
                     let ready = state.images.size(&path).is_some();
                     Some((path, ready))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    /// The source of each laid-out diagram, and whether its block shows an error.
+    #[cfg(test)]
+    pub fn diagram_states(&self) -> Vec<(String, bool)> {
+        self.with(|state| {
+            state
+                .layouts
+                .iter()
+                .flatten()
+                .flat_map(|laid| {
+                    let error = laid.ops.iter().any(|op| {
+                        matches!(op, crate::preview::layout::DrawOp::Text { run: None, .. })
+                    });
+                    laid.images.iter().filter_map(move |slot| {
+                        Some((slot.diagram.as_ref()?.source().to_owned(), error))
+                    })
                 })
                 .collect()
         })
@@ -711,6 +741,9 @@ fn accept_update(state: &mut ViewState, update: Update, started: Instant) {
                 .collect();
             reset_layouts(state);
             state.h_scroll.clear();
+            // Kept: a small document reparses in full on every edit, and its diagrams must not
+            // collapse to code while their edited sources render. A stale entry only ever draws
+            // until the block's own diagram is ready.
             true
         }
         Update::Replaced { old, new } => {
@@ -763,6 +796,23 @@ fn accept_update(state: &mut ViewState, update: Update, started: Instant) {
                     }
                 })
                 .collect();
+            // A replaced block keeps the diagrams of the block it replaced at the same position,
+            // which is the block being edited when typing inside a diagram.
+            state.diagrams_shown = std::mem::take(&mut state.diagrams_shown)
+                .into_iter()
+                .filter_map(|((index, order), key)| {
+                    let index = if index < old.start {
+                        index
+                    } else if index >= old.end {
+                        (index as isize + delta) as usize
+                    } else if index - old.start < new.len() {
+                        new.start + (index - old.start)
+                    } else {
+                        return None;
+                    };
+                    Some(((index, order), key))
+                })
+                .collect();
             state.hover = None;
             state.pressed = None;
             state.focus = None;
@@ -801,6 +851,7 @@ fn ensure_layouts(state: &mut ViewState, indices: &[usize]) -> Result<bool> {
         hwnd,
         graphics,
         brushes,
+        colors,
         fonts,
         document,
         document_dir,
@@ -809,15 +860,32 @@ fn ensure_layouts(state: &mut ViewState, indices: &[usize]) -> Result<bool> {
         heights,
         layout_width,
         details_overrides,
+        diagrams_shown,
         ..
     } = state;
     let Some(brushes) = brushes.as_ref() else {
         return Ok(false);
     };
     let mut requests = Vec::new();
+    let diagram_requests = RefCell::new(Vec::new());
     let mut changed = false;
     {
         let sizes = |path: &Path| images.size(path);
+        let style = DiagramStyle::new(*colors, &fonts.body_family, fonts.body_size);
+        // The block being laid out and how many diagrams it has resolved so far.
+        let current = Cell::new((0_usize, 0_u32));
+        let shown = RefCell::new(&mut *diagrams_shown);
+        let resolve = |source: &str| {
+            let (index, order) = current.get();
+            current.set((index, order + 1));
+            resolve_diagram(
+                images,
+                &mut shown.borrow_mut(),
+                (index, order),
+                DiagramKey::new(source, &style),
+                &diagram_requests,
+            )
+        };
         let context = LayoutContext::new(
             graphics,
             brushes,
@@ -826,11 +894,13 @@ fn ensure_layouts(state: &mut ViewState, indices: &[usize]) -> Result<bool> {
             &sizes,
             dark,
             details_overrides,
-        )?;
+        )?
+        .with_diagrams(&resolve);
         for &index in indices {
             if index >= document.blocks.len() || layouts[index].is_some() {
                 continue;
             }
+            current.set((index, 0));
             let block_keys = keys.get(&index).map_or(&[][..], Vec::as_slice);
             let laid = layout_block(
                 &context,
@@ -852,11 +922,59 @@ fn ensure_layouts(state: &mut ViewState, indices: &[usize]) -> Result<bool> {
     }
     // Decode at the content width in device pixels. The cache caps that at the natural width and
     // decodes again only when a wider pane needs more pixels than the last decode has.
-    let pixel_width = (*layout_width * dpi_scale(*hwnd)).ceil().max(1.0) as u32;
+    let scale = dpi_scale(*hwnd);
+    let pixel_width = (*layout_width * scale).ceil().max(1.0) as u32;
     for path in requests {
         images.request(&path, pixel_width);
     }
+    // Diagrams are vector: rendered at the DPI scale, so their text is as sharp as the preview's.
+    for key in diagram_requests.into_inner() {
+        images.request_diagram(&key, pixel_width, scale);
+    }
     Ok(changed)
+}
+
+/// What the `order`th Mermaid block of block `index` draws: its diagram once rendered; until
+/// then, or when the source fails, the diagram the block drew last, if the cache still has it.
+/// Sources not rendered yet go in `requests`.
+fn resolve_diagram(
+    images: &ImageCache,
+    shown: &mut HashMap<(usize, u32), DiagramKey>,
+    slot: (usize, u32),
+    key: DiagramKey,
+    requests: &RefCell<Vec<DiagramKey>>,
+) -> DiagramView {
+    let state = images.diagram(&key);
+    if let DiagramState::Ready(width, height) = state {
+        shown.insert(slot, key.clone());
+        return DiagramView::Ready {
+            key,
+            width: width as f32,
+            height: height as f32,
+            error: None,
+        };
+    }
+    let error = match state {
+        DiagramState::Failed(error) => Some(error.to_owned()),
+        _ => {
+            requests.borrow_mut().push(key);
+            None
+        }
+    };
+    if let Some(last) = shown.get(&slot)
+        && let DiagramState::Ready(width, height) = images.diagram(last)
+    {
+        return DiagramView::Ready {
+            key: last.clone(),
+            width: width as f32,
+            height: height as f32,
+            error,
+        };
+    }
+    match error {
+        Some(error) => DiagramView::Failed(error),
+        None => DiagramView::Pending,
+    }
 }
 
 fn visible_indices(state: &mut ViewState, view_height: f32) -> Vec<usize> {

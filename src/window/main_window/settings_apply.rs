@@ -44,6 +44,22 @@ pub(super) fn set_file_icons(hwnd: HWND, set: crate::config::FileIconSet) {
     }
 }
 
+/// Sets the view Markdown tabs open in (view modes spec §2). The tabs already open keep the mode
+/// they show, so the change is seen on the next Markdown tab opened.
+pub(super) fn set_markdown_view(hwnd: HWND, mode: crate::preview::ViewMode) {
+    let Some(previous) = (unsafe { app_ptr(hwnd) })
+        .map(|app| unsafe { app.as_ref() }.settings.markdown_view)
+        .filter(|&previous| previous != mode)
+    else {
+        return;
+    };
+    crate::window::preview_host::keep_open_markdown_modes(hwnd, previous);
+    change_setting(hwnd, |settings| {
+        settings.markdown_view = mode;
+        Some(("markdown_view", mode.token().to_owned()))
+    });
+}
+
 /// Makes one Settings dialog change through the same code the palette commands use, so it
 /// applies at once and saves its one `fastpad.ini` line (settings dialog spec §4.2).
 pub(crate) fn apply_settings_action(
@@ -54,6 +70,7 @@ pub(crate) fn apply_settings_action(
     match action {
         SettingsAction::SetTheme(theme) => set_theme(hwnd, theme),
         SettingsAction::SetFileIcons(set) => set_file_icons(hwnd, set),
+        SettingsAction::SetMarkdownView(mode) => set_markdown_view(hwnd, mode),
         SettingsAction::SetFontFace(face) => change_setting(hwnd, |settings| {
             (settings.font_face != face).then(|| {
                 settings.font_face.clone_from(&face);
@@ -219,10 +236,12 @@ pub(crate) fn change_setting(
         .is_some_and(|app| unsafe { app.as_ref() }.settings.theme != previous_theme);
     // The sidebar's view, width and icon set change only the sidebar, which their callers redo,
     // the Settings dialog's size only that dialog, and the window's placement only the next
-    // start; the editor and the Markdown preview are not restyled for them.
+    // start, and the Markdown view only the tabs opened next; the editor and the Markdown
+    // preview are not restyled for them.
     let sidebar_only = matches!(
         key,
-        "sidebar_view"
+        "markdown_view"
+            | "sidebar_view"
             | "sidebar_width"
             | "file_icons"
             | "open_editors_expanded"

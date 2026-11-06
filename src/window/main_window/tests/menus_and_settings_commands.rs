@@ -414,6 +414,7 @@ fn settings_actions_apply_and_save_only_their_own_lines() {
     for action in [
         SettingsAction::SetTheme(ThemePreference::CatppuccinMocha),
         SettingsAction::SetFileIcons(FileIconSet::Solid),
+        SettingsAction::SetMarkdownView(crate::preview::ViewMode::Split),
         SettingsAction::SetFontFace("Cascadia Mono".to_owned()),
         SettingsAction::SetFontSize(14),
         SettingsAction::SetTabWidth(2),
@@ -421,6 +422,7 @@ fn settings_actions_apply_and_save_only_their_own_lines() {
         // Picking what is already set writes nothing.
         SettingsAction::SetFontSize(14),
         SettingsAction::SetFontFace("Cascadia Mono".to_owned()),
+        SettingsAction::SetMarkdownView(crate::preview::ViewMode::Split),
     ] {
         super::super::apply_settings_action(window.hwnd, action);
     }
@@ -428,6 +430,7 @@ fn settings_actions_apply_and_save_only_their_own_lines() {
     let settings = app_mut(window.hwnd).settings.clone();
     assert_eq!(settings.theme, ThemePreference::CatppuccinMocha);
     assert_eq!(settings.file_icons, FileIconSet::Solid);
+    assert_eq!(settings.markdown_view, crate::preview::ViewMode::Split);
     assert_eq!(settings.font_face, "Cascadia Mono");
     assert_eq!(settings.font_size, 14);
     assert_eq!(settings.tab_width, 2);
@@ -439,8 +442,8 @@ fn settings_actions_apply_and_save_only_their_own_lines() {
 
     assert_eq!(
         std::fs::read_to_string(&ini).unwrap(),
-        "# kept\r\ntheme=catppuccin-mocha\r\nfile_icons=solid\r\nfont_face=Cascadia Mono\r\n\
-         font_size=14\r\ntab_width=2\r\nword_wrap=true\r\n"
+        "# kept\r\ntheme=catppuccin-mocha\r\nfile_icons=solid\r\nmarkdown_view=split\r\n\
+         font_face=Cascadia Mono\r\nfont_size=14\r\ntab_width=2\r\nword_wrap=true\r\n"
     );
 }
 
