@@ -10,6 +10,8 @@ use windows_sys::Win32::Foundation::RECT;
 /// Open Editors rows visible before the section scrolls on its own (spec §3.1).
 pub(crate) const MAX_EDITOR_ROWS: usize = 9;
 const ROOT_BUTTON: i32 = 22;
+/// The title band's button, at 96 DPI: the Favorites view's header button's size.
+const TITLE_BUTTON: i32 = 28;
 const CHEVRON_LEFT: i32 = 4;
 const CHEVRON: i32 = 16;
 const RIGHT_PAD: i32 = 6;
@@ -105,6 +107,21 @@ impl RootParts {
     /// The "…" button, always shown.
     pub(crate) fn more(&self) -> RECT {
         self.buttons[BUTTONS - 1].1
+    }
+}
+
+/// The title band's "+" (open or create a notebook), at its right end and centred in it, the
+/// size of the Favorites view's header button, so the two views' title bands match.
+pub(crate) fn add_notebook_button(client: RECT, dpi: u32) -> RECT {
+    let size = scale(TITLE_BUTTON, dpi);
+    let header = panel_header(dpi);
+    let right = client.right - scale(RIGHT_PAD, dpi);
+    let top = client.top + (header - size) / 2;
+    RECT {
+        left: (right - size).max(client.left),
+        top,
+        right,
+        bottom: top + size,
     }
 }
 

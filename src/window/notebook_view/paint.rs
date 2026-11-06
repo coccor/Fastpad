@@ -739,6 +739,11 @@ impl NotebookView {
             tools.push((id, rect, text.to_owned()));
         }
         tools.push((TOOL_ROW, row_rect, row_text));
+        tools.push((
+            TOOL_ADD_NOTEBOOK,
+            self.add_button(),
+            crate::window::notebook_view::ADD_NOTEBOOK_TIP.to_owned(),
+        ));
         tools
     }
 
@@ -941,6 +946,21 @@ impl NotebookView {
             ..layout.title
         };
         bold("Notebook", title, palette.muted_foreground);
+        // The "+" that opens or creates a notebook, always there, so it can be found.
+        let add = self.add_button();
+        unsafe {
+            if self.hover == Some(Hit::AddNotebook) {
+                fill(dc, add, palette.hover_background);
+            }
+            draw_text(
+                dc,
+                GLYPH_ADD,
+                add,
+                fonts.glyph,
+                palette.editor_foreground,
+                CENTERED,
+            );
+        }
         // Open Editors header: chevron, label and count.
         let chevron = notebook_layout::section_chevron(layout.editors_header, dpi);
         let glyph = if self.editors_expanded {

@@ -414,6 +414,18 @@ pub(crate) fn recent_notebooks(hwnd: HWND) -> Vec<PathBuf> {
     known_folders(hwnd, false).folders
 }
 
+/// `recent_notebooks` for a menu the user just opened: `folders.ini` is read if nothing is
+/// cached yet.
+pub(crate) fn recent_notebooks_now(hwnd: HWND) -> Vec<PathBuf> {
+    known_folders(hwnd, true).folders
+}
+
+/// Forgets the cached `folders.ini`, so the next read sees a file a test wrote.
+#[cfg(test)]
+pub(crate) fn forget_folders_cache(hwnd: HWND) {
+    host(hwnd, |host| host.folders = None);
+}
+
 /// Whether the open notebook is a favorite.
 #[cfg(test)]
 pub(crate) fn is_favorite(hwnd: HWND) -> bool {

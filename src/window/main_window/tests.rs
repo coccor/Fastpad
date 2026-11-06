@@ -38,6 +38,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 mod about_and_settings_dialog;
+mod add_notebook_button;
 mod command_palette;
 mod copy_host_and_panel_drop;
 mod cross_move;

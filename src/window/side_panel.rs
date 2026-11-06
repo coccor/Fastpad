@@ -1241,7 +1241,8 @@ fn view_key(
 /// and the padding painted around it), nor the Favorites header's Open notebook… button.
 fn header_is_caption(main: HWND, view: PanelView, panel: HWND, x: i32, y: i32) -> bool {
     match view {
-        PanelView::Notebook | PanelView::Tags | PanelView::Links => true,
+        PanelView::Notebook => !crate::window::notebook_view::header_hit(main, x, y),
+        PanelView::Tags | PanelView::Links => true,
         PanelView::Search => !crate::window::search_view::header_hit(main, panel, x, y),
         PanelView::Favorites => {
             let mut client = RECT::default();
