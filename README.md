@@ -24,7 +24,7 @@ A native Windows editor and notebook, written in Rust on Win32 and built on Scin
 | | |
 |---|---|
 | ⚡ **~60 ms to typing** | The window takes your keystrokes first; everything else loads behind you. ([How we measure](benchmarks/README.md)) |
-| 🪶 **~2 MB idle, 1.7 MB download** | One executable and two DLLs. No runtime, no framework, no Electron. |
+| 🪶 **Under 3 MB idle, 5 MB download** | One executable and two DLLs. No runtime, no framework, no Electron. |
 | 🔒 **Offline by design** | No network access, no telemetry, no account. |
 | 💾 **Never lose a word** | Unsaved work is snapshotted as you type and survives crashes and power cuts. |
 
