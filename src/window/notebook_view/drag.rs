@@ -139,9 +139,22 @@ pub(super) fn arm_drag(
         return;
     }
     let default = crate::window::library_host::default_notebook(hwnd);
+    let from = notebook.or(default);
+    // A row's file or folder on disk, for a Ctrl copy's checks.
+    let row_path = match &source {
+        DragSource::Row(kind) => from
+            .and_then(|id| crate::window::library_host::notebook_folder(hwnd, id))
+            .zip(tree_drag::source_path(kind))
+            .map(|(root, path)| root.join(path)),
+        _ => None,
+    };
     with_view(hwnd, |view| {
-        view.drag = Drag::armed(source, x, y);
-        view.drag_notebook = notebook.or(default);
+        view.drag = Drag::armed(source, x, y).map(|mut drag| {
+            drag.row_path = row_path;
+            drag
+        });
+        view.drag_notebook = from;
+        view.drop_notebook = from;
     });
 }
 
@@ -187,7 +200,13 @@ pub(super) fn drag_move(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) -> bool {
     } else {
         move_drag_label(hwnd, panel, x, y);
     }
-    let accepted = with_view(hwnd, |view| view.drag_to(x, y, Instant::now())).unwrap_or(false);
+    let accepted = with_view(hwnd, |view| {
+        if let Some(drag) = view.drag.as_mut() {
+            drag.copy = buttons & MK_CONTROL != 0;
+        }
+        view.drag_to(x, y, Instant::now())
+    })
+    .unwrap_or(false);
     let source = with_view(hwnd, |view| {
         view.drag.as_ref().map(|drag| drag.source.clone())
     })
@@ -310,12 +329,19 @@ fn open_note_in_group(
 }
 
 pub(super) fn drag_release(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) -> bool {
-    let Some((drag, panel, notebook)) = with_view(hwnd, |view| {
-        if view.drag.as_ref().is_some_and(|drag| drag.started) {
+    let Some((drag, panel, notebook, dest)) = with_view(hwnd, |view| {
+        if let Some(drag) = view.drag.as_mut().filter(|drag| drag.started) {
+            // Ctrl as it is at the release decides (Review Focus 5).
+            drag.copy = buttons & MK_CONTROL != 0;
             view.drag_to(x, y, Instant::now());
             view.invalidate();
         }
-        (view.drag.take(), view.panel, view.drag_notebook)
+        (
+            view.drag.take(),
+            view.panel,
+            view.drag_notebook,
+            view.drop_notebook,
+        )
     }) else {
         return false;
     };
@@ -344,8 +370,8 @@ pub(super) fn drag_release(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) -> bool 
     if let Some(folder) = drag.target {
         match &drag.source {
             DragSource::Row(kind) => {
-                if let Some(id) = notebook {
-                    crate::window::tree_move::drop_into_of(hwnd, id, kind, &folder);
+                if let (Some(from), Some(dest)) = (notebook, dest) {
+                    drop_row(hwnd, from, dest, kind, folder, drag.copy, drag.row_path);
                 }
             }
             DragSource::Tab {
@@ -363,6 +389,57 @@ pub(super) fn drag_release(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) -> bool 
         }
     }
     true
+}
+
+/// A row of the notebook `from` dropped into `folder` of the notebook `dest` (multi-root move
+/// spec §3.1): moved inside its notebook, moved across, or with Ctrl copied.
+fn drop_row(
+    hwnd: HWND,
+    from: NotebookId,
+    dest: NotebookId,
+    kind: &RowKind,
+    folder: PathBuf,
+    copy: bool,
+    row_path: Option<PathBuf>,
+) {
+    match tree_drag::drop_action(from, dest, copy) {
+        tree_drag::DropAction::MoveHere => {
+            crate::window::tree_move::drop_into_of(hwnd, from, kind, &folder);
+        }
+        tree_drag::DropAction::MoveAcross => crate::window::cross_move_host::move_items(
+            hwnd,
+            from,
+            vec![kind.clone()],
+            crate::window::cross_move_host::Destination::Open { id: dest, folder },
+        ),
+        tree_drag::DropAction::Copy => {
+            if let Some(path) = row_path {
+                crate::window::copy_host::copy_into_of(hwnd, dest, vec![path], &folder, None);
+            }
+        }
+    }
+}
+
+/// Ctrl went down or up during a started row drag (`down`): the drop's action, its hint and
+/// the cursor follow at once, without a mouse move (multi-root move spec §3.1).
+pub(super) fn drag_ctrl(hwnd: HWND, down: bool) {
+    let Some(pointer) = with_view(hwnd, |view| {
+        let drag = view
+            .drag
+            .as_mut()
+            .filter(|drag| drag.started && matches!(drag.source, DragSource::Row(_)))?;
+        drag.copy = down;
+        Some(drag.pointer)
+    })
+    .flatten() else {
+        return;
+    };
+    let accepted = with_view(hwnd, |view| {
+        view.drag_to(pointer.0, pointer.1, Instant::now())
+    })
+    .unwrap_or(false);
+    // Windows has no stock copy cursor: the hint says Copy (multi-root move spec §3.1).
+    set_drag_cursor(accepted);
 }
 
 /// Takes a started drag, invalidating the row it painted over. `None` when there was no drag, or
@@ -436,7 +513,7 @@ pub(crate) fn drag_tick(hwnd: HWND, now: Instant) {
         let external = is_external(&drag.source);
         // The resting folder is the drag's own notebook's.
         let expand = tree_drag::expand_due(drag.resting.as_ref(), now)
-            .zip(view.drag_notebook)
+            .zip(view.drop_notebook)
             .map(|(folder, id)| (id, folder));
         let list = view.list_rect(view.client());
         let lines = tree_drag::scroll_step(pointer.1, list.top, list.bottom, view.list.row_height);
@@ -490,6 +567,7 @@ pub(crate) fn external_over(hwnd: HWND, x: i32, y: i32, paths: &[PathBuf]) -> bo
             .is_some_and(|drag| is_external(&drag.source))
         {
             view.drag_notebook = default;
+            view.drop_notebook = default;
             view.drag = Drag::armed(DragSource::Files(paths.to_vec()), x, y).map(|mut drag| {
                 drag.started = true;
                 drag
@@ -599,6 +677,7 @@ pub(crate) fn strip_tab_over(hwnd: HWND, point: POINT, id: DocumentId, path: &Pa
                 path: path.to_path_buf(),
             };
             view.drag_notebook = default;
+            view.drop_notebook = default;
             view.drag = Drag::armed(source, x, y).map(|mut drag| {
                 drag.started = true;
                 drag

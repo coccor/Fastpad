@@ -17,12 +17,13 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM}
 use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, ReleaseCapture, SetCapture, SetFocus, VK_DELETE, VK_F2, VK_LEFT, VK_RETURN, VK_RIGHT,
+    GetFocus, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_DELETE, VK_F2, VK_LEFT,
+    VK_RETURN, VK_RIGHT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, WM_CAPTURECHANGED, WM_CHAR, WM_CONTEXTMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER,
+    GetCursorPos, WM_CAPTURECHANGED, WM_CHAR, WM_CONTEXTMENU, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER,
 };
 
 /// The panel's input while the Notebook view is shown (`side_panel::view_mouse` and `view_key`).
@@ -145,7 +146,12 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
         // A started drag owns the keyboard until it ends: Esc already cancels it, before this
         // (side_panel routes it to cancel_drag first), so nothing here needs to (tree drag spec
         // §3.3).
-        WM_KEYDOWN if drag_started(hwnd) => Some(0),
+        WM_KEYDOWN | WM_KEYUP if drag_started(hwnd) => {
+            if wparam as u16 == VK_CONTROL {
+                drag_ctrl(hwnd, message == WM_KEYDOWN);
+            }
+            Some(0)
+        }
         WM_CHAR if drag_started(hwnd) => Some(0),
         WM_KEYDOWN => key_down(hwnd, wparam as u16).then_some(0),
         WM_CHAR => {

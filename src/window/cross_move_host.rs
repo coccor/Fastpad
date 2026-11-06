@@ -2,10 +2,6 @@
 //! dirty tabs saved first, the plan and its question, then the move itself (one rename on one
 //! drive, `move_file` for a note going to another drive) and the hand-off that updates both
 //! notebooks, the tabs, the pins, the expanded folders and the tree.
-#![allow(
-    dead_code,
-    reason = "the tree drop and Move to notebook call it from the next commits"
-)]
 
 use super::library_host::{self, NotebookId};
 use super::main_window::push_notice;
@@ -24,6 +20,7 @@ pub(crate) enum Destination {
     /// A folder (relative; empty is the root) of an open notebook.
     Open { id: NotebookId, folder: PathBuf },
     /// The root of a notebook that isn't open.
+    #[allow(dead_code, reason = "Move to notebook… sends it from a later commit")]
     Closed { root: PathBuf },
 }
 

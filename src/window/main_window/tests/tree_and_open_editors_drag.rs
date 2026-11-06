@@ -1098,16 +1098,15 @@ fn b_with_sub(ab: &NotebooksAB) {
 }
 
 #[test]
-fn dragging_a_note_onto_another_root_is_refused_with_a_hint() {
-    // Break caught: a drop onto another notebook moving the file (or showing the arrow), and a
-    // refusal with no word on why (multi-root notebooks spec §4.5).
-    use windows_sys::Win32::UI::WindowsAndMessaging::IDC_NO;
+fn dragging_a_note_onto_another_notebooks_folder_moves_it() {
+    // Break caught: a drop onto another notebook still refused, or moving the file without a
+    // word on what the drop will do (multi-root move spec §3.1).
+    use windows_sys::Win32::UI::WindowsAndMessaging::IDC_ARROW;
     let _scintilla = load_native_scintilla();
     let ab = drag_ab("drag-cross-root");
     let hwnd = ab.window.hwnd;
     b_with_sub(&ab);
     let panel = sidebar_windows(hwnd).1;
-    let hint = "Moving between notebooks isn't supported yet";
 
     start_drag(hwnd, panel, &RowKind::Note("a.md".into()));
     assert_eq!(
@@ -1116,20 +1115,131 @@ fn dragging_a_note_onto_another_root_is_refused_with_a_hint() {
         "no hint at the start"
     );
     let sub = row_lparam_in(hwnd, ab.b_id, &RowKind::Folder("sub".into()));
-    for over in [row_lparam_in(hwnd, ab.b_id, &RowKind::Root), sub] {
-        drag_over(panel, over);
-        assert_eq!(notebook_view(hwnd).drag.as_ref().unwrap().target, None);
-        assert!(drag_cursor_is(IDC_NO));
-        assert_eq!(notebook_view(hwnd).drag_hint(), Some(hint));
-    }
-    // Over its own root the hint goes with the refusal.
+    drag_over(panel, row_lparam_in(hwnd, ab.b_id, &RowKind::Root));
+    assert_eq!(
+        notebook_view(hwnd).drag.as_ref().unwrap().target,
+        Some(std::path::PathBuf::new())
+    );
+    assert_eq!(
+        notebook_view(hwnd).drag_hint().as_deref(),
+        Some("Move to B")
+    );
+    drag_over(panel, sub);
+    assert_eq!(
+        notebook_view(hwnd).drag.as_ref().unwrap().target,
+        Some(std::path::PathBuf::from("sub"))
+    );
+    assert!(drag_cursor_is(IDC_ARROW));
+    assert_eq!(
+        notebook_view(hwnd).drag_hint().as_deref(),
+        Some("Move to B › sub")
+    );
+    // Over its own root, where it already is, nothing is said.
     drag_over(panel, row_lparam_in(hwnd, ab.a_id, &RowKind::Root));
     assert_eq!(notebook_view(hwnd).drag_hint(), None);
     drag_over(panel, sub);
     drop_at(panel, sub);
-    assert!(ab.a.join("a.md").exists(), "the note stayed in A");
-    assert!(!ab.b.join("sub").join("a.md").exists());
-    assert!(!ab.b.join("a.md").exists());
+    assert!(!ab.a.join("a.md").exists(), "the note left A");
+    assert!(ab.b.join("sub").join("a.md").exists());
+}
+
+#[test]
+fn ctrl_drop_across_notebooks_copies() {
+    // Break caught: Ctrl ignored, so a copy request moves the user's only copy away.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONUP, WM_MOUSEMOVE};
+    let _scintilla = load_native_scintilla();
+    let ab = drag_ab("drag-cross-copy");
+    let hwnd = ab.window.hwnd;
+    b_with_sub(&ab);
+    let panel = sidebar_windows(hwnd).1;
+    start_drag(hwnd, panel, &RowKind::Note("a.md".into()));
+    let sub = row_lparam_in(hwnd, ab.b_id, &RowKind::Folder("sub".into()));
+    mouse(panel, WM_MOUSEMOVE, 1 | 8, sub);
+    assert_eq!(
+        notebook_view(hwnd).drag_hint().as_deref(),
+        Some("Copy to B › sub")
+    );
+    mouse(panel, WM_LBUTTONUP, 8, sub);
+    crate::window::copy_host::wait_for_copies(hwnd);
+    assert!(ab.a.join("a.md").exists(), "the original stays");
+    assert!(ab.b.join("sub").join("a.md").exists());
+}
+
+#[test]
+fn ctrl_drop_inside_one_notebook_copies() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONUP, WM_MOUSEMOVE};
+    let _scintilla = load_native_scintilla();
+    let ab = drag_ab("drag-same-copy");
+    let hwnd = ab.window.hwnd;
+    std::fs::create_dir_all(ab.a.join("sub")).unwrap();
+    crate::window::library_host::request_rescan_of(hwnd, ab.a_id);
+    pump_until(hwnd, || {
+        crate::window::notebook_view::view_row_index(
+            &notebook_view(hwnd).rows,
+            ab.a_id,
+            &RowKind::Folder("sub".into()),
+        )
+        .is_some()
+    });
+    let panel = sidebar_windows(hwnd).1;
+    start_drag(hwnd, panel, &RowKind::Note("a.md".into()));
+    let sub = row_lparam_in(hwnd, ab.a_id, &RowKind::Folder("sub".into()));
+    mouse(panel, WM_MOUSEMOVE, 1 | 8, sub);
+    assert_eq!(
+        notebook_view(hwnd).drag_hint().as_deref(),
+        Some("Copy to A › sub")
+    );
+    mouse(panel, WM_LBUTTONUP, 8, sub);
+    crate::window::copy_host::wait_for_copies(hwnd);
+    assert!(ab.a.join("a.md").exists());
+    assert!(ab.a.join("sub").join("a.md").exists());
+}
+
+#[test]
+fn the_hint_reads_copy_when_ctrl_goes_down_without_a_mouse_move_and_a_release_without_it_moves() {
+    // Break caught (Review Focus 5): a hint that only updates on the next mouse move, or a drop
+    // that copies because Ctrl was down a moment before the release.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_KEYDOWN, WM_KEYUP};
+    let _scintilla = load_native_scintilla();
+    let ab = drag_ab("drag-ctrl-key");
+    let hwnd = ab.window.hwnd;
+    b_with_sub(&ab);
+    let panel = sidebar_windows(hwnd).1;
+    start_drag(hwnd, panel, &RowKind::Note("a.md".into()));
+    let sub = row_lparam_in(hwnd, ab.b_id, &RowKind::Folder("sub".into()));
+    drag_over(panel, sub);
+    unsafe { SendMessageW(panel, WM_KEYDOWN, VK_CONTROL as usize, 0) };
+    assert_eq!(
+        notebook_view(hwnd).drag_hint().as_deref(),
+        Some("Copy to B › sub")
+    );
+    unsafe { SendMessageW(panel, WM_KEYUP, VK_CONTROL as usize, 0) };
+    assert_eq!(
+        notebook_view(hwnd).drag_hint().as_deref(),
+        Some("Move to B › sub")
+    );
+    drop_at(panel, sub);
+    assert!(!ab.a.join("a.md").exists(), "moved, not copied");
+    assert!(ab.b.join("sub").join("a.md").exists());
+}
+
+#[test]
+fn a_cross_notebook_drop_onto_the_same_relative_folder_is_offered() {
+    // Break caught: the own-folder refusal of one notebook applied across two, so a note at A's
+    // root could never be dropped on B's root.
+    let _scintilla = load_native_scintilla();
+    let ab = drag_ab("drag-cross-same-place");
+    let hwnd = ab.window.hwnd;
+    let panel = sidebar_windows(hwnd).1;
+    start_drag(hwnd, panel, &RowKind::Note("a.md".into()));
+    drag_over(panel, row_lparam_in(hwnd, ab.b_id, &RowKind::Root));
+    assert_eq!(
+        notebook_view(hwnd).drag.as_ref().unwrap().target,
+        Some(std::path::PathBuf::new())
+    );
+    drop_at(panel, row_lparam_in(hwnd, ab.b_id, &RowKind::Root));
+    assert!(ab.b.join("a.md").exists());
 }
 
 #[test]

@@ -906,7 +906,7 @@ impl NotebookView {
                 if let Some(layout) = self.inline_layout_in(area, dpi) {
                     self.paint_inline(dc, layout, list, palette, fonts, dpi);
                 }
-                // Why the pointer's place refuses the dragged row: a strip along the list's
+                // What a drop there does (Move to / Copy to …): a strip along the list's
                 // bottom edge, clear of the pointer's label.
                 if let Some(hint) = self.drag_hint() {
                     let height = self.list.row_height.min(height(list));
@@ -920,7 +920,7 @@ impl NotebookView {
                     };
                     unsafe {
                         fill(dc, strip, palette.hover_background);
-                        draw_text(dc, hint, text, fonts.text, palette.muted_foreground, LINE);
+                        draw_text(dc, &hint, text, fonts.text, palette.muted_foreground, LINE);
                     }
                 }
             }

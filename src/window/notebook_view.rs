@@ -551,8 +551,12 @@ pub(crate) struct NotebookView {
     /// distance, which moves or copies (tree drag spec §3, open editors spec §4.3); or an
     /// Explorer drag over the panel.
     pub(crate) drag: Option<Drag>,
-    /// The notebook `drag` moves or copies within (multi-root notebooks spec §4.5).
+    /// The notebook `drag` comes from: a dragged row's own; for a tab or files, the one under
+    /// the pointer.
     pub(crate) drag_notebook: Option<NotebookId>,
+    /// The notebook under the pointer, whose folders the drag targets (multi-root move spec
+    /// §3.1).
+    pub(crate) drop_notebook: Option<NotebookId>,
     /// The right press that cancelled a drag: its release opens no menu.
     pub(crate) eat_right_up: bool,
     /// The label following the pointer while a drag is under way (tree drag spec §3.2).
@@ -648,6 +652,7 @@ impl NotebookView {
             thumb_grab: None,
             drag: None,
             drag_notebook: None,
+            drop_notebook: None,
             eat_right_up: false,
             drag_label: None,
             tracking_leave: false,
