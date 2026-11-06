@@ -185,6 +185,7 @@ pub(crate) fn set_scope(hwnd: HWND, scope: Option<library_host::NotebookId>) {
 }
 
 /// The notebook the search is limited to, `None` for all.
+#[cfg(test)]
 pub(crate) fn scope(hwnd: HWND) -> Option<library_host::NotebookId> {
     with_view(hwnd, |view| view.scope).flatten()
 }

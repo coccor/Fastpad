@@ -168,9 +168,128 @@ pub(super) fn row_replace_requested(hwnd: HWND, index: usize) {
 pub(crate) fn header_hit(hwnd: HWND, panel: HWND, x: i32, y: i32) -> bool {
     let (client, dpi) = geometry(panel);
     let point = POINT { x, y };
-    with_view(hwnd, |view| view.edit.is_some()).unwrap_or(false)
-        && (inside(SearchView::field_rect(client, dpi), point)
-            || inside(SearchView::chevron_rect(client, dpi), point))
+    let (edit, scope) =
+        with_view(hwnd, |view| (view.edit.is_some(), view.scope_shown())).unwrap_or_default();
+    (scope && inside(SearchView::scope_rect(client, dpi), point))
+        || (edit
+            && (inside(SearchView::field_rect(client, dpi), point)
+                || inside(SearchView::chevron_rect(client, dpi), point)))
+}
+
+/// The scope button (multi-root search spec §4.1): a menu of "All notebooks", a separator, then
+/// each open notebook by label, the current choice checked, under the button. Picking one sets
+/// the scope and runs the query again. Shown with nothing of the App borrowed: the menu runs a
+/// modal loop.
+pub(super) fn scope_menu(hwnd: HWND, panel: HWND) {
+    let Some((scope, notebooks)) = with_view(hwnd, |view| (view.scope, view.notebooks.clone()))
+    else {
+        return;
+    };
+    let mut items = vec![("All notebooks".to_owned(), scope.is_none())];
+    items.extend(
+        notebooks
+            .iter()
+            .map(|s| (s.label.clone(), scope == Some(s.id))),
+    );
+    let Some(picked) = choose_scope(hwnd, panel, &items) else {
+        return;
+    };
+    let scope = picked
+        .checked_sub(1)
+        .and_then(|index| notebooks.get(index))
+        .map(|s| s.id);
+    set_scope(hwnd, scope);
+}
+
+/// Shows the scope menu and returns the index of the item picked (0 for all notebooks), or
+/// `None` when it was dismissed. Tests answer it with `answer_next_scope_menu`.
+fn choose_scope(hwnd: HWND, panel: HWND, items: &[(String, bool)]) -> Option<usize> {
+    #[cfg(test)]
+    {
+        let _ = (hwnd, panel);
+        let answer = SCOPE_ANSWERS
+            .with(|answers| answers.borrow_mut().pop_front())
+            .expect("a test opened the scope menu without queuing an answer");
+        return answer(items);
+    }
+    #[cfg(not(test))]
+    {
+        use crate::platform::wide_null;
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            AppendMenuW, CreatePopupMenu, DestroyMenu, MF_CHECKED, MF_SEPARATOR, MF_STRING,
+            TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, TrackPopupMenu,
+        };
+        let (client, dpi) = geometry(panel);
+        let button = SearchView::scope_rect(client, dpi);
+        let mut at = POINT {
+            x: button.left,
+            y: button.bottom,
+        };
+        unsafe {
+            ClientToScreen(panel, &mut at);
+            let menu = CreatePopupMenu();
+            if menu.is_null() {
+                return None;
+            }
+            for (index, (label, checked)) in items.iter().enumerate() {
+                let flags = MF_STRING | if *checked { MF_CHECKED } else { 0 };
+                let text = wide_null(label);
+                AppendMenuW(menu, flags, index + 1, text.as_ptr());
+                if index == 0 {
+                    AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+                }
+            }
+            let picked = TrackPopupMenu(
+                menu,
+                TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RETURNCMD,
+                at.x,
+                at.y,
+                0,
+                hwnd,
+                std::ptr::null(),
+            );
+            DestroyMenu(menu);
+            usize::try_from(picked).ok()?.checked_sub(1)
+        }
+    }
+}
+
+#[cfg(test)]
+type ScopeAnswer = Box<dyn FnOnce(&[(String, bool)]) -> Option<usize>>;
+
+#[cfg(test)]
+thread_local! {
+    static SCOPE_ANSWERS: std::cell::RefCell<std::collections::VecDeque<ScopeAnswer>> =
+        std::cell::RefCell::new(std::collections::VecDeque::new());
+}
+
+/// Queues the answer to the next scope menu: given its items as (label, checked), the index
+/// picked or `None` for a dismissed menu.
+#[cfg(test)]
+pub(crate) fn answer_next_scope_menu(
+    answer: impl FnOnce(&[(String, bool)]) -> Option<usize> + 'static,
+) {
+    SCOPE_ANSWERS.with(|answers| answers.borrow_mut().push_back(Box::new(answer)));
+}
+
+/// Clicks the scope button, for in-process tests.
+#[cfg(test)]
+pub(crate) fn click_scope(hwnd: HWND) {
+    if let Some((_, panel)) = crate::window::side_panel::windows(hwnd) {
+        let (client, dpi) = geometry(panel);
+        let button = SearchView::scope_rect(client, dpi);
+        let x = (button.left + button.right) / 2;
+        let y = (button.top + button.bottom) / 2;
+        handle(
+            hwnd,
+            panel,
+            WM_LBUTTONDOWN,
+            0,
+            ((y as isize) << 16) | (x as isize & 0xFFFF),
+        );
+    }
 }
 
 /// A press on the field's padding, outside the box itself, puts the caret in the box. Reports
@@ -351,6 +470,12 @@ pub(crate) fn handle(
                 Some(HeaderButton::ReplaceAll) => {
                     if pressed {
                         replace_all_requested(hwnd);
+                    }
+                    return Some(0);
+                }
+                Some(HeaderButton::Scope) => {
+                    if pressed {
+                        scope_menu(hwnd, panel);
                     }
                     return Some(0);
                 }

@@ -1119,3 +1119,78 @@ fn opening_a_notebook_reruns_the_query() {
     open_and_load_folder(&ab.window, &ab.b);
     pump_until(hwnd, || search_rows(hwnd).len() == 2);
 }
+
+/// The Search view's accessible children's names.
+fn search_children(hwnd: HWND) -> Vec<String> {
+    let panel = sidebar_panel(hwnd);
+    (0..crate::window::side_panel::accessible_item_count(panel))
+        .filter_map(|index| crate::window::side_panel::accessible_item(panel, index))
+        .map(|item| item.name)
+        .collect()
+}
+
+#[test]
+fn the_scope_button_lists_the_notebooks_and_sets_the_scope() {
+    // Break caught: a scope menu missing a notebook or the current choice's check, a pick that
+    // doesn't narrow the search, or a button screen readers can't name (spec §4.1).
+    let _scintilla = load_native_scintilla();
+    let ab = searched_ab("search-scope-menu");
+    let hwnd = ab.window.hwnd;
+    assert!(
+        search_children(hwnd).contains(&"Search scope: All notebooks".to_owned()),
+        "{:?}",
+        search_children(hwnd)
+    );
+    let offered = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let seen = std::rc::Rc::clone(&offered);
+    crate::window::search_view::answer_next_scope_menu(move |items| {
+        *seen.borrow_mut() = items.to_vec();
+        Some(2)
+    });
+    let before = search_generation(hwnd);
+    crate::window::search_view::click_scope(hwnd);
+    assert_eq!(
+        *offered.borrow(),
+        [
+            ("All notebooks".to_owned(), true),
+            ("A".to_owned(), false),
+            ("B".to_owned(), false)
+        ]
+    );
+    wait_for_search(hwnd, before);
+    assert_eq!(crate::window::search_view::scope(hwnd), Some(ab.b_id));
+    assert_eq!(labelled_rows(hwnd), [("b".to_owned(), "B".to_owned())]);
+    assert!(search_children(hwnd).contains(&"Search scope: B".to_owned()));
+
+    // Dismissed: nothing changes.
+    crate::window::search_view::answer_next_scope_menu(|_| None);
+    crate::window::search_view::click_scope(hwnd);
+    assert_eq!(crate::window::search_view::scope(hwnd), Some(ab.b_id));
+}
+
+#[test]
+fn scope_button_hidden_with_one_notebook() {
+    // Break caught: a scope button offering a choice of one, or the single notebook's header
+    // and placeholder changed (spec §4.1).
+    let _scintilla = load_native_scintilla();
+    let ab = searched_ab("search-scope-one");
+    let hwnd = ab.window.hwnd;
+    assert!(crate::window::library_host::close_notebook_of(
+        hwnd, ab.b_id
+    ));
+    assert!(
+        !search_children(hwnd)
+            .iter()
+            .any(|name| name.starts_with("Search scope")),
+        "{:?}",
+        search_children(hwnd)
+    );
+    assert_eq!(
+        crate::window::search_view::shown_header(hwnd),
+        "Searching A"
+    );
+    assert_eq!(
+        crate::window::search_view::placeholder_text(hwnd),
+        "Search text in A"
+    );
+}

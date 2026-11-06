@@ -95,6 +95,12 @@ const TITLE_INSET_AT_96_DPI: i32 = 12;
 /// A result's file icon, as the tree's.
 const ICON_AT_96_DPI: i32 = 16;
 
+/// The scope button at the title band's right end, while several notebooks are open
+/// (multi-root search spec §4.1).
+const SCOPE_WIDTH_AT_96_DPI: i32 = 150;
+const SCOPE_HEIGHT_AT_96_DPI: i32 = 24;
+const SCOPE_INSET_AT_96_DPI: i32 = 6;
+
 /// A painted button in the Search view's header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HeaderButton {
@@ -102,6 +108,8 @@ enum HeaderButton {
     ReplaceAll,
     /// Clears the query and the results.
     Clear,
+    /// Opens the scope menu.
+    Scope,
 }
 
 /// A rectangle as an array, so the tooltip tools can be compared (`RECT` has no `PartialEq`).
@@ -161,6 +169,8 @@ enum SearchChild {
     Status,
     /// The replace button of the selected result `usize`.
     RowReplace(usize),
+    /// The scope button, while several notebooks are open.
+    Scope,
     Result(usize),
 }
 
