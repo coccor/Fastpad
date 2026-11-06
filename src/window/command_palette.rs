@@ -227,7 +227,7 @@ pub(crate) const ENTRIES: [PaletteEntry; 166] = [
     entry("Notes: Previous daily note", CommandId::NotesPreviousDaily),
     entry("Notes: Next daily note", CommandId::NotesNextDaily),
     entry(
-        "Notes: New note from template{2026}",
+        "Notes: New note from template\u{2026}",
         CommandId::NotesNewFromTemplate,
     ),
     entry(
@@ -239,7 +239,7 @@ pub(crate) const ENTRIES: [PaletteEntry; 166] = [
         CommandId::NotesPasteImage,
     ),
     entry(
-        "Notes: Insert attachment{2026}",
+        "Notes: Insert attachment\u{2026}",
         CommandId::NotesInsertAttachment,
     ),
     entry("View: Zoom in", CommandId::ZoomIn),

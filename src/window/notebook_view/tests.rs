@@ -1026,6 +1026,11 @@ fn a_root_label_carries_its_hint_and_the_marker_follows_it() {
         "kept inside the name's room"
     );
     assert_eq!(
+        (cut.left, cut.right),
+        (150 - 16, 150),
+        "a long name's marker keeps its box at the end of the room"
+    );
+    assert_eq!(
         placeholder_text(tree::Placeholder::Failed),
         "Couldn't load. Retry"
     );

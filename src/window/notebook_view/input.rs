@@ -664,7 +664,7 @@ pub(super) fn root_menu(hwnd: HWND, id: NotebookId, at: Option<POINT>) {
     entries.extend([
         MenuEntry::command("Today's note", CommandId::NotesToday),
         MenuEntry::command(
-            "New note from template{2026}",
+            "New note from template\u{2026}",
             CommandId::NotesNewFromTemplate,
         ),
         MenuEntry::Separator,

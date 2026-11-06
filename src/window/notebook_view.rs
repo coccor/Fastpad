@@ -88,6 +88,39 @@ pub(crate) fn root_label(hwnd: HWND, id: NotebookId) -> Option<RootLabel> {
     with_view(hwnd, |view| view.root(id).map(|root| root.label.clone())).flatten()
 }
 
+/// The text of the tooltip tool a tooltip control picks at `(x, y)`: the first tool, in the
+/// order they are added, whose rectangle holds the point.
+#[cfg(test)]
+pub(crate) fn tooltip_at(hwnd: HWND, x: i32, y: i32) -> Option<String> {
+    let fonts = crate::window::main_window::ui_fonts(hwnd);
+    with_view(hwnd, |view| {
+        view.tooltip_tools(fonts)
+            .into_iter()
+            .find(|(_, rect, text)| {
+                !text.is_empty()
+                    && x >= rect.left
+                    && x < rect.right
+                    && y >= rect.top
+                    && y < rect.bottom
+            })
+            .map(|(_, _, text)| text)
+    })
+    .flatten()
+}
+
+/// The default marker's tooltip rectangle on the hovered root row.
+#[cfg(test)]
+pub(crate) fn marker_tool_rect(hwnd: HWND) -> Option<RECT> {
+    let fonts = crate::window::main_window::ui_fonts(hwnd);
+    with_view(hwnd, |view| {
+        view.tooltip_tools(fonts)
+            .into_iter()
+            .find(|(id, rect, _)| *id == TOOL_DEFAULT && rect.right > rect.left)
+            .map(|(_, rect, _)| rect)
+    })
+    .flatten()
+}
+
 /// What the view knows of one open notebook, for its root row (multi-root notebooks spec §4.2).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RootInfo {
@@ -379,8 +412,9 @@ pub(crate) fn state_layout(body: RECT, dpi: u32) -> StateLayout {
 }
 
 /// The row that stands for `kind` of notebook `id` after a rebuild: the same path in the same
-/// notebook if it is still there, else the row that took its index (clamped to the list).
-/// Nothing selected stays nothing.
+/// notebook if it is still there, else the row that took its index (clamped to the list) when
+/// that row is the same notebook's, else the nearest end of that notebook's rows: a row of
+/// another notebook would change the target notebook silently. Nothing selected stays nothing.
 pub(crate) fn follow(
     rows: &[ViewRow],
     kind: Option<(NotebookId, &RowKind)>,
@@ -391,7 +425,21 @@ pub(crate) fn follow(
         return Some(index);
     }
     let last = rows.len().checked_sub(1)?;
-    Some(old.unwrap_or(0).min(last))
+    let at = old.unwrap_or(0).min(last);
+    if rows[at].notebook == id {
+        return Some(at);
+    }
+    let Some(first) = rows.iter().position(|row| row.notebook == id) else {
+        return Some(at);
+    };
+    if at < first {
+        return Some(first);
+    }
+    Some(
+        rows.iter()
+            .rposition(|row| row.notebook == id)
+            .unwrap_or(first),
+    )
 }
 
 /// How `flatten` keys an expanded folder: the same lowercasing as `model::same_path`.
@@ -734,8 +782,10 @@ impl NotebookView {
                 .any(|(new, old)| new.notebook != old.notebook || new.kind != old.kind);
         if reordered {
             self.order = self.order.wrapping_add(1);
-            // The rows moved under a pointer that has not: the old hover names another row.
+            // The rows moved under a pointer that has not: the old hover names another row, and
+            // a hot root button another root's.
             self.list.hover = None;
+            self.hover = None;
         }
         self.mode = snapshot.mode;
         let expanding = snapshot.editors_expanded && !self.editors_expanded;

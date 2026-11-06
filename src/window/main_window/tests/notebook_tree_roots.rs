@@ -207,6 +207,7 @@ fn the_root_menu_offers_close_default_and_favorite() {
         "Close notebook",
         "Set as default notebook",
         "Add to Favorites",
+        "New note from template\u{2026}",
     ] {
         assert!(has(&on_b, wanted), "{wanted:?} in {on_b:?}");
     }
@@ -370,6 +371,25 @@ fn a_refresh_while_search_is_hidden_keeps_its_query() {
         crate::window::search_view::shown_header(hwnd),
         "Searching B"
     );
+}
+
+#[test]
+fn showing_the_tags_view_catches_up_with_the_target_notebook() {
+    // Break caught: a refresh while a B row is selected in the tree leaving Tags on "Tags in
+    // B" when it is shown with A's note in front, until some unrelated refresh flips it.
+    let _scintilla = load_native_scintilla();
+    let ab = roots_ab("roots-tags-shown");
+    let hwnd = ab.window.hwnd;
+    super::super::open_path(hwnd, &ab.a.join("a.md")).unwrap();
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, false);
+    crate::window::notebook_view::rebuild(hwnd);
+    let b_row = row_in(hwnd, ab.b_id, &RowKind::Note("b.md".into()));
+    notebook_view(hwnd).list.selected = Some(b_row);
+    crate::window::side_panel::refresh(hwnd);
+    assert_eq!(crate::window::tags_view::shown_header(hwnd), "Tags in B");
+
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Tags, false);
+    assert_eq!(crate::window::tags_view::shown_header(hwnd), "Tags in A");
 }
 
 #[test]
@@ -649,5 +669,80 @@ fn each_root_is_a_top_level_automation_item() {
             ("No notes yet", "", ROLE_SYSTEM_STATICTEXT),
         ],
         "{items:?}"
+    );
+}
+
+#[test]
+fn deleting_a_notebooks_last_row_keeps_the_selection_in_that_notebook() {
+    // Break caught: the row that takes a deleted last row's place being the next notebook's
+    // root, so Ctrl+N, New folder or Today's note silently go to the other notebook.
+    let _scintilla = load_native_scintilla();
+    let ab = roots_ab("roots-delete-last");
+    let hwnd = ab.window.hwnd;
+    std::fs::create_dir_all(ab.a.join("zfolder")).unwrap();
+    std::fs::write(ab.a.join("zfolder").join("z.md"), "z").unwrap();
+    rescan_and_wait(hwnd);
+    crate::window::notebook_view::rebuild(hwnd);
+    assert_eq!(
+        view_rows(hwnd)[..3],
+        [
+            (ab.a_id, RowKind::Root),
+            (ab.a_id, RowKind::Folder("zfolder".into())),
+            (ab.a_id, RowKind::Note("a.md".into())),
+        ]
+    );
+
+    // A note that was the notebook's last row.
+    select_index(hwnd, row_in(hwnd, ab.a_id, &RowKind::Note("a.md".into())));
+    crate::window::answer_next_confirm(|_| true);
+    crate::window::library_host::delete_file(hwnd, &ab.a.join("a.md"));
+    crate::window::notebook_view::rebuild(hwnd);
+    assert_eq!(selected_row_of(hwnd).map(|(id, _)| id), Some(ab.a_id));
+    assert_eq!(
+        crate::window::library_host::target_notebook(hwnd),
+        Some(ab.a_id)
+    );
+
+    // A folder that was the notebook's last row.
+    select_index(
+        hwnd,
+        row_in(hwnd, ab.a_id, &RowKind::Folder("zfolder".into())),
+    );
+    crate::window::answer_next_confirm(|_| true);
+    crate::window::library_host::delete_folder_of(hwnd, ab.a_id, std::path::Path::new("zfolder"));
+    crate::window::notebook_view::rebuild(hwnd);
+    assert_eq!(selected_row_of(hwnd), Some((ab.a_id, RowKind::Root)));
+    assert_eq!(
+        crate::window::library_host::target_notebook(hwnd),
+        Some(ab.a_id)
+    );
+}
+
+#[test]
+fn the_default_marker_shows_its_own_tooltip() {
+    // Break caught: the notebook's folder tip, added first over the whole name, covering the
+    // marker so "Default notebook" never shows.
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+    let _scintilla = load_native_scintilla();
+    let ab = roots_ab("roots-marker-tip");
+    let hwnd = ab.window.hwnd;
+    let panel = notebook_view(hwnd).panel;
+    let root_a = row_in(hwnd, ab.a_id, &RowKind::Root);
+    let row = notebook_view(hwnd).row_rect_at(root_a).unwrap();
+    mouse(panel, WM_MOUSEMOVE, 0, centre(row));
+    let marker = crate::window::notebook_view::marker_tool_rect(hwnd)
+        .expect("the default's hovered root row has a marker tool");
+    let (x, y) = (
+        (marker.left + marker.right) / 2,
+        (marker.top + marker.bottom) / 2,
+    );
+    assert_eq!(
+        crate::window::notebook_view::tooltip_at(hwnd, x, y).as_deref(),
+        Some("Default notebook")
+    );
+    assert_eq!(
+        crate::window::notebook_view::tooltip_at(hwnd, marker.left - 2, y).as_deref(),
+        Some(ab.a.display().to_string().as_str()),
+        "the name still shows the folder"
     );
 }

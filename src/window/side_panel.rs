@@ -570,6 +570,11 @@ fn show_view_now(hwnd: HWND, view: SidebarView, focus: bool) {
     if view == SidebarView::Links {
         crate::window::links_view::refresh(hwnd, panel);
     }
+    // The Tags view lists the target notebook, which can differ now that the Notebook view no
+    // longer shows: it catches up as it opens, as Search does.
+    if view == SidebarView::Tags {
+        crate::window::tags_view::target_changed(hwnd, panel);
+    }
     layout_editor_and_find_bar(hwnd);
     invalidate_title_strip(hwnd);
     if focus && view != SidebarView::Hidden && is_shown(panel) {

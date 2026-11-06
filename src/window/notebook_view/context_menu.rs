@@ -101,7 +101,7 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
                 MenuEntry::command("New note here", CommandId::NoteNew),
                 MenuEntry::command("New folder here", CommandId::NoteNewFolder),
                 MenuEntry::command(
-                    "New note from template{2026}",
+                    "New note from template\u{2026}",
                     CommandId::NotesNewFromTemplate,
                 ),
                 MenuEntry::Separator,

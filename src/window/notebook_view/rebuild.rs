@@ -405,7 +405,9 @@ pub(crate) fn focus_tree(hwnd: HWND) {
 }
 
 /// Where the row of the notebook `id` showing `kind` is, and the row that takes its place once
-/// it and everything shown under it go (`tree::row_in_place_of`), by its notebook and kind.
+/// it and everything shown under it go (`tree::row_in_place_of`), by its notebook and kind. The
+/// next row is never another notebook's (its root row follows a notebook's last row): the row
+/// before takes the place then, so the target notebook stays the same.
 pub(crate) fn row_in_place_of(
     hwnd: HWND,
     id: NotebookId,
@@ -413,8 +415,14 @@ pub(crate) fn row_in_place_of(
 ) -> Option<(usize, Option<(NotebookId, RowKind)>)> {
     with_view(hwnd, |view| {
         let index = view_row_index(&view.rows, id, kind)?;
-        let next =
-            tree::row_in_place_of(&view.rows, index).map(|row| (row.notebook, row.kind.clone()));
+        let next = tree::row_in_place_of(&view.rows, index)
+            .filter(|row| row.notebook == id)
+            .or_else(|| {
+                index
+                    .checked_sub(1)
+                    .and_then(|before| view.rows.get(before))
+            })
+            .map(|row| (row.notebook, row.kind.clone()));
         Some((index, next))
     })
     .flatten()

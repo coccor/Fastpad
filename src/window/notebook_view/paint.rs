@@ -695,8 +695,15 @@ impl NotebookView {
                     .label
                     .marker
                     .map(|tip| (marker_rect(parts.name, width, dpi), tip.to_owned()));
+                // The name's tip ends where the marker's begins, so the marker shows its own.
+                let title = RECT {
+                    right: marker
+                        .as_ref()
+                        .map_or(parts.name.right, |(rect, _)| rect.left),
+                    ..parts.name
+                };
                 (
-                    (parts.name, root.folder.display().to_string()),
+                    (title, root.folder.display().to_string()),
                     marker.unwrap_or_default(),
                 )
             }
@@ -1068,13 +1075,27 @@ pub(crate) fn root_label_text(label: &RootLabel) -> String {
     }
 }
 
-/// The default marker's box: just after a label `width` pixels wide in `name`, cut to it.
+/// The default marker's box: just after a label `width` pixels wide in `name`. Its box is
+/// reserved first, so a long label is cut off before it rather than hiding it.
 pub(crate) fn marker_rect(name: RECT, width: i32, dpi: u32) -> RECT {
-    let left = (name.left + width + scale(GAP, dpi)).min(name.right);
+    let (gap, glyph) = (scale(GAP, dpi), scale(GLYPH_BOX, dpi));
+    let room = (name.right - name.left - gap - glyph).max(0);
+    let left = (name.left + width.clamp(0, room) + gap).min(name.right);
     RECT {
         left,
-        right: (left + scale(GLYPH_BOX, dpi)).min(name.right),
+        right: (left + glyph).min(name.right),
         ..name
+    }
+}
+
+/// Where a root row's label is drawn: its name room, less the marker's box when it has one.
+fn label_rect(name: RECT, marker: Option<RECT>, dpi: u32) -> RECT {
+    match marker {
+        Some(marker) => RECT {
+            right: (marker.left - scale(GAP, dpi)).max(name.left),
+            ..name
+        },
+        None => name,
     }
 }
 
@@ -1123,13 +1144,24 @@ pub(super) fn draw_root_row(
     };
     unsafe { draw_text(dc, chevron, parts.chevron, fonts.glyph, color, CENTERED) };
     let label = root_label_text(&root.label);
-    unsafe { draw_text(dc, &label, parts.name, fonts.bold, color, LINE) };
-    if root.label.marker.is_some() {
+    let marker = root.label.marker.map(|_| {
         let width = text_extent(dc, &label, fonts.bold);
-        let marker = marker_rect(parts.name, width, dpi);
-        if marker.right > marker.left {
-            unsafe { draw_text(dc, GLYPH_DEFAULT, marker, fonts.glyph, color, CENTERED) };
-        }
+        marker_rect(parts.name, width, dpi)
+    });
+    unsafe {
+        draw_text(
+            dc,
+            &label,
+            label_rect(parts.name, marker, dpi),
+            fonts.bold,
+            color,
+            LINE,
+        )
+    };
+    if let Some(marker) = marker
+        && marker.right > marker.left
+    {
+        unsafe { draw_text(dc, GLYPH_DEFAULT, marker, fonts.glyph, color, CENTERED) };
     }
     if !buttons {
         return;
