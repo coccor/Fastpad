@@ -57,10 +57,64 @@ pub fn missing_notice(missing: &[PathBuf]) -> Option<String> {
     }
 }
 
+/// What results call each open notebook (multi-root search spec §3.2), in `folders`' order: the
+/// sidebar's name, with its hint in parentheses when another notebook shares the name
+/// (`local::display_names`). A drive root's trailing `\` is left out of the hint: "Work (D:)".
+pub fn notebook_labels(folders: &[PathBuf]) -> Vec<String> {
+    super::local::display_names(folders)
+        .into_iter()
+        .map(|(name, hint)| match hint {
+            Some(hint) => format!("{name} ({})", hint.trim_end_matches('\\')),
+            None => name,
+        })
+        .collect()
+}
+
+/// A result's dim folder text (multi-root search spec §3.3): "Label › folder", "Label" for a
+/// note at the notebook's root, or `folder_text` unchanged when only one notebook is open.
+pub fn notebook_prefixed(label: &str, folder_text: &str, several: bool) -> String {
+    match (several, folder_text.is_empty()) {
+        (false, _) => folder_text.to_owned(),
+        (true, true) => label.to_owned(),
+        (true, false) => format!("{label} › {folder_text}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn labels_are_names_unless_two_collide() {
+        // Break caught: two notebooks named "Work" labelled alike, so a result can't be told apart;
+        // or a unique name decorated for no reason.
+        let f = |s: &str| PathBuf::from(s);
+        assert_eq!(
+            notebook_labels(&[f(r"C:\n\Work"), f(r"C:\n\Home")]),
+            ["Work", "Home"]
+        );
+        assert_eq!(
+            notebook_labels(&[f(r"D:\Work"), f(r"C:\Archive\work"), f(r"C:\n\Home")]),
+            ["Work (D:)", "work (Archive)", "Home"]
+        );
+        assert_eq!(
+            notebook_labels(&[f(r"C:\a\x\Work"), f(r"C:\b\x\Work")]),
+            [r"Work (C:\a\x)", r"Work (C:\b\x)"]
+        );
+    }
+
+    #[test]
+    fn prefixed_only_with_several() {
+        // Break caught: the notebook name shown with one notebook open, or missing with several.
+        assert_eq!(notebook_prefixed("Work", r"team\q3", false), r"team\q3");
+        assert_eq!(
+            notebook_prefixed("Work", r"team\q3", true),
+            r"Work › team\q3"
+        );
+        assert_eq!(notebook_prefixed("Work", "", true), "Work");
+        assert_eq!(notebook_prefixed("Work", "", false), "");
+    }
 
     #[test]
     fn nesting_finds_a_folder_inside_or_around_an_open_one() {

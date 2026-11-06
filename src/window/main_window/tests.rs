@@ -67,6 +67,7 @@ mod read_only_mode;
 mod search_replace;
 mod search_replace_writes;
 mod search_view;
+mod searchable_notebooks;
 mod session_restore;
 mod settings_shortcuts_page;
 mod sidebar_layout;
