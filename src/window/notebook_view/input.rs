@@ -886,11 +886,21 @@ pub(super) fn right(hwnd: HWND, index: usize) {
     let Some(Target::Row(id, row)) = with_view(hwnd, |view| view.target(index)) else {
         return;
     };
-    // A root row expands, as its header did (open editors spec §3.5).
+    // A root row expands, then moves to its first child (multi-root notebooks spec §4.4).
     if row.kind == RowKind::Root {
         if !row.expanded {
             set_root_expanded(hwnd, id, true);
         }
+        with_view(hwnd, |view| {
+            let first = view_row_index(&view.rows, id, &RowKind::Root).map(|root| root + 1);
+            if let Some(first) = first
+                && view.rows.get(first).is_some_and(|child| {
+                    child.notebook == id && !matches!(child.kind, RowKind::Placeholder(_))
+                })
+            {
+                view.select(first);
+            }
+        });
         return;
     }
     let RowKind::Folder(relative) = &row.kind else {

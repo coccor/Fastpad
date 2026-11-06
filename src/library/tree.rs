@@ -859,9 +859,11 @@ pub fn type_ahead<R: AsRef<TreeRow>>(rows: &[R], from: usize, prefix: &str) -> O
         return None;
     }
     let start = from % rows.len();
-    (start..rows.len())
-        .chain(0..start)
-        .find(|&index| starts_with_ignore_case(&rows[index].as_ref().name, prefix))
+    (start..rows.len()).chain(0..start).find(|&index| {
+        let row = rows[index].as_ref();
+        // A placeholder's text is a message, not a name.
+        !matches!(row.kind, RowKind::Placeholder(_)) && starts_with_ignore_case(&row.name, prefix)
+    })
 }
 
 /// The folders that contain `path`, outermost first: `a\b\c.md` gives `a` and `a\b`.

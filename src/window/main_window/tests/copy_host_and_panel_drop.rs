@@ -376,6 +376,12 @@ fn inline_name_a_new_note_or_rename_with_the_root_collapsed_expands_it_and_shows
     collapse();
     let panel = sidebar_windows(window.hwnd).1;
     let root = notebook_view(window.hwnd).root_rect();
+    mouse(
+        panel,
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE,
+        0,
+        centre(root),
+    );
     let (_, new_note) = crate::window::notebook_layout::root_parts(root, 96)
         .buttons
         .into_iter()

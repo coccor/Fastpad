@@ -203,13 +203,28 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
         let index = self.row_of_accessible(index);
         let row = self.rows().get(index)?;
         let (rect, visible) = row_rect(self.list_area(client, dpi), self.list(), index);
-        Some(tree_item(
+        // A placeholder is a plain text item (multi-root notebooks spec §4.4).
+        if matches!(row.kind, RowKind::Placeholder(_)) {
+            return Some(crate::window::sidebar_accessibility::text_item(
+                &row.name, rect,
+            ));
+        }
+        let mut item = tree_item(
             row,
             self.list().selected == Some(index),
             focused,
             rect,
             visible,
-        ))
+        );
+        // The default root is named so, as the marker after its name says it by sight.
+        if row.kind == RowKind::Root
+            && self
+                .root(row.notebook)
+                .is_some_and(|root| root.label.marker.is_some())
+        {
+            item.name.push_str(" (default)");
+        }
+        Some(item)
     }
 
     fn accessible_hit(&self, point: POINT, client: RECT, dpi: u32) -> Option<usize> {

@@ -140,6 +140,12 @@ fn open_editors_and_the_root_collapse_and_stay_so() {
     mouse(panel, WM_LBUTTONUP, 0, centre(header));
     assert!(!super::super::open_editors_expanded(window.hwnd));
     let root = notebook_view(window.hwnd).root_rect();
+    mouse(
+        panel,
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE,
+        0,
+        centre(root),
+    );
     let chevron = crate::window::notebook_layout::root_parts(root, 96).chevron;
     mouse(panel, WM_LBUTTONDOWN, 1, centre(chevron));
     mouse(panel, WM_LBUTTONUP, 0, centre(chevron));
@@ -240,6 +246,12 @@ fn the_root_rows_new_note_button_still_makes_the_note_in_the_selected_folder() {
     select_row(window.hwnd, &RowKind::Folder("sub".into()));
     let panel = sidebar_windows(window.hwnd).1;
     let root = notebook_view(window.hwnd).root_rect();
+    mouse(
+        panel,
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE,
+        0,
+        centre(root),
+    );
     let (_, new_note) = crate::window::notebook_layout::root_parts(root, 96)
         .buttons
         .into_iter()
@@ -364,7 +376,7 @@ fn screen_readers_see_the_sections_and_the_tab_rows() {
     assert_eq!(outline("a.md, open editor, modified"), "1");
     let notebook = crate::window::library_host::notebook_name(&scratch.folder());
     // A root row is a tree row at level 1 (multi-root notebooks spec §4.4), its rows under it.
-    assert_eq!(outline(&notebook), "1");
+    assert_eq!(outline(&format!("{notebook} (default)")), "1");
     assert_eq!(outline("a.md, Markdown"), "2", "a top-level tree row");
 }
 

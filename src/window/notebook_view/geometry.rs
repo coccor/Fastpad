@@ -59,7 +59,7 @@ impl NotebookView {
     }
 
     /// The root row of the notebook `id`'s parts: its chevron, label and buttons.
-    pub(super) fn root_parts_of(&self, id: NotebookId) -> Option<notebook_layout::RootParts> {
+    pub(crate) fn root_parts_of(&self, id: NotebookId) -> Option<notebook_layout::RootParts> {
         let index = view_row_index(&self.rows, id, &RowKind::Root)?;
         let rect = self.row_rect(self.list_rect(self.client()), index)?;
         Some(notebook_layout::root_parts(rect, self.dpi()))
@@ -299,6 +299,11 @@ impl NotebookView {
                 // A root row: its buttons, where the pointer makes it the hovered row, else
                 // the row itself, which toggles its notebook.
                 if row.kind == RowKind::Root {
+                    // Only buttons that are drawn take a click: the row hovered by the pointer
+                    // (its hover was reset by any rebuild) or selected.
+                    if !self.buttons_shown(index) {
+                        return Hit::Root(row.notebook);
+                    }
                     let parts = notebook_layout::root_parts(rect, dpi);
                     return parts
                         .shown()

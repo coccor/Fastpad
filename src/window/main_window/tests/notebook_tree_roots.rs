@@ -408,3 +408,246 @@ fn a_new_note_from_a_template_is_named_under_the_target_root() {
     );
     assert!(!ab.a.join("Spark.md").exists());
 }
+
+/// Selects row `index` of the view's list.
+fn select_index(hwnd: HWND, index: usize) {
+    notebook_view(hwnd).list.selected = Some(index);
+}
+
+fn key(hwnd: HWND, key: u16) {
+    crate::window::notebook_view::key_down(hwnd, key);
+}
+
+#[test]
+fn arrow_keys_collapse_expand_and_enter_a_root() {
+    // Break caught: Left moving off a root, Right not moving into the first child, or Enter
+    // not toggling (multi-root notebooks spec §4.4).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_LEFT, VK_RETURN, VK_RIGHT};
+    let _scintilla = load_native_scintilla();
+    let ab = roots_ab("roots-keys");
+    let hwnd = ab.window.hwnd;
+    let root_b = (ab.b_id, RowKind::Root);
+    let note_b = (ab.b_id, RowKind::Note("b.md".into()));
+    select_index(hwnd, row_in(hwnd, ab.b_id, &RowKind::Root));
+
+    key(hwnd, VK_LEFT);
+    assert!(!view_rows(hwnd).contains(&note_b), "Left collapses B");
+    assert_eq!(selected_row_of(hwnd), Some(root_b.clone()));
+    key(hwnd, VK_LEFT);
+    assert_eq!(
+        selected_row_of(hwnd),
+        Some(root_b.clone()),
+        "stays when collapsed"
+    );
+    assert!(!view_rows(hwnd).contains(&note_b));
+
+    key(hwnd, VK_RIGHT);
+    assert!(view_rows(hwnd).contains(&note_b), "Right expands B");
+    assert_eq!(
+        selected_row_of(hwnd),
+        Some(note_b.clone()),
+        "and moves to its first child"
+    );
+
+    select_index(hwnd, row_in(hwnd, ab.b_id, &RowKind::Root));
+    key(hwnd, VK_RIGHT);
+    assert_eq!(
+        selected_row_of(hwnd),
+        Some(note_b.clone()),
+        "an expanded root moves in"
+    );
+
+    select_index(hwnd, row_in(hwnd, ab.b_id, &RowKind::Root));
+    key(hwnd, VK_RETURN);
+    assert!(
+        !view_rows(hwnd).contains(&note_b),
+        "Enter collapses an expanded root"
+    );
+    assert_eq!(selected_row_of(hwnd), Some(root_b.clone()));
+    key(hwnd, VK_RETURN);
+    assert!(
+        view_rows(hwnd).contains(&note_b),
+        "Enter expands a collapsed root"
+    );
+    assert_eq!(selected_row_of(hwnd), Some(root_b));
+}
+
+#[test]
+fn left_from_a_top_level_note_moves_to_its_root() {
+    // Break caught: Left on a depth-1 row doing nothing or landing on the previous notebook.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_LEFT;
+    let _scintilla = load_native_scintilla();
+    let ab = roots_ab("roots-left");
+    let hwnd = ab.window.hwnd;
+    select_index(hwnd, row_in(hwnd, ab.b_id, &RowKind::Note("b.md".into())));
+    key(hwnd, VK_LEFT);
+    assert_eq!(selected_row_of(hwnd), Some((ab.b_id, RowKind::Root)));
+}
+
+#[test]
+fn f2_and_delete_on_a_root_do_nothing() {
+    // Break caught: a root renamed or deleted from the tree. No answer is queued, so a
+    // Recycle Bin question would panic.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DELETE, VK_F2};
+    let _scintilla = load_native_scintilla();
+    let ab = roots_ab("roots-f2-del");
+    let hwnd = ab.window.hwnd;
+    let before = view_rows(hwnd);
+    select_index(hwnd, row_in(hwnd, ab.b_id, &RowKind::Root));
+    key(hwnd, VK_F2);
+    key(hwnd, VK_DELETE);
+    assert!(!inline_open(hwnd), "no name field");
+    assert!(!name_box_visible(hwnd), "no name box");
+    assert_eq!(view_rows(hwnd), before);
+    assert!(ab.b.join("b.md").exists() && ab.b.exists());
+}
+
+fn type_char(hwnd: HWND, ch: char) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR;
+    let panel = notebook_view(hwnd).panel;
+    unsafe { SendMessageW(panel, WM_CHAR, ch as usize, 0) };
+}
+
+#[test]
+fn type_ahead_matches_a_root_name() {
+    // Break caught: type-ahead skipping root rows and landing on the note b.md below them.
+    let _scintilla = load_native_scintilla();
+    let ab = roots_ab("roots-typeahead");
+    let hwnd = ab.window.hwnd;
+    select_index(hwnd, 0);
+    type_char(hwnd, 'b');
+    assert_eq!(selected_row_of(hwnd), Some((ab.b_id, RowKind::Root)));
+}
+
+#[test]
+fn type_ahead_skips_placeholder_rows() {
+    // Break caught: typing "n" selecting the "No notes yet" row of an empty notebook.
+    let _scintilla = load_native_scintilla();
+    let ab = roots_ab("roots-typeahead-placeholder");
+    let hwnd = ab.window.hwnd;
+    let d = ab.scratch.root.join("D");
+    std::fs::create_dir_all(&d).unwrap();
+    open_and_load_folder(&ab.window, &d);
+    crate::window::notebook_view::rebuild(hwnd);
+    assert_eq!(row_text(hwnd, view_rows(hwnd).len() - 1), "No notes yet");
+    select_index(hwnd, 0);
+    type_char(hwnd, 'n');
+    assert_eq!(selected_row_of(hwnd), Some((ab.a_id, RowKind::Root)));
+}
+
+#[test]
+fn closing_the_selected_rows_notebook_selects_a_neighbouring_root() {
+    // Break caught: the selection clamping onto whatever row took its index, which can sit
+    // in another notebook and silently change the target notebook.
+    let _scintilla = load_native_scintilla();
+    let ab = roots_ab("roots-close-selection");
+    let hwnd = ab.window.hwnd;
+    let c = ab.scratch.root.join("C");
+    std::fs::create_dir_all(&c).unwrap();
+    std::fs::write(c.join("c.md"), "c").unwrap();
+    let c_id = open_and_load_folder(&ab.window, &c);
+    crate::window::notebook_view::rebuild(hwnd);
+
+    // The next notebook's root row when one follows.
+    select_index(hwnd, row_in(hwnd, ab.b_id, &RowKind::Note("b.md".into())));
+    assert!(crate::window::library_host::close_notebook_of(
+        hwnd, ab.b_id
+    ));
+    crate::window::notebook_view::rebuild(hwnd);
+    assert_eq!(selected_row_of(hwnd), Some((c_id, RowKind::Root)));
+
+    // The previous one when it was last.
+    select_index(hwnd, row_in(hwnd, c_id, &RowKind::Note("c.md".into())));
+    assert!(crate::window::library_host::close_notebook_of(hwnd, c_id));
+    crate::window::notebook_view::rebuild(hwnd);
+    assert_eq!(selected_row_of(hwnd), Some((ab.a_id, RowKind::Root)));
+
+    // None when no notebook remains.
+    assert!(crate::window::library_host::close_notebook_of(
+        hwnd, ab.a_id
+    ));
+    crate::window::notebook_view::rebuild(hwnd);
+    assert_eq!(notebook_view(hwnd).list.selected, None);
+}
+
+#[test]
+fn a_rebuild_under_a_still_pointer_does_not_leave_invisible_buttons_clickable() {
+    // Break caught: a stale hover after rows shift, so a click at a button position on a row
+    // that draws no buttons presses that invisible button.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_LEFT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+    let _scintilla = load_native_scintilla();
+    let ab = roots_ab("roots-stale-hover");
+    let hwnd = ab.window.hwnd;
+    let panel = notebook_view(hwnd).panel;
+    let row = notebook_view(hwnd)
+        .row_rect_at(row_in(hwnd, ab.b_id, &RowKind::Root))
+        .unwrap();
+    mouse(panel, WM_MOUSEMOVE, 0, centre(row));
+    assert!(notebook_view(hwnd).list.hover.is_some());
+
+    // Collapsing A moves B's root up a row, under the unmoved pointer.
+    select_index(hwnd, 0);
+    key(hwnd, VK_LEFT);
+    assert_eq!(
+        notebook_view(hwnd).list.hover,
+        None,
+        "rows moved: hover reset"
+    );
+
+    let button = notebook_view(hwnd)
+        .root_parts_of(ab.b_id)
+        .unwrap()
+        .shown()
+        .find(|(button, _)| *button == HeaderButton::NewNote)
+        .map(|(_, rect)| rect)
+        .unwrap();
+    click_rect(panel, button);
+    assert!(
+        !inline_open(hwnd),
+        "B's buttons are not drawn, so none is pressed"
+    );
+}
+
+#[test]
+fn each_root_is_a_top_level_automation_item() {
+    // Break caught: the default root not named "(default)", B's rows not under B, or a
+    // placeholder exposed as an outline item.
+    use windows_sys::Win32::UI::Accessibility::{ROLE_SYSTEM_OUTLINEITEM, ROLE_SYSTEM_STATICTEXT};
+    let _scintilla = load_native_scintilla();
+    let ab = roots_ab("roots-uia");
+    let hwnd = ab.window.hwnd;
+    let d = ab.scratch.root.join("D");
+    std::fs::create_dir_all(&d).unwrap();
+    open_and_load_folder(&ab.window, &d);
+    crate::window::notebook_view::rebuild(hwnd);
+    let panel = notebook_view(hwnd).panel;
+    let count = crate::window::side_panel::accessible_item_count(panel);
+    let items: Vec<_> = (0..count)
+        .filter_map(|index| crate::window::side_panel::accessible_item(panel, index))
+        .collect();
+    let first = items
+        .iter()
+        .position(|item| item.name.starts_with("A"))
+        .expect("A's root item");
+    let tree: Vec<_> = items[first..]
+        .iter()
+        .filter(|item| {
+            item.role == ROLE_SYSTEM_OUTLINEITEM
+                || (item.role == ROLE_SYSTEM_STATICTEXT && item.name == "No notes yet")
+        })
+        .map(|item| (item.name.as_str(), item.value.as_str(), item.role))
+        .collect();
+    assert_eq!(
+        tree,
+        [
+            ("A (default)", "1", ROLE_SYSTEM_OUTLINEITEM),
+            ("a.md, Markdown", "2", ROLE_SYSTEM_OUTLINEITEM),
+            ("B", "1", ROLE_SYSTEM_OUTLINEITEM),
+            ("b.md, Markdown", "2", ROLE_SYSTEM_OUTLINEITEM),
+            ("D", "1", ROLE_SYSTEM_OUTLINEITEM),
+            ("No notes yet", "", ROLE_SYSTEM_STATICTEXT),
+        ],
+        "{items:?}"
+    );
+}

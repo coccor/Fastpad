@@ -718,6 +718,7 @@ impl NotebookView {
             })
             .flatten();
         let (old_selected, old_top) = (self.list.selected, self.list.top);
+        let old_order: Vec<NotebookId> = self.roots.iter().map(|root| root.id).collect();
         let infos: Vec<RootInfo> = snapshot
             .roots
             .iter()
@@ -733,6 +734,8 @@ impl NotebookView {
                 .any(|(new, old)| new.notebook != old.notebook || new.kind != old.kind);
         if reordered {
             self.order = self.order.wrapping_add(1);
+            // The rows moved under a pointer that has not: the old hover names another row.
+            self.list.hover = None;
         }
         self.mode = snapshot.mode;
         let expanding = snapshot.editors_expanded && !self.editors_expanded;
@@ -761,7 +764,7 @@ impl NotebookView {
         // Measured in the new mode's list area.
         let height = self.list_height();
         if self.mode == Mode::Tree {
-            self.list.selected = self.follow_selection(selected.as_ref(), old_selected);
+            self.list.selected = self.follow_selection(selected.as_ref(), old_selected, &old_order);
             self.list.top = follow(
                 &self.rows,
                 top.as_ref().map(|(id, kind)| (*id, kind)),
@@ -780,8 +783,20 @@ impl NotebookView {
         &self,
         selected: Option<&(NotebookId, RowKind)>,
         old: Option<usize>,
+        old_order: &[NotebookId],
     ) -> Option<usize> {
         let (id, kind) = selected?;
+        // The selected row's notebook closed: the next notebook's root row, else the previous
+        // one's, else nothing. Taking whatever row now sits at that index could change the
+        // target notebook silently.
+        if view_row_index(&self.rows, *id, &RowKind::Root).is_none() {
+            let at = old_order.iter().position(|open| open == id)?;
+            let root_of = |open: &NotebookId| view_row_index(&self.rows, *open, &RowKind::Root);
+            return old_order[at + 1..]
+                .iter()
+                .find_map(root_of)
+                .or_else(|| old_order[..at].iter().rev().find_map(root_of));
+        }
         if view_row_index(&self.rows, *id, kind).is_none()
             && let Some(root) = view_row_index(&self.rows, *id, &RowKind::Root)
             && !self.rows[root].expanded

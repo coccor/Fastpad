@@ -190,7 +190,7 @@ fn the_panel_exposes_the_tree_as_an_outline_with_pinned_and_folder_states() {
     // level 1 named after the notebook (multi-root notebooks spec §4.4), with its rows under it.
     let root = outline
         .iter()
-        .position(|item| item.value == "1" && item.name == "notes")
+        .position(|item| item.value == "1" && item.name == "notes (default)")
         .expect("the notebook's root row");
     let rows = &outline[root + 1..];
     // "sub" is collapsed, so b is not a row: pinned a first, then the folder.
