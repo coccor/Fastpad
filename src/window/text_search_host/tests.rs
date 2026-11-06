@@ -101,7 +101,7 @@ fn narrowing_needs_a_longer_plain_query_with_the_same_options_and_tab_texts() {
         query: "foo".to_owned(),
         options: plain,
         paths: Vec::new(),
-        notes: 1,
+        notes: vec![(1, 1)],
         overlays: 2,
     };
     assert!(narrows(&previous, "foo", plain, 2), "the same query again");
@@ -154,20 +154,21 @@ fn the_question_counts_matches_and_notes_and_warns_only_when_a_note_is_saved() {
         notes,
         closed_notes,
     };
+    let one = ["Work".to_owned()];
     assert_eq!(
-        confirm_text(count(1, 1, 0), 1, false, "x"),
+        confirm_text(count(1, 1, 0), 1, false, "x", &one),
         "Replace 1 match in 1 note with \"x\"?"
     );
     assert_eq!(
-        confirm_text(count(1_234, 12, 1), 12, false, "y"),
+        confirm_text(count(1_234, 12, 1), 12, false, "y", &one),
         "Replace 1,234 matches in 12 notes with \"y\"?\nNotes that aren't open are saved and can't be undone."
     );
     assert_eq!(
-        confirm_text(count(2_000, 480, 0), 500, true, ""),
+        confirm_text(count(2_000, 480, 0), 500, true, "", &one),
         "Replace 2,000 matches in the 500 listed notes with \"\"? More notes match; search again to replace in the rest."
     );
     assert_eq!(
-        confirm_text(count(2_000, 480, 479), 500, true, "z"),
+        confirm_text(count(2_000, 480, 479), 500, true, "z", &one),
         "Replace 2,000 matches in the 500 listed notes with \"z\"? More notes match; search again to replace in the rest.\nNotes that aren't open are saved and can't be undone."
     );
     assert_eq!(
@@ -191,26 +192,77 @@ fn the_report_is_one_line_that_counts_what_was_replaced_and_names_what_was_not()
             .map(|name| (*name).to_owned())
             .collect::<Vec<_>>()
     };
-    assert_eq!(report_text(1, 1, &[], &[]), "Replaced 1 match in 1 note.");
     assert_eq!(
-        report_text(5, 2, &names(&["b"]), &[]),
+        report_text(1, 1, &[], &[], &[]),
+        "Replaced 1 match in 1 note."
+    );
+    assert_eq!(
+        report_text(5, 2, &names(&["b"]), &[], &[]),
         "Replaced 5 matches in 2 notes. 1 note was skipped because it changed since the search. (b)"
     );
     assert_eq!(
-        report_text(0, 0, &[], &names(&["c", "d"])),
+        report_text(0, 0, &[], &names(&["c", "d"]), &[]),
         "Replaced 0 matches in 0 notes. 2 notes couldn't be written. (c, d)"
     );
     assert_eq!(
-        report_text(3_000, 1, &names(&["x"]), &names(&["y", "z"])),
+        report_text(3_000, 1, &names(&["x"]), &names(&["y", "z"]), &[]),
         "Replaced 3,000 matches in 1 note. 1 note was skipped because it changed since the search. 2 notes couldn't be written. (x, y, z)"
     );
     let changed = (0..1_200)
         .map(|index| format!("n{index}"))
         .collect::<Vec<_>>();
-    let report = report_text(9, 9, &changed, &names(&["f"]));
+    let report = report_text(9, 9, &changed, &names(&["f"]), &[]);
     assert_eq!(
         report,
         "Replaced 9 matches in 9 notes. 1,200 notes were skipped because they changed since the search. 1 note couldn't be written. (n0, n1, n2, and 1,198 more)"
     );
     assert!(!report.contains('\n'));
+}
+
+#[test]
+fn confirm_text_names_notebooks_only_when_several() {
+    // Break caught: a replace across two notebooks asked about as if it touched one, or the
+    // notebook named when only one is involved (multi-root search spec §4.5).
+    let count = ReplaceCount {
+        matches: 14,
+        notes: 6,
+        closed_notes: 0,
+    };
+    let labels = |names: &[&str]| {
+        names
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        confirm_text(count, 6, false, "x", &labels(&["Work"])),
+        "Replace 14 matches in 6 notes with \"x\"?"
+    );
+    assert_eq!(
+        confirm_text(count, 6, false, "x", &labels(&["Work", "Personal"])),
+        "Replace 14 matches in 6 notes across Work and Personal with \"x\"?"
+    );
+    assert_eq!(
+        confirm_text(
+            count,
+            6,
+            false,
+            "x",
+            &labels(&["Work", "Personal", "Archive"])
+        ),
+        "Replace 14 matches in 6 notes across Work, Personal and Archive with \"x\"?"
+    );
+    assert_eq!(
+        confirm_text(count, 6, true, "x", &labels(&["Work", "Personal"])),
+        "Replace 14 matches in the 6 listed notes across Work and Personal with \"x\"? More notes match; search again to replace in the rest."
+    );
+}
+
+#[test]
+fn the_report_says_which_notebooks_were_skipped_because_they_closed() {
+    // Break caught: a notebook closed mid-replace silently left out of the report.
+    assert_eq!(
+        report_text(1, 1, &[], &[], &["Personal".to_owned()]),
+        "Replaced 1 match in 1 note. Skipped Personal: it was closed."
+    );
 }

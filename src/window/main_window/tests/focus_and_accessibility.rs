@@ -372,7 +372,7 @@ fn the_summary_speaks_at_most_once_a_second_while_a_search_runs() {
             window.hwnd,
             SearchBatch {
                 generation: 0,
-                hits: vec![hit(name)],
+                hits: vec![(first_id(window.hwnd), hit(name))],
                 progress: progress(visited),
                 end: None,
                 skipped: Vec::new(),

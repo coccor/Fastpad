@@ -398,18 +398,17 @@ pub(crate) fn open_note(
 /// again.
 pub(crate) fn open_search_result(
     hwnd: HWND,
-    relative: &std::path::Path,
+    note: &crate::window::library_host::NoteRef,
     mode: OpenMode,
     focus_editor: bool,
 ) {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
         return;
     };
-    // Relative to the notebook the results come from.
-    let Some(folder) = crate::window::search_view::notebook(hwnd) else {
+    // In the notebook the result came from (multi-root search spec §4.6).
+    let Some(path) = crate::window::library_host::note_ref_path(hwnd, note) else {
         return;
     };
-    let path = folder.join(relative);
     // The results' query, not the box's text, which may be newer while the debounce runs.
     let search = crate::window::search_view::run_query(hwnd);
     if let Err(error) = open_note(hwnd, &path, mode, false) {

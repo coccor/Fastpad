@@ -247,7 +247,7 @@ impl sidebar_accessibility::AccessibleView for SearchView {
                 let (rect, visible) =
                     sidebar_accessibility::row_rect(self.list_area(client, dpi), &self.list, row);
                 sidebar_accessibility::list_item(
-                    &result_name(hit),
+                    &result_name(hit, &hit.shown_folder),
                     self.list.selected == Some(row),
                     focused,
                     rect,
@@ -311,12 +311,12 @@ impl sidebar_accessibility::AccessibleView for SearchView {
             SearchChild::ReplaceField => sidebar_accessibility::identity_of(&"replace field"),
             SearchChild::ReplaceAll => sidebar_accessibility::identity_of(&"replace all"),
             SearchChild::RowReplace(row) => {
-                sidebar_accessibility::identity_of(&("replace in", &self.results.get(row)?.path))
+                sidebar_accessibility::identity_of(&("replace in", &self.results.get(row)?.note()))
             }
             SearchChild::Summary => sidebar_accessibility::identity_of(&"summary"),
             SearchChild::Status => sidebar_accessibility::identity_of(&"status"),
             SearchChild::Result(row) => {
-                sidebar_accessibility::identity_of(&self.results.get(row)?.path)
+                sidebar_accessibility::identity_of(&self.results.get(row)?.note())
             }
         })
     }

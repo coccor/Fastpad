@@ -3,26 +3,24 @@
 
 use super::*;
 use crate::library::text_search::{self, Progress, SkipReason};
-use crate::window::library_host;
 use crate::window::notebook_view::LOAD_FAILED;
-use std::path::Path;
 
-/// The box's placeholder: "Search text in <notebook>", with the notebook's display name.
-pub(crate) fn placeholder(notebook: Option<&Path>) -> String {
-    notebook
-        .map(|notebook| format!("Search text in {}", library_host::notebook_name(notebook)))
+/// The box's placeholder: "Search text in <name>", the name being the notebook searched or "all
+/// notebooks" (multi-root search spec §4.1).
+pub(crate) fn placeholder(name: Option<&str>) -> String {
+    name.map(|name| format!("Search text in {name}"))
         .unwrap_or_else(|| "Search text".to_owned())
 }
 
-/// The title band's text: "Searching <name>" for the notebook the view searches (multi-root
-/// notebooks spec §5.3), else "Search".
-pub(crate) fn header_text(notebook_name: Option<&str>) -> String {
-    notebook_name.map_or_else(|| TITLE.to_owned(), |name| format!("Searching {name}"))
+/// The title band's text: "Searching <name>", the name being the notebook searched or "all
+/// notebooks" (multi-root search spec §4.1), else "Search".
+pub(crate) fn header_text(name: Option<&str>) -> String {
+    name.map_or_else(|| TITLE.to_owned(), |name| format!("Searching {name}"))
 }
 
 impl SearchView {
     pub(crate) fn header(&self) -> String {
-        header_text(self.notebook_name.as_deref())
+        self.header.clone()
     }
 }
 

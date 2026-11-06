@@ -493,6 +493,14 @@ pub(super) fn first_id(hwnd: HWND) -> crate::window::library_host::NotebookId {
         .expect("a notebook is open")
 }
 
+/// The note `path` (relative) in the first open notebook.
+pub(super) fn first_note(hwnd: HWND, path: &str) -> crate::window::library_host::NoteRef {
+    crate::window::library_host::NoteRef {
+        notebook: first_id(hwnd),
+        path: path.into(),
+    }
+}
+
 /// `folder` (relative) of the first open notebook, as a new item's place.
 pub(super) fn in_first(
     hwnd: HWND,

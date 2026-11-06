@@ -353,7 +353,7 @@ fn a_refresh_while_search_is_hidden_keeps_its_query() {
     search_for(hwnd, "needle");
     assert_eq!(
         crate::window::search_view::shown_header(hwnd),
-        "Searching B"
+        "Searching all notebooks"
     );
 
     // A stale A row selected while the Notebook view shows, then a refresh.
@@ -369,8 +369,9 @@ fn a_refresh_while_search_is_hidden_keeps_its_query() {
     );
     assert_eq!(
         crate::window::search_view::shown_header(hwnd),
-        "Searching B"
+        "Searching all notebooks"
     );
+    assert_eq!(search_rows(hwnd).len(), 2, "both notebooks' results stay");
 }
 
 /// The notebooks A and B, each with one note tagged `#x`, indexed, with the Tags view shown.

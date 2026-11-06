@@ -1,21 +1,22 @@
-//! The Search view (note-search spec §4): a search box over the text of the open notebook's
-//! notes, a summary line, the matching notes with their folders and the first match, and a
-//! status line. `text_search_host` runs the search; this view shows its batches. Enter or a click
-//! opens a result following the preview-tab rules (sidebar spec §6.4). The box's placeholder is
-//! painted the way the find bar paints its placeholder. FastPad has no ComCtl32 v6 manifest, so
-//! `EM_SETCUEBANNER` would show nothing.
+//! The Search view (note-search spec §4): a search box over the text of every open notebook's
+//! notes (multi-root search spec §4), a summary line, the matching notes with their folders and
+//! the first match, and a status line. `text_search_host` runs the search; this view shows its
+//! batches. Enter or a click opens a result following the preview-tab rules (sidebar spec §6.4).
+//! The box's placeholder is painted the way the find bar paints its placeholder. FastPad has no
+//! ComCtl32 v6 manifest, so `EM_SETCUEBANNER` would show nothing.
 
 use crate::library::text_search::{Progress, RunEnd, TextHit, hit_cmp};
 use crate::search::{MatchOptions, SearchOption};
 use crate::window::design::text_scale::scale_text;
 use crate::window::icon_sets::images::IconImages;
+use crate::window::library_host::{NoteRef, NotebookId, Searchable};
 use crate::window::palette::Palette;
 use crate::window::row_list::RowListState;
 use crate::window::side_panel::point_of;
 use crate::window::text_search_host::SearchBatch;
 use crate::window::tooltip::Tooltip;
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+
 use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{CreateSolidBrush, DeleteObject, HBRUSH, InvalidateRect};
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
@@ -163,14 +164,51 @@ enum SearchChild {
     Result(usize),
 }
 
-/// A result's accessible name (spec §10): "<name>, <folder>: <snippet>". A note at the
-/// notebook's root has no folder, so it reads "<name>: <snippet>".
-pub(crate) fn result_name(hit: &TextHit) -> String {
-    if hit.folder.is_empty() {
+/// A result's accessible name (spec §10): "<name>, <folder>: <snippet>", `folder` being the dim
+/// text the row shows. A note at the notebook's root with one notebook open has no folder, so it
+/// reads "<name>: <snippet>".
+pub(crate) fn result_name(hit: &TextHit, folder: &str) -> String {
+    if folder.is_empty() {
         format!("{}: {}", hit.name, hit.snippet.text)
     } else {
-        format!("{}, {}: {}", hit.name, hit.folder, hit.snippet.text)
+        format!("{}, {folder}: {}", hit.name, hit.snippet.text)
     }
+}
+
+/// A listed result: a search hit in the open notebook `notebook` (multi-root search spec §4).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SearchHit {
+    pub(crate) notebook: NotebookId,
+    /// The notebook's place among the searched ones, which orders equal hits (spec §3.3).
+    pub(crate) rank: usize,
+    /// The row's dim text: "Label › folder" while several notebooks are open, else the folder.
+    pub(crate) shown_folder: String,
+    pub(crate) hit: TextHit,
+}
+
+impl std::ops::Deref for SearchHit {
+    type Target = TextHit;
+    fn deref(&self) -> &TextHit {
+        &self.hit
+    }
+}
+
+impl SearchHit {
+    pub(crate) fn note(&self) -> NoteRef {
+        NoteRef {
+            notebook: self.notebook,
+            path: self.hit.path.clone(),
+        }
+    }
+
+    fn is(&self, note: &NoteRef) -> bool {
+        self.notebook == note.notebook && self.hit.path == note.path
+    }
+}
+
+/// `hit_cmp`, then the notebooks' order.
+fn search_hit_cmp(a: &SearchHit, b: &SearchHit) -> std::cmp::Ordering {
+    hit_cmp(&a.hit, &b.hit).then_with(|| a.rank.cmp(&b.rank))
 }
 
 #[derive(Debug)]
@@ -182,14 +220,20 @@ pub(crate) struct SearchView {
     edit_failed: bool,
     brush: HBRUSH,
     colors: Palette,
-    /// The folder of the notebook the view searches: the target notebook when it last caught up
-    /// (multi-root notebooks spec §5.3).
-    notebook: Option<PathBuf>,
-    /// That notebook's display name, for the header ("Searching <name>").
-    notebook_name: Option<String>,
-    /// The library's state has loaded.
+    /// The notebooks the view searches, in sidebar order: every loaded open notebook, or the
+    /// scoped one (multi-root search spec §4.1). Hits keep their place among these.
+    notebooks: Vec<Searchable>,
+    /// Some notebook is open, loaded or not.
+    open: bool,
+    /// Two or more notebooks are open: rows name their notebook and the scope button shows.
+    several: bool,
+    /// The notebook the search is limited to, or `None` for all (spec §4.1). For the session.
+    scope: Option<NotebookId>,
+    /// The title band's text: "Searching all notebooks", "Searching <name>" or "Search".
+    header: String,
+    /// Some notebook has loaded.
     loaded: bool,
-    /// The notebook's load failed (`library_host::load_failed`).
+    /// Every open notebook's load failed (`library_host::load_failed_of`).
     failed: bool,
     /// The library changed while the view was hidden: `shown` checks whether the query must run
     /// again.
@@ -204,8 +248,8 @@ pub(crate) struct SearchView {
     /// The options the results are for: the view's options when the last search began. The find
     /// bar is seeded from `query` and these (Task 7).
     pub(crate) run_options: MatchOptions,
-    /// Sorted by `hit_cmp`, at most `text_search::RESULT_CAP`.
-    pub(crate) results: Vec<TextHit>,
+    /// Sorted by `search_hit_cmp`, at most `text_search::RESULT_CAP`.
+    pub(crate) results: Vec<SearchHit>,
     /// Match case, whole word and regex, for the session.
     pub(crate) options: MatchOptions,
     /// The replace field is open (spec §11). Ctrl+Shift+H opens it, the chevron opens and closes
@@ -234,10 +278,10 @@ pub(crate) struct SearchView {
     /// The same query is running again: its first batch replaces the results.
     replace_on_batch: bool,
     /// The note selected when the running search began, selected again when it arrives.
-    restore: Option<PathBuf>,
+    restore: Option<NoteRef>,
     /// The note the last batch left selected. A different selection at the next batch means the
     /// user moved it, and `restore` gives way.
-    selected_by_batch: Option<PathBuf>,
+    selected_by_batch: Option<NoteRef>,
     pub(crate) list: RowListState,
     placeholder: String,
     /// While the scroll thumb is dragged: how far below its top it was grabbed.
@@ -267,8 +311,11 @@ impl SearchView {
             edit_failed: false,
             brush: unsafe { CreateSolidBrush(colors.editor_background) },
             colors,
-            notebook: None,
-            notebook_name: None,
+            notebooks: Vec::new(),
+            open: false,
+            several: false,
+            scope: None,
+            header: TITLE.to_owned(),
             loaded: false,
             failed: false,
             stale: false,
@@ -316,12 +363,53 @@ impl SearchView {
         self.colors = colors;
     }
 
-    fn path_at(&self, index: usize) -> Option<PathBuf> {
-        self.results.get(index).map(|result| result.path.clone())
+    fn note_at(&self, index: usize) -> Option<NoteRef> {
+        self.results.get(index).map(SearchHit::note)
     }
 
-    fn position(&self, path: &Path) -> Option<usize> {
-        self.results.iter().position(|result| result.path == path)
+    fn position(&self, note: &NoteRef) -> Option<usize> {
+        self.results.iter().position(|result| result.is(note))
+    }
+
+    /// `hit` from the notebook `notebook` as the view lists it: placed after the notebooks
+    /// before it, and named by its notebook while several are open.
+    fn listed(&self, notebook: NotebookId, hit: TextHit) -> SearchHit {
+        let rank = self.notebooks.iter().position(|s| s.id == notebook);
+        let shown_folder = match rank {
+            Some(rank) if self.several => crate::library::roots::notebook_prefixed(
+                &self.notebooks[rank].label,
+                &hit.folder,
+                true,
+            ),
+            _ => hit.folder.clone(),
+        };
+        SearchHit {
+            notebook,
+            rank: rank.unwrap_or(usize::MAX),
+            shown_folder,
+            hit,
+        }
+    }
+
+    /// The searched notebooks changed (one opened, closed or loaded, or the scope moved): drops
+    /// the rows of notebooks no longer searched, and names and orders the rest anew, keeping the
+    /// selected note.
+    fn relist(&mut self) {
+        let selected = self.list.selected.and_then(|index| self.note_at(index));
+        let searched: Vec<NotebookId> = self.notebooks.iter().map(|s| s.id).collect();
+        let rows = std::mem::take(&mut self.results);
+        self.results = rows
+            .into_iter()
+            .filter(|row| searched.contains(&row.notebook))
+            .map(|row| self.listed(row.notebook, row.hit))
+            .collect();
+        self.results.sort_by(search_hit_cmp);
+        self.order = self.order.wrapping_add(1);
+        self.list.set_count(self.results.len());
+        self.list.top = self.list.top.min(self.results.len().saturating_sub(1));
+        self.list.selected = selected
+            .and_then(|note| self.position(&note))
+            .or_else(|| (!self.results.is_empty()).then_some(0));
     }
 
     /// Empties the list and forgets its selection and scroll.
@@ -343,7 +431,7 @@ impl SearchView {
     /// clears them. Either way the selected note is remembered, to be selected again when it
     /// arrives.
     fn begin(&mut self, query: &str, total: usize) {
-        let selected = self.list.selected.and_then(|index| self.path_at(index));
+        let selected = self.list.selected.and_then(|index| self.note_at(index));
         if self.query == query && self.run_options == self.options && !self.results.is_empty() {
             self.replace_on_batch = true;
         } else {
@@ -373,7 +461,7 @@ impl SearchView {
             self.search = SearchState::Running(batch.progress);
             return (self.summary(), self.status_line()) != lines;
         }
-        let current = self.list.selected.and_then(|index| self.path_at(index));
+        let current = self.list.selected.and_then(|index| self.note_at(index));
         let (selected, top) = if replacing {
             self.replace_on_batch = false;
             // The note selected now, where the search began or where the user moved it since,
@@ -383,7 +471,7 @@ impl SearchView {
             }
             (None, None)
         } else {
-            (current, self.path_at(self.list.top))
+            (current, self.note_at(self.list.top))
         };
         if !replacing && selected != self.selected_by_batch {
             // The user moved the selection since the last batch: it stays where they put it.
@@ -398,8 +486,12 @@ impl SearchView {
         let rows_in_view = (height.max(0) as usize).div_ceil(self.list.row_height.max(1) as usize);
         let in_view = self.list.top + rows_in_view;
         let arrived = !batch.hits.is_empty();
-        for hit in batch.hits {
-            match self.results.binary_search_by(|probe| hit_cmp(probe, &hit)) {
+        for (notebook, hit) in batch.hits {
+            let hit = self.listed(notebook, hit);
+            match self
+                .results
+                .binary_search_by(|probe| search_hit_cmp(probe, &hit))
+            {
                 Ok(index) => {
                     rows_changed |= index < in_view;
                     self.results[index] = hit;
@@ -414,21 +506,21 @@ impl SearchView {
             self.order = self.order.wrapping_add(1);
         }
         self.list.set_count(self.results.len());
-        if let Some(index) = top.and_then(|path| self.position(&path)) {
+        if let Some(index) = top.and_then(|note| self.position(&note)) {
             self.list.top = index;
         }
-        let restored = self.restore.as_deref().and_then(|path| self.position(path));
+        let restored = self.restore.as_ref().and_then(|note| self.position(note));
         if restored.is_some() {
             self.restore = None;
         }
         let index = restored
-            .or_else(|| selected.and_then(|path| self.position(&path)))
+            .or_else(|| selected.and_then(|note| self.position(&note)))
             .or_else(|| (!self.results.is_empty()).then_some(0));
         match index {
             Some(index) => self.list.select(index, height),
             None => self.list.selected = None,
         }
-        self.selected_by_batch = self.list.selected.and_then(|index| self.path_at(index));
+        self.selected_by_batch = self.list.selected.and_then(|index| self.note_at(index));
         if batch.end.is_some() {
             self.restore = None;
         }
@@ -446,7 +538,7 @@ impl SearchView {
 
     /// The line shown instead of the results.
     pub(crate) fn notice(&self) -> Option<&'static str> {
-        notice_text(self.notebook.is_some(), self.loaded, self.failed)
+        notice_text(self.open, self.loaded, self.failed)
     }
 
     pub(crate) fn summary(&self) -> Option<(String, bool)> {
@@ -507,6 +599,24 @@ pub(crate) fn shown_results(hwnd: HWND) -> Vec<(String, String)> {
     .unwrap_or_default()
 }
 
+/// The results listed, as (name, the row's dim folder text, its note), for in-process tests.
+#[cfg(test)]
+pub(crate) fn shown_hits(hwnd: HWND) -> Vec<(String, String, NoteRef)> {
+    with_view(hwnd, |view| {
+        view.results
+            .iter()
+            .map(|result| {
+                (
+                    result.name.clone(),
+                    result.shown_folder.clone(),
+                    result.note(),
+                )
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 /// The notice shown instead of the results.
 #[cfg(test)]
 pub(crate) fn status(hwnd: HWND) -> Option<&'static str> {
@@ -527,6 +637,12 @@ pub(crate) fn search_state(hwnd: HWND) -> SearchState {
 #[cfg(test)]
 pub(crate) fn shown_header(hwnd: HWND) -> String {
     with_view(hwnd, |view| view.header()).unwrap_or_default()
+}
+
+/// The search box's placeholder, for in-process tests.
+#[cfg(test)]
+pub(crate) fn placeholder_text(hwnd: HWND) -> String {
+    with_view(hwnd, |view| view.placeholder.clone()).unwrap_or_default()
 }
 
 #[cfg(test)]

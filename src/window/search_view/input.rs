@@ -8,7 +8,6 @@ use crate::window::option_toggles;
 use crate::window::row_list::{self, ListKey};
 use crate::window::text_search_host;
 use crate::window::tooltip::Tooltip;
-use std::path::Path;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::UI::Controls::{EM_SETSEL, WM_MOUSELEAVE};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -63,22 +62,22 @@ pub(super) fn next_stop(
 
 /// Opens the selected result, or the first one, as the preview tab or a normal tab.
 pub(crate) fn open_selected(hwnd: HWND, mode: OpenMode, focus_editor: bool) {
-    let Some(path) = with_view(hwnd, |view| {
+    let Some(note) = with_view(hwnd, |view| {
         let index = view.list.selected.unwrap_or(0);
-        view.results.get(index).map(|result| result.path.clone())
+        view.results.get(index).map(SearchHit::note)
     })
     .flatten() else {
         return;
     };
-    open_result(hwnd, &path, mode, focus_editor);
+    open_result(hwnd, &note, mode, focus_editor);
 }
 
-pub(super) fn open_result(hwnd: HWND, relative: &Path, mode: OpenMode, focus_editor: bool) {
+pub(super) fn open_result(hwnd: HWND, note: &NoteRef, mode: OpenMode, focus_editor: bool) {
     // A replace is changing these notes: a result opens again once its report is in.
     if with_view(hwnd, |view| view.replacing).unwrap_or(false) {
         return;
     }
-    crate::window::main_window::open_search_result(hwnd, relative, mode, focus_editor);
+    crate::window::main_window::open_search_result(hwnd, note, mode, focus_editor);
 }
 
 /// Down from the box: the focus moves into the results.
@@ -151,16 +150,16 @@ pub(super) fn replace_all_requested(hwnd: HWND) {
 /// A result's replace button, or Ctrl+Shift+1 on the selected result: replaces in that note only
 /// (spec §11). It runs under the same rule as Replace all, while the replace field is open.
 pub(super) fn row_replace_requested(hwnd: HWND, index: usize) {
-    let path = with_view(hwnd, |view| {
+    let note = with_view(hwnd, |view| {
         (view.replace_open && view.replace_all_enabled())
-            .then(|| view.results.get(index).map(|hit| hit.path.clone()))
+            .then(|| view.results.get(index).map(SearchHit::note))
             .flatten()
     })
     .flatten();
-    if let Some(path) = path {
+    if let Some(note) = note {
         #[cfg(test)]
         with_view(hwnd, |view| view.row_replace_requests.push(index));
-        text_search_host::replace_in(hwnd, &path);
+        text_search_host::replace_in(hwnd, &note);
     }
 }
 
@@ -381,22 +380,22 @@ pub(crate) fn handle(
                 }
                 return Some(0);
             }
-            let path = with_view(hwnd, |view| {
+            let note = with_view(hwnd, |view| {
                 let index = view.row_under(at, client, dpi)?;
                 let area = view.list_area(client, dpi);
                 view.list.select(index, height(area));
-                Some(view.results[index].path.clone())
+                Some(view.results[index].note())
             })
             .flatten();
             invalidate(panel);
-            if let Some(path) = path {
+            if let Some(note) = note {
                 let mode = if message == WM_LBUTTONDBLCLK {
                     OpenMode::Permanent
                 } else {
                     OpenMode::Preview
                 };
                 // A mouse click moves the focus to the editor (spec §6.4).
-                open_result(hwnd, &path, mode, true);
+                open_result(hwnd, &note, mode, true);
             }
             Some(0)
         }

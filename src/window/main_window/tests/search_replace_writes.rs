@@ -125,7 +125,7 @@ fn a_tab_closed_before_an_unasked_row_replace_applies_is_not_written() {
     search_to_replace(window.hwnd, "needle", "pin");
     crate::window::modal::take_last_confirm();
 
-    crate::window::text_search_host::replace_in(window.hwnd, std::path::Path::new("b.md"));
+    crate::window::text_search_host::replace_in(window.hwnd, &first_note(window.hwnd, "b.md"));
     execute_command(window.hwnd, CommandId::CloseTab);
     assert!(
         tab_paths(window.hwnd)
@@ -258,6 +258,7 @@ fn a_reload_leaves_a_tab_edited_and_saved_since_its_file_was_read() {
     crate::window::text_search_host::replace_written(
         window.hwnd,
         crate::window::text_search_host::test_written(
+            window.hwnd,
             crate::window::text_search_host::replace_generation(window.hwnd),
             report,
         ),
@@ -328,6 +329,7 @@ fn a_write_report_and_its_reloads_wait_for_a_file_population_to_end() {
     crate::window::text_search_host::replace_written(
         window.hwnd,
         crate::window::text_search_host::test_written(
+            window.hwnd,
             crate::window::text_search_host::replace_generation(window.hwnd),
             report,
         ),
@@ -498,6 +500,7 @@ fn a_clean_tab_on_a_written_note_reloads_from_disk_and_a_dirty_one_keeps_its_tex
     crate::window::text_search_host::replace_written(
         window.hwnd,
         crate::window::text_search_host::test_written(
+            window.hwnd,
             crate::window::text_search_host::replace_generation(window.hwnd),
             report,
         ),
@@ -876,6 +879,8 @@ fn a_replace_finishes_in_the_notebook_it_started_in() {
     let a_before = (size(ab.a_id, "a.md"), size(ab.a_id, "c.md"));
     super::super::open_path(hwnd, &ab.b.join("b.md")).unwrap();
     crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Search, false);
+    // Scoped to B, so the replace writes only into B (multi-root search spec §4.1).
+    crate::window::search_view::set_scope(hwnd, Some(ab.b_id));
     search_to_replace(hwnd, "needle", "pin");
     assert_eq!(search_rows(hwnd).len(), 2, "b.md and c.md of B");
 
@@ -926,9 +931,97 @@ fn a_replace_finishes_in_the_notebook_it_started_in() {
         !own.contains_key(&ab.a.join("c.md").to_string_lossy().to_lowercase()),
         "nothing marked in A"
     );
-    // Once the replace is over, the view follows the tab in front.
+    // The tab in front never moves the scope (multi-root search spec §4.2).
     assert_eq!(
         crate::window::search_view::shown_header(hwnd),
-        "Searching A"
+        "Searching B"
+    );
+}
+
+#[test]
+fn replace_across_writes_both_notebooks() {
+    // Break caught: Replace all writing only one notebook's notes, or a question that doesn't
+    // say it spans several (multi-root search spec §4.5).
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("replace-across", "alpha needle", "beta needle");
+    let hwnd = ab.window.hwnd;
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Search, false);
+    search_to_replace(hwnd, "needle", "pin");
+    crate::window::modal::take_last_confirm();
+    crate::window::answer_next_confirm(|_| true);
+    crate::window::text_search_host::replace_all(hwnd);
+    assert_eq!(wait_for_report(hwnd), "Replaced 2 matches in 2 notes.");
+    let asked = crate::window::modal::take_last_confirm().unwrap();
+    assert!(asked.contains("across A and B"), "{asked}");
+    assert_eq!(
+        std::fs::read_to_string(ab.a.join("a.md")).unwrap(),
+        "alpha pin"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ab.b.join("b.md")).unwrap(),
+        "beta pin"
+    );
+}
+
+#[test]
+fn replace_across_uses_each_notebooks_dirty_tab() {
+    // Break caught: B's dirty tab looked up under A's folder, so B's file is written over the
+    // user's unsaved edit, or the edit is missed.
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("replace-across-dirty", "alpha needle", "beta");
+    let hwnd = ab.window.hwnd;
+    super::super::open_path(hwnd, &ab.b.join("b.md")).unwrap();
+    ab._editor.set_text("beta needle").unwrap();
+    pump_posted_messages(hwnd);
+    assert!(app_mut(hwnd).tabs.active().unwrap().dirty);
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Search, false);
+    search_to_replace(hwnd, "needle", "pin");
+    assert_eq!(search_rows(hwnd).len(), 2, "{:?}", search_rows(hwnd));
+    crate::window::modal::take_last_confirm();
+    crate::window::answer_next_confirm(|_| true);
+    crate::window::text_search_host::replace_all(hwnd);
+    wait_for_report(hwnd);
+    assert_eq!(ab._editor.text().unwrap(), "beta pin", "B's tab took it");
+    assert_eq!(std::fs::read_to_string(ab.b.join("b.md")).unwrap(), "beta");
+    assert_eq!(
+        std::fs::read_to_string(ab.a.join("a.md")).unwrap(),
+        "alpha pin"
+    );
+}
+
+#[test]
+fn replace_skips_a_notebook_closed_mid_replace() {
+    // Break caught: a notebook closed while the question was up still written into, or left
+    // out of the report without a word (spec §4.5).
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("replace-across-closed", "alpha needle", "beta needle");
+    let hwnd = ab.window.hwnd;
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Search, false);
+    search_to_replace(hwnd, "needle", "pin");
+    crate::window::modal::take_last_confirm();
+    let generation = crate::window::text_search_host::replace_generation(hwnd);
+    let counted = crate::window::text_search_host::test_counted(
+        hwnd,
+        generation,
+        crate::library::text_replace::ReplaceCount {
+            matches: 2,
+            notes: 2,
+            closed_notes: 2,
+        },
+    );
+    assert!(crate::window::library_host::close_notebook_of(
+        hwnd, ab.b_id
+    ));
+    crate::window::answer_next_confirm(|_| true);
+    crate::window::text_search_host::replace_counted(hwnd, counted);
+    let report = wait_for_report(hwnd);
+    assert!(report.ends_with("Skipped B: it was closed."), "{report}");
+    assert_eq!(
+        std::fs::read_to_string(ab.a.join("a.md")).unwrap(),
+        "alpha pin"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ab.b.join("b.md")).unwrap(),
+        "beta needle"
     );
 }

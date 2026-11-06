@@ -380,10 +380,10 @@ impl SearchView {
                 foreground,
                 line | DT_LEFT | DT_END_ELLIPSIS,
             );
-            if !result.folder.is_empty() {
+            if !result.shown_folder.is_empty() {
                 draw_text(
                     hdc,
-                    &result.folder,
+                    &result.shown_folder,
                     RECT {
                         left: text.left + width + scale(GAP_AT_96_DPI, dpi),
                         ..text

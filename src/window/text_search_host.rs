@@ -12,6 +12,7 @@ use crate::library::text_replace::{self, ReplaceCount, ReplaceReport, ReplaceTar
 use crate::library::text_search::{self, Progress, RunEnd, SearchNote, Stamp, TextHit};
 use crate::library::{self, NoteEntry, path_key};
 use crate::search::{MatchOptions, Matcher};
+use crate::window::library_host::{NoteRef, NotebookId, Searchable};
 use crate::window::search_view::thousands;
 use crate::window::{library_host, search_view};
 use std::collections::{HashMap, HashSet};
@@ -41,14 +42,18 @@ const OVERLAY_STAMP: Stamp = Stamp { size: 0, mtime: 0 };
 #[derive(Debug)]
 pub(crate) struct SearchBatch {
     pub generation: u64,
-    pub hits: Vec<TextHit>,
+    /// Each hit with the open notebook it was found in.
+    pub hits: Vec<(NotebookId, TextHit)>,
     pub progress: Progress,
     /// `Some` only on the last batch of a run that was not cancelled.
     pub end: Option<RunEnd>,
     /// The notes the run skipped (online only, too large, unreadable or not text), on the `end`
     /// batch only. A narrowed search visits them again.
-    pub skipped: Vec<PathBuf>,
+    pub skipped: Vec<NoteRef>,
 }
+
+/// One mark per searched notebook, keyed by `NotebookId.0` (`text_search::marks_match`).
+type Marks = Vec<(u32, u64)>;
 
 /// What the last completed search found, so a longer plain query visits only those notes.
 #[derive(Clone, Debug)]
@@ -56,10 +61,11 @@ struct Narrowing {
     query: String,
     options: MatchOptions,
     /// Its hits and the notes it skipped.
-    paths: Vec<PathBuf>,
-    /// The `note_mark` of the notes it searched and the `overlay_mark` of the tab texts it read.
-    /// A note added, removed or saved, or an edit in a dirty tab, makes the old hits unsafe.
-    notes: u64,
+    paths: Vec<NoteRef>,
+    /// The `note_mark` of each notebook's notes it searched and the `overlay_mark` of the tab
+    /// texts it read. A note added, removed or saved, an edit in a dirty tab, or a notebook
+    /// opened, closed or scoped out, makes the old hits unsafe (multi-root search spec §4.4).
+    notes: Marks,
     overlays: u64,
 }
 
@@ -68,7 +74,7 @@ struct Narrowing {
 struct Running {
     query: String,
     options: MatchOptions,
-    notes: u64,
+    notes: Marks,
     overlays: u64,
 }
 
@@ -79,10 +85,10 @@ pub(crate) struct TextSearchHost {
     cancel: Option<Arc<AtomicBool>>,
     previous: Option<Narrowing>,
     running: Option<Running>,
-    /// The `list_mark` of the note list the last search started over, so a library change runs
-    /// the query again only when a note was added, removed or renamed (spec §7). `None` after a
-    /// reload, which always runs it again.
-    list: Option<u64>,
+    /// The `list_mark` of each note list the last search started over, so a library change runs
+    /// the query again only when a note was added, removed or renamed (spec §7), or a notebook
+    /// joined or left the search. `None` after a reload, which always runs it again.
+    list: Option<Marks>,
     /// Bumped by every replace start and by `cancel_replace`: a count or write report of any
     /// other generation is stale. Separate from the search's `generation`.
     replace_generation: u64,
@@ -102,9 +108,9 @@ pub(crate) struct TextSearchHost {
     /// The write workers not known to have ended. `WM_DESTROY` joins them (`join_writers`), so
     /// the note being written when the window closes is finished, never left half written.
     writers: Vec<JoinHandle<()>>,
-    /// The notebook the replace in hand started in, and its folder: its report lands there,
-    /// whatever the Search view shows by then.
-    replace_notebook: Option<(library_host::NotebookId, PathBuf)>,
+    /// The notebooks the replace in hand writes into, and their folders: its report lands there,
+    /// whatever the Search view shows by then (multi-root search spec §4.5).
+    replace_notebooks: Vec<(NotebookId, PathBuf)>,
 }
 
 fn with_host<R>(hwnd: HWND, f: impl FnOnce(&mut TextSearchHost) -> R) -> Option<R> {
@@ -166,13 +172,26 @@ fn narrows(previous: &Narrowing, query: &str, options: MatchOptions, overlays: u
         && previous.overlays == overlays
 }
 
-/// The notebook the Search view searches (multi-root notebooks spec §5.3), and its folder: the
-/// view's notebook, while it is still open.
-fn searched(hwnd: HWND) -> Option<(library_host::NotebookId, PathBuf)> {
-    let folder = search_view::notebook(hwnd)?;
-    let id = library_host::notebook_of(hwnd, &folder)?;
-    let root = library_host::notebook_folder(hwnd, id)?;
-    same_path(&root, &folder).then_some((id, root))
+/// The notebooks the Search view searches (multi-root search spec §4.3), in sidebar order: the
+/// view's list, less any that closed since it was made.
+fn searched(hwnd: HWND) -> Vec<Searchable> {
+    search_view::searched_notebooks(hwnd)
+        .into_iter()
+        .filter(|s| {
+            library_host::notebook_folder(hwnd, s.id)
+                .is_some_and(|open| same_path(&open, &s.folder))
+        })
+        .collect()
+}
+
+/// `list_mark` of each searched notebook's notes.
+fn list_marks(hwnd: HWND, searched: &[Searchable]) -> Marks {
+    searched
+        .iter()
+        .filter_map(|s| {
+            library_host::with_notebook(hwnd, s.id, |state| (s.id.0, list_mark(&state.notes)))
+        })
+        .collect()
 }
 
 /// A keystroke in the box: cancels any running search and restarts the debounce.
@@ -225,33 +244,64 @@ pub(crate) fn run_now(hwnd: HWND) {
             return;
         }
     };
-    let Some((id, notebook)) = searched(hwnd) else {
-        return;
-    };
-    if library_host::with_notebook(hwnd, id, |_| ()).is_none() {
+    let searched = searched(hwnd);
+    if searched.is_empty() {
         return;
     }
     // Read with nothing of the App borrowed: a background dirty tab is swapped into the editor.
-    let overlays = dirty_overlays(hwnd, &notebook);
-    let overlays_mark = overlay_mark(&overlays);
-    let candidate = with_host(hwnd, |host| host.previous.clone())
+    let overlays: Vec<HashMap<PathBuf, String>> = searched
+        .iter()
+        .map(|s| dirty_overlays(hwnd, &s.folder))
+        .collect();
+    let overlays_mark = searched
+        .iter()
+        .zip(&overlays)
+        .fold(0u64, |mark, (s, overlays)| {
+            let mut hasher = DefaultHasher::new();
+            s.id.0.hash(&mut hasher);
+            overlay_mark(overlays).hash(&mut hasher);
+            mark.wrapping_add(hasher.finish())
+        });
+    let marked: Marks = searched
+        .iter()
+        .filter_map(|s| {
+            library_host::with_notebook(hwnd, s.id, |state| (s.id.0, note_mark(&state.notes)))
+        })
+        .collect();
+    // A longer plain query over the very same notebooks and notes visits only the last hits.
+    let keep: Option<HashSet<(u32, String)>> = with_host(hwnd, |host| host.previous.clone())
         .flatten()
-        .filter(|previous| narrows(previous, &query, options, overlays_mark));
-    let Some((notes, list, marked)) = library_host::with_notebook(hwnd, id, |state| {
-        let list = list_mark(&state.notes);
-        let marked = note_mark(&state.notes);
-        let keep: Option<HashSet<String>> = candidate
-            .filter(|previous| previous.notes == marked)
-            .map(|previous| previous.paths.iter().map(|path| path_key(path)).collect());
-        let notes = text_search::search_notes(state.notes.iter().filter(|note| {
-            keep.as_ref()
-                .is_none_or(|keep| keep.contains(&path_key(&note.path)))
-        }));
-        (notes, list, marked)
-    }) else {
+        .filter(|previous| narrows(previous, &query, options, overlays_mark))
+        .filter(|previous| text_search::marks_match(&previous.notes, &marked))
+        .map(|previous| {
+            previous
+                .paths
+                .iter()
+                .map(|note| (note.notebook.0, path_key(&note.path)))
+                .collect()
+        });
+    let mut roots = Vec::with_capacity(searched.len());
+    for (s, overlays) in searched.iter().zip(overlays) {
+        let notes = library_host::with_notebook(hwnd, s.id, |state| {
+            text_search::search_notes(state.notes.iter().filter(|note| {
+                keep.as_ref()
+                    .is_none_or(|keep| keep.contains(&(s.id.0, path_key(&note.path))))
+            }))
+        });
+        if let Some(notes) = notes {
+            roots.push(JobRoot {
+                id: s.id,
+                folder: s.folder.clone(),
+                notes,
+                overlays,
+            });
+        }
+    }
+    if roots.is_empty() {
         return;
-    };
-    let total = notes.len();
+    }
+    let list = list_marks(hwnd, &searched);
+    let total = roots.iter().map(|root| root.notes.len()).sum();
     let Some((generation, cancel)) = with_host(hwnd, |host| {
         host.generation = host.generation.wrapping_add(1);
         let flag = Arc::new(AtomicBool::new(false));
@@ -271,9 +321,7 @@ pub(crate) fn run_now(hwnd: HWND) {
     spawn(
         hwnd,
         Job {
-            notebook,
-            notes,
-            overlays,
+            roots,
             matcher,
             generation,
             cancel,
@@ -281,11 +329,17 @@ pub(crate) fn run_now(hwnd: HWND) {
     );
 }
 
-/// Everything the worker owns. It is dropped, note copy and overlays included, when it ends.
-struct Job {
-    notebook: PathBuf,
+/// One notebook of a search job: its notes copied, and its dirty tabs' text.
+struct JobRoot {
+    id: NotebookId,
+    folder: PathBuf,
     notes: Vec<SearchNote>,
     overlays: HashMap<PathBuf, String>,
+}
+
+/// Everything the worker owns. It is dropped, note copies and overlays included, when it ends.
+struct Job {
+    roots: Vec<JobRoot>,
     matcher: Matcher,
     generation: u64,
     cancel: Arc<AtomicBool>,
@@ -295,13 +349,20 @@ fn spawn(hwnd: HWND, job: Job) {
     let target = hwnd as isize;
     std::thread::spawn(move || {
         let Job {
-            notebook,
-            notes,
-            overlays,
+            roots,
             matcher,
             generation,
             cancel,
         } = job;
+        let ids: Vec<NotebookId> = roots.iter().map(|root| root.id).collect();
+        let search_roots: Vec<text_search::SearchRoot<'_>> = roots
+            .iter()
+            .map(|root| text_search::SearchRoot {
+                folder: &root.folder,
+                notes: &root.notes,
+                overlays: &root.overlays,
+            })
+            .collect();
         let post = |batch: SearchBatch| -> bool {
             let payload = Box::into_raw(Box::new(batch));
             let posted = unsafe {
@@ -319,11 +380,14 @@ fn spawn(hwnd: HWND, job: Job) {
             posted
         };
         let mut last = Progress::default();
-        let mut sink = |hits: Vec<TextHit>, progress: Progress| {
+        let mut sink = |hits: Vec<(usize, TextHit)>, progress: Progress| {
             last = progress;
             let batch = SearchBatch {
                 generation,
-                hits,
+                hits: hits
+                    .into_iter()
+                    .map(|(root, hit)| (ids[root], hit))
+                    .collect(),
                 progress,
                 end: None,
                 skipped: Vec::new(),
@@ -333,22 +397,20 @@ fn spawn(hwnd: HWND, job: Job) {
             }
         };
         let mut skipped = Vec::new();
-        let end = text_search::run_noting_skipped(
-            &notebook,
-            &notes,
-            &overlays,
-            &matcher,
-            &cancel,
-            &mut sink,
-            &mut skipped,
-        );
+        let end = text_search::run_roots(&search_roots, &matcher, &cancel, &mut sink, &mut skipped);
         if end != RunEnd::Cancelled && !cancel.load(Ordering::Relaxed) {
             post(SearchBatch {
                 generation,
                 hits: Vec::new(),
                 progress: last,
                 end: Some(end),
-                skipped,
+                skipped: skipped
+                    .into_iter()
+                    .map(|(root, path)| NoteRef {
+                        notebook: ids[root],
+                        path,
+                    })
+                    .collect(),
             });
         }
     });
@@ -366,6 +428,10 @@ pub(crate) fn batch_arrived(hwnd: HWND, lparam: LPARAM) {
     }
     let end = batch.end;
     let skipped = std::mem::take(&mut batch.skipped);
+    // A notebook that closed (or left the scope) since the search began lists nothing more
+    // (multi-root search spec §4.3).
+    let searched: Vec<NotebookId> = searched(hwnd).iter().map(|s| s.id).collect();
+    batch.hits.retain(|(id, _)| searched.contains(id));
     // New rows raise the panel's reorder, as a keystroke in the panel does.
     crate::window::side_panel::with_accessible_events(hwnd, || {
         search_view::apply_batch(hwnd, batch)
@@ -374,7 +440,7 @@ pub(crate) fn batch_arrived(hwnd: HWND, lparam: LPARAM) {
         return;
     };
     let paths = if end == RunEnd::Completed {
-        let mut paths = search_view::result_paths(hwnd);
+        let mut paths = search_view::result_notes(hwnd);
         paths.extend(skipped);
         paths
     } else {
@@ -453,12 +519,18 @@ pub(crate) fn library_changed(hwnd: HWND) {
     if !searchable(&query) {
         return;
     }
-    let Some(list) = searched(hwnd)
-        .and_then(|(id, _)| library_host::with_notebook(hwnd, id, |state| list_mark(&state.notes)))
-    else {
+    let searched = searched(hwnd);
+    if searched.is_empty() {
         return;
-    };
-    if with_host(hwnd, |host| host.list) == Some(Some(list)) {
+    }
+    let list = list_marks(hwnd, &searched);
+    let same = with_host(hwnd, |host| {
+        host.list
+            .as_ref()
+            .is_some_and(|last| text_search::marks_match(last, &list))
+    })
+    .unwrap_or(false);
+    if same {
         return;
     }
     unsafe {
@@ -493,38 +565,55 @@ pub(crate) fn dirty_overlays(hwnd: HWND, notebook: &Path) -> HashMap<PathBuf, St
     overlays
 }
 
-/// A listed note a replace may change: its path relative to the notebook, its name for the
-/// question and the report, and the stamp the search read (`None` when the hit came from a tab's
-/// text).
+/// A listed note a replace may change: its notebook, its path relative to that notebook, its
+/// name for the question and the report, and the stamp the search read (`None` when the hit came
+/// from a tab's text).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Candidate {
+    pub notebook: NotebookId,
     pub path: PathBuf,
     pub name: String,
     pub stamp: Option<Stamp>,
 }
 
+/// One notebook's share of a replace (multi-root search spec §4.5).
+#[derive(Debug)]
+struct ReplacePart {
+    id: NotebookId,
+    folder: PathBuf,
+    /// The notebook's label, for the question and a skipped part's report.
+    label: String,
+    /// The candidates the count reads: every one of this notebook's but `unread`.
+    candidates: Vec<Candidate>,
+    /// Hits from a tab's text (no stamp) whose tab has closed: their file is never read, so they
+    /// are left out of the count and the question, and reported as changed since the search.
+    unread: Vec<PathBuf>,
+}
+
 /// What a replace is for, carried from the start through the count to the write.
 #[derive(Debug)]
 pub(crate) struct ReplacePlan {
-    notebook_id: library_host::NotebookId,
-    notebook: PathBuf,
+    /// One per notebook with listed notes, in sidebar order.
+    parts: Vec<ReplacePart>,
     /// The results' query and options the plan was made for. The plan is dropped when the
     /// Search view no longer shows them (`plan_current`).
     query: String,
     options: MatchOptions,
     matcher: Matcher,
     template: String,
-    /// The candidates the count reads: every one but `unread`.
-    candidates: Vec<Candidate>,
-    /// Hits from a tab's text (no stamp) whose tab has closed: their file is never read, so they
-    /// are left out of the count and the question, and reported as changed since the search.
-    unread: Vec<PathBuf>,
     /// How many notes the results list, for a capped question.
     listed: usize,
     /// The results were capped: only the listed notes are replaced (spec §12a).
     capped: bool,
     /// A row's replace: one note, asked about only if it isn't open.
     single: bool,
+}
+
+/// What the count reads in one notebook: its folder, its open tabs' text and its targets.
+struct CountRoot {
+    folder: PathBuf,
+    overlays: HashMap<PathBuf, String>,
+    targets: Vec<ReplaceTarget>,
 }
 
 /// One `WM_FASTPAD_REPLACE_COUNTED` payload, posted as `Box::into_raw` in `lparam`.
@@ -535,12 +624,16 @@ pub(crate) struct ReplaceCounted {
     plan: ReplacePlan,
 }
 
-/// One `WM_FASTPAD_REPLACE_WRITTEN` payload: the closed notes' report and what the open tabs
-/// took on the UI thread before the write began.
+/// One `WM_FASTPAD_REPLACE_WRITTEN` payload: each notebook's report on its closed notes, the
+/// notes skipped before the write began, the notebooks skipped because they closed, and what
+/// the open tabs took on the UI thread before the write began.
 #[derive(Debug)]
 pub(crate) struct ReplaceWritten {
     pub generation: u64,
-    pub report: ReplaceReport,
+    pub reports: Vec<(NotebookId, ReplaceReport)>,
+    /// Relative paths, for their names only.
+    pub stale: Vec<PathBuf>,
+    pub closed: Vec<String>,
     pub tab_matches: usize,
     pub tab_notes: usize,
 }
@@ -572,11 +665,13 @@ pub(crate) fn replace_all(hwnd: HWND) {
 }
 
 /// A row's replace button: that note only, asked about only if it isn't open.
-pub(crate) fn replace_in(hwnd: HWND, relative: &Path) {
+pub(crate) fn replace_in(hwnd: HWND, note: &NoteRef) {
     let (candidates, _) = search_view::replace_candidates(hwnd);
     let one = candidates
         .into_iter()
-        .filter(|candidate| same_path(&candidate.path, relative))
+        .filter(|candidate| {
+            candidate.notebook == note.notebook && same_path(&candidate.path, &note.path)
+        })
         .collect::<Vec<_>>();
     if !one.is_empty() {
         start_replace(hwnd, one, false, true);
@@ -605,59 +700,80 @@ fn start_replace(hwnd: HWND, candidates: Vec<Candidate>, capped: bool, single: b
         return;
     };
     search_view::set_replacing(hwnd, true);
-    let (overlays, targets, plan) = prepared;
+    let (roots, plan) = prepared;
     spawn_count(
         hwnd,
         CountJob {
             generation,
             cancel,
-            overlays,
-            targets,
+            roots,
             plan,
         },
     );
 }
 
-/// What the count needs: the tab texts, the targets and the plan. `None` without a view, a
-/// notebook, or a pattern that compiles.
+/// What the count needs: each notebook's tab texts and targets, and the plan. `None` without a
+/// view, a searched notebook holding a candidate, or a pattern that compiles.
 fn prepare(
     hwnd: HWND,
     candidates: Vec<Candidate>,
     capped: bool,
     single: bool,
-) -> Option<(HashMap<PathBuf, String>, Vec<ReplaceTarget>, ReplacePlan)> {
+) -> Option<(Vec<CountRoot>, ReplacePlan)> {
     // The results' query and options, not the box's text, which may be newer.
     let (query, options) = search_view::run_query(hwnd)?;
     let matcher = Matcher::new(&query, options).ok()?;
-    let (notebook_id, notebook) = searched(hwnd)?;
     let template = search_view::replace_text(hwnd);
-    // Read with nothing of the App borrowed: a background tab is swapped into the editor.
-    let overlays = target_overlays(hwnd, &notebook, &candidates);
-    let counted_open: HashSet<String> = overlays.keys().map(|path| path_key(path)).collect();
     let listed = candidates.len();
-    let (candidates, unread): (Vec<_>, Vec<_>) = candidates.into_iter().partition(|candidate| {
-        candidate.stamp.is_some() || counted_open.contains(&path_key(&candidate.path))
-    });
-    let unread = unread.into_iter().map(|candidate| candidate.path).collect();
-    let targets = candidates
-        .iter()
-        .map(|candidate| ReplaceTarget {
-            path: candidate.path.clone(),
-            stamp: candidate.stamp.unwrap_or(OVERLAY_STAMP),
-        })
-        .collect();
+    let mut roots = Vec::new();
+    let mut parts = Vec::new();
+    // One part per notebook with candidates, in sidebar order.
+    for s in searched(hwnd) {
+        let mine: Vec<Candidate> = candidates
+            .iter()
+            .filter(|candidate| candidate.notebook == s.id)
+            .cloned()
+            .collect();
+        if mine.is_empty() {
+            continue;
+        }
+        // Read with nothing of the App borrowed: a background tab is swapped into the editor.
+        let overlays = target_overlays(hwnd, &s.folder, &mine);
+        let counted_open: HashSet<String> = overlays.keys().map(|path| path_key(path)).collect();
+        let (mine, unread): (Vec<_>, Vec<_>) = mine.into_iter().partition(|candidate| {
+            candidate.stamp.is_some() || counted_open.contains(&path_key(&candidate.path))
+        });
+        let targets = mine
+            .iter()
+            .map(|candidate| ReplaceTarget {
+                path: candidate.path.clone(),
+                stamp: candidate.stamp.unwrap_or(OVERLAY_STAMP),
+            })
+            .collect();
+        roots.push(CountRoot {
+            folder: s.folder.clone(),
+            overlays,
+            targets,
+        });
+        parts.push(ReplacePart {
+            id: s.id,
+            folder: s.folder,
+            label: s.label,
+            candidates: mine,
+            unread: unread.into_iter().map(|candidate| candidate.path).collect(),
+        });
+    }
+    if parts.is_empty() {
+        return None;
+    }
     Some((
-        overlays,
-        targets,
+        roots,
         ReplacePlan {
-            notebook_id,
-            notebook,
+            parts,
             query,
             options,
             matcher,
             template,
-            candidates,
-            unread,
             listed,
             capped,
             single,
@@ -669,8 +785,7 @@ fn prepare(
 struct CountJob {
     generation: u64,
     cancel: Arc<AtomicBool>,
-    overlays: HashMap<PathBuf, String>,
-    targets: Vec<ReplaceTarget>,
+    roots: Vec<CountRoot>,
     plan: ReplacePlan,
 }
 
@@ -691,13 +806,23 @@ fn spawn_count(hwnd: HWND, job: CountJob) {
         let CountJob {
             generation,
             cancel,
-            overlays,
-            targets,
+            roots,
             plan,
         } = job;
-        let count =
-            text_replace::count(&plan.notebook, &targets, &overlays, &plan.matcher, &cancel);
-        drop(overlays);
+        let mut count = ReplaceCount::default();
+        for root in &roots {
+            let part = text_replace::count(
+                &root.folder,
+                &root.targets,
+                &root.overlays,
+                &plan.matcher,
+                &cancel,
+            );
+            count.matches += part.matches;
+            count.notes += part.notes;
+            count.closed_notes += part.closed_notes;
+        }
+        drop(roots);
         if cancel.load(Ordering::Relaxed) {
             return;
         }
@@ -755,7 +880,7 @@ pub(crate) fn replace_timer(hwnd: HWND) {
     if let Some(written) = written
         && current() == Some(written.generation)
     {
-        report_written(hwnd, written.report, written.tab_matches, written.tab_notes);
+        report_written(hwnd, *written);
     }
     if let Some(counted) = counted
         && current() == Some(counted.generation)
@@ -803,16 +928,20 @@ fn confirm_and_apply(hwnd: HWND, counted: ReplaceCounted) {
     }
     let question = if plan.single {
         let name = plan
-            .candidates
-            .first()
+            .parts
+            .iter()
+            .flat_map(|part| &part.candidates)
+            .next()
             .map_or("", |candidate| candidate.name.as_str());
         (count.closed_notes > 0).then(|| row_confirm_text(count.matches, name, &plan.template))
     } else {
+        let labels: Vec<String> = plan.parts.iter().map(|part| part.label.clone()).collect();
         Some(confirm_text(
             count,
             plan.listed,
             plan.capped,
             &plan.template,
+            &labels,
         ))
     };
     // Asked with nothing of the App borrowed: the question is a nested modal loop.
@@ -839,59 +968,83 @@ fn confirm_and_apply(hwnd: HWND, counted: ReplaceCounted) {
 /// question said that notes that aren't open are saved; without it no file is written.
 fn apply_plan(hwnd: HWND, generation: u64, plan: ReplacePlan, warned: bool) {
     let ReplacePlan {
-        notebook_id,
-        notebook,
+        parts,
         matcher,
         template,
-        candidates,
-        unread,
         ..
     } = plan;
+    // A notebook that closed since the count is skipped whole, and said so (spec §4.5).
+    let (parts, gone): (Vec<_>, Vec<_>) = parts.into_iter().partition(|part| {
+        library_host::notebook_folder(hwnd, part.id)
+            .is_some_and(|open| same_path(&open, &part.folder))
+    });
+    let closed_notebooks: Vec<String> = gone.into_iter().map(|part| part.label).collect();
     with_host(hwnd, |host| {
         host.applying = true;
-        host.replace_notebook = Some((notebook_id, notebook.clone()));
+        host.replace_notebooks = parts
+            .iter()
+            .map(|part| (part.id, part.folder.clone()))
+            .collect();
     });
-    let open = open_notes(hwnd, &notebook);
     let mut tab_matches = 0;
     let mut tab_notes = 0;
-    let mut closed = Vec::new();
-    let mut stale = unread;
-    for candidate in candidates {
-        let key = path_key(&candidate.path);
-        match open.get(&key) {
-            // An open tab, active or background, clean or dirty: changed in the editor from its
-            // live text as one undo action, and not saved (spec §12).
-            Some(&id) => {
-                match super::main_window::replace_in_document(hwnd, id, &matcher, &template) {
-                    Some(0) => {}
-                    Some(replaced) => {
-                        tab_matches += replaced;
-                        tab_notes += 1;
+    let mut writes: Vec<WritePart> = Vec::new();
+    let mut stale = Vec::new();
+    for part in parts {
+        let open = open_notes(hwnd, &part.folder);
+        let mut closed = Vec::new();
+        stale.extend(part.unread);
+        for candidate in part.candidates {
+            let key = path_key(&candidate.path);
+            match open.get(&key) {
+                // An open tab, active or background, clean or dirty: changed in the editor from
+                // its live text as one undo action, and not saved (spec §12).
+                Some(&id) => {
+                    match super::main_window::replace_in_document(hwnd, id, &matcher, &template) {
+                        Some(0) => {}
+                        Some(replaced) => {
+                            tab_matches += replaced;
+                            tab_notes += 1;
+                        }
+                        None => stale.push(candidate.path),
                     }
-                    None => stale.push(candidate.path),
                 }
+                // The question never said a note would be saved, so no closed note is written:
+                // the count found no match in any note's file, so a match now can only come from
+                // a tab that closed since the count (which read the tab's text) or a read that
+                // failed during the count.
+                None if !warned => stale.push(candidate.path),
+                None => match candidate.stamp {
+                    Some(stamp) => closed.push(ReplaceTarget {
+                        path: candidate.path,
+                        stamp,
+                    }),
+                    // Found in a tab's text, and that tab has closed since: its file was never
+                    // read.
+                    None => stale.push(candidate.path),
+                },
             }
-            // The question never said a note would be saved, so no closed note is written: the
-            // count found no match in any note's file, so a match now can only come from a tab
-            // that closed since the count (which read the tab's text) or a read that failed
-            // during the count.
-            None if !warned => stale.push(candidate.path),
-            None => match candidate.stamp {
-                Some(stamp) => closed.push(ReplaceTarget {
-                    path: candidate.path,
-                    stamp,
-                }),
-                // Found in a tab's text, and that tab has closed since: its file was never read.
-                None => stale.push(candidate.path),
-            },
+        }
+        if !closed.is_empty() {
+            writes.push(WritePart {
+                id: part.id,
+                folder: part.folder,
+                targets: closed,
+            });
         }
     }
-    if closed.is_empty() {
-        let report = ReplaceReport {
-            changed: stale,
-            ..ReplaceReport::default()
-        };
-        report_written(hwnd, report, tab_matches, tab_notes);
+    if writes.is_empty() {
+        report_written(
+            hwnd,
+            ReplaceWritten {
+                generation,
+                reports: Vec::new(),
+                stale,
+                closed: closed_notebooks,
+                tab_matches,
+                tab_notes,
+            },
+        );
         return;
     }
     // A missing flag means `cancel_replace` may have run since the generation check: a fresh
@@ -909,10 +1062,15 @@ fn apply_plan(hwnd: HWND, generation: u64, plan: ReplacePlan, warned: bool) {
     }) else {
         return;
     };
-    // The notebook watcher will report these writes: they are FastPad's own, not outside changes.
-    let own = closed
+    // The notebook watchers will report these writes: they are FastPad's own, not outside
+    // changes.
+    let own = writes
         .iter()
-        .map(|target| notebook.join(&target.path))
+        .flat_map(|part| {
+            part.targets
+                .iter()
+                .map(|target| part.folder.join(&target.path))
+        })
         .collect::<Vec<_>>();
     crate::window::library_host::begin_own_writes(hwnd, own.iter().map(PathBuf::as_path));
     let writer = spawn_write(
@@ -920,11 +1078,11 @@ fn apply_plan(hwnd: HWND, generation: u64, plan: ReplacePlan, warned: bool) {
         WriteJob {
             generation,
             cancel,
-            notebook,
             matcher,
             template,
-            targets: closed,
+            parts: writes,
             stale,
+            closed: closed_notebooks,
             tab_matches,
             tab_notes,
         },
@@ -935,51 +1093,68 @@ fn apply_plan(hwnd: HWND, generation: u64, plan: ReplacePlan, warned: bool) {
     });
 }
 
+/// One notebook's closed notes to write.
+struct WritePart {
+    id: NotebookId,
+    folder: PathBuf,
+    targets: Vec<ReplaceTarget>,
+}
+
 /// Everything the write worker owns.
 struct WriteJob {
     generation: u64,
     cancel: Arc<AtomicBool>,
-    notebook: PathBuf,
     matcher: Matcher,
     template: String,
-    targets: Vec<ReplaceTarget>,
+    parts: Vec<WritePart>,
     /// Notes skipped before the write began, reported as changed since the search.
     stale: Vec<PathBuf>,
+    /// Notebooks skipped because they closed before the write began.
+    closed: Vec<String>,
     tab_matches: usize,
     tab_notes: usize,
 }
 
-/// Writes the closed notes on a worker. A cancelled write finishes the note in hand and posts
-/// nothing: its report is stale (a notebook change) or has no window left to go to.
+/// Writes the closed notes on a worker, notebook by notebook. A cancelled write finishes the
+/// note in hand and posts nothing: its report is stale or has no window left to go to.
 fn spawn_write(hwnd: HWND, job: WriteJob) -> JoinHandle<()> {
     let target = hwnd as isize;
     std::thread::spawn(move || {
         let WriteJob {
             generation,
             cancel,
-            notebook,
             matcher,
             template,
-            targets,
+            parts,
             stale,
+            closed,
             tab_matches,
             tab_notes,
         } = job;
         #[cfg(test)]
         let _ended = writer_hooks::Ended;
-        let mut report = text_replace::apply(&notebook, &targets, &matcher, &template, &cancel);
+        let mut reports = Vec::with_capacity(parts.len());
+        for part in &parts {
+            let report =
+                text_replace::apply(&part.folder, &part.targets, &matcher, &template, &cancel);
+            reports.push((part.id, report));
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+        }
         #[cfg(test)]
         writer_hooks::pause();
         if cancel.load(Ordering::Relaxed) {
             return;
         }
-        report.changed.extend(stale);
         post_boxed(
             target,
             crate::window::WM_FASTPAD_REPLACE_WRITTEN,
             ReplaceWritten {
                 generation,
-                report,
+                reports,
+                stale,
+                closed,
                 tab_matches,
                 tab_notes,
             },
@@ -1002,62 +1177,62 @@ pub(crate) fn replace_written(hwnd: HWND, lparam: LPARAM) {
         hold(hwnd, |host| host.held_written = Some(written));
         return;
     }
-    report_written(hwnd, written.report, written.tab_matches, written.tab_notes);
+    report_written(hwnd, *written);
 }
 
-/// The end of a replace: the library takes every written note's new size and time from the
-/// stamps the write worker took (`record_written_all`, one pass, no disk access), as it does for
-/// a FastPad save, so the next rescan reads no outside change. A clean tab opened on a written
-/// note while the write ran is read again from its file on a worker (`replace_reloaded`); a
-/// dirty one keeps its text, and its old disk stamp pauses its autosave as for any change made
-/// outside FastPad. Then the report is pushed and the query runs again, so the results show
-/// what still matches.
-fn report_written(hwnd: HWND, report: ReplaceReport, tab_matches: usize, tab_notes: usize) {
-    // The notebook the replace started in, not whatever the view shows now. Its own-write marks
-    // end by absolute path even if it closed meanwhile; its list and tabs change only while it
-    // is still open.
-    let started = with_host(hwnd, |host| host.replace_notebook.take())
-        .flatten()
-        .or_else(|| searched(hwnd));
-    if let Some((_, notebook)) = &started {
+/// The end of a replace: each notebook's library takes every written note's new size and time
+/// from the stamps the write worker took (`record_written_all`, one pass, no disk access), as it
+/// does for a FastPad save, so the next rescan reads no outside change. A clean tab opened on a
+/// written note while the write ran is read again from its file on a worker
+/// (`replace_reloaded`); a dirty one keeps its text, and its old disk stamp pauses its autosave
+/// as for any change made outside FastPad. Then the report is pushed and the query runs again,
+/// so the results show what still matches.
+fn report_written(hwnd: HWND, written: ReplaceWritten) {
+    // The notebooks the replace wrote into, not whatever the view shows now. Own-write marks end
+    // by absolute path even if a notebook closed meanwhile; its list and tabs change only while
+    // it is still open.
+    let started =
+        with_host(hwnd, |host| std::mem::take(&mut host.replace_notebooks)).unwrap_or_default();
+    let mut matches = written.tab_matches;
+    let mut notes = written.tab_notes;
+    let mut changed: Vec<String> = written.stale.iter().map(|path| note_name(path)).collect();
+    let mut failed = Vec::new();
+    for (id, report) in &written.reports {
+        matches += report.matches;
+        notes += report.written.len();
+        changed.extend(report.changed.iter().map(|path| note_name(path)));
+        failed.extend(report.failed.iter().map(|(path, _)| note_name(path)));
+        let Some(folder) = started
+            .iter()
+            .find(|(started, _)| started == id)
+            .map(|(_, folder)| folder.clone())
+            .or_else(|| library_host::notebook_folder(hwnd, *id))
+        else {
+            continue;
+        };
+        let folder = &folder;
         let done = report
             .written
             .iter()
             .map(|(path, _)| path)
             .chain(&report.changed)
             .chain(report.failed.iter().map(|(path, _)| path))
-            .map(|path| notebook.join(path))
+            .map(|path| folder.join(path))
             .collect::<Vec<_>>();
         library_host::end_own_writes(hwnd, done.iter().map(PathBuf::as_path));
-    }
-    let still_open = started.filter(|(id, notebook)| {
-        library_host::notebook_folder(hwnd, *id).is_some_and(|open| same_path(&open, notebook))
-    });
-    if !report.written.is_empty()
-        && let Some((id, notebook)) = &still_open
-    {
-        library_host::with_notebook(hwnd, *id, |state| state.record_written_all(&report.written));
-        let reloads = clean_tabs_on(hwnd, notebook, &report.written);
-        if !reloads.is_empty() {
-            spawn_reload(hwnd, reloads);
+        let still_open =
+            library_host::notebook_folder(hwnd, *id).is_some_and(|open| same_path(&open, folder));
+        if still_open && !report.written.is_empty() {
+            library_host::with_notebook(hwnd, *id, |state| {
+                state.record_written_all(&report.written)
+            });
+            let reloads = clean_tabs_on(hwnd, folder, &report.written);
+            if !reloads.is_empty() {
+                spawn_reload(hwnd, reloads);
+            }
         }
     }
-    let changed = report
-        .changed
-        .iter()
-        .map(|path| note_name(path))
-        .collect::<Vec<_>>();
-    let failed = report
-        .failed
-        .iter()
-        .map(|(path, _)| note_name(path))
-        .collect::<Vec<_>>();
-    let text = report_text(
-        tab_matches + report.matches,
-        tab_notes + report.written.len(),
-        &changed,
-        &failed,
-    );
+    let text = report_text(matches, notes, &changed, &failed, &written.closed);
     finish_replace(hwnd);
     super::main_window::push_notice(hwnd, text);
     run_now(hwnd);
@@ -1163,11 +1338,9 @@ fn finish_replace(hwnd: HWND) {
         host.replacing = false;
         host.applying = false;
         host.replace_cancel = None;
-        host.replace_notebook = None;
+        host.replace_notebooks.clear();
     });
     search_view::set_replacing(hwnd, false);
-    // The view kept its notebook while the replace ran: it follows the target again.
-    search_view::target_changed(hwnd);
 }
 
 /// Stops a replace: a count or write still running stops before its next note (a note being
@@ -1181,7 +1354,7 @@ pub(crate) fn cancel_replace(hwnd: HWND) {
         host.replace_generation = host.replace_generation.wrapping_add(1);
         host.replacing = false;
         host.applying = false;
-        host.replace_notebook = None;
+        host.replace_notebooks.clear();
         host.held = None;
         host.held_written = None;
         !host.held_reloads.is_empty()
@@ -1260,24 +1433,41 @@ fn count_of(count: usize, one: &str, many: &str) -> String {
     }
 }
 
+/// "A", "A and B", "A, B and C".
+fn listing(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 /// Replace all's question (spec wording). `listed` is how many notes the results list; a capped
-/// search names them instead of the notes that matched. The second line, that notes are saved,
-/// comes only when the count read a match from a note's file (`closed_notes`).
+/// search names them instead of the notes that matched. `notebooks` are the labels of the
+/// notebooks it replaces in, named only when there are several (multi-root search spec §4.5).
+/// The second line, that notes are saved, comes only when the count read a match from a note's
+/// file (`closed_notes`).
 pub(crate) fn confirm_text(
     count: ReplaceCount,
     listed: usize,
     capped: bool,
     template: &str,
+    notebooks: &[String],
 ) -> String {
     let matches = count_of(count.matches, "match", "matches");
+    let across = if notebooks.len() > 1 {
+        format!(" across {}", listing(notebooks))
+    } else {
+        String::new()
+    };
     let mut text = if capped {
         format!(
-            "Replace {matches} in the {} listed notes with \"{template}\"? More notes match; search again to replace in the rest.",
+            "Replace {matches} in the {} listed notes{across} with \"{template}\"? More notes match; search again to replace in the rest.",
             thousands(listed)
         )
     } else {
         format!(
-            "Replace {matches} in {} with \"{template}\"?",
+            "Replace {matches} in {}{across} with \"{template}\"?",
             count_of(count.notes, "note", "notes")
         )
     };
@@ -1297,12 +1487,14 @@ pub(crate) fn row_confirm_text(matches: usize, name: &str, template: &str) -> St
 
 /// The report notification, on one line: what was replaced, what was skipped and what couldn't
 /// be written, then the skipped and failed notes' names in brackets, at most `REPORT_NAMES`,
-/// then "and K more".
+/// then "and K more", then each notebook skipped because it closed (multi-root search spec
+/// §4.5).
 pub(crate) fn report_text(
     matches: usize,
     notes: usize,
     changed: &[String],
     failed: &[String],
+    closed: &[String],
 ) -> String {
     let mut text = format!(
         "Replaced {} in {}.",
@@ -1338,6 +1530,9 @@ pub(crate) fn report_text(
         }
         text.push_str(&format!(" ({})", names.join(", ")));
     }
+    for name in closed {
+        text.push_str(&format!(" Skipped {name}: it was closed."));
+    }
     text
 }
 
@@ -1352,12 +1547,18 @@ pub(crate) fn cancel_flag(hwnd: HWND) -> Option<Arc<AtomicBool>> {
     with_host(hwnd, |host| host.cancel.clone()).flatten()
 }
 
-/// A boxed batch, as the worker posts it.
+/// A boxed batch, as the worker posts it, its hits found in the first notebook the view searches.
 #[cfg(test)]
-pub(crate) fn test_batch(generation: u64, hits: Vec<TextHit>, end: Option<RunEnd>) -> LPARAM {
+pub(crate) fn test_batch(
+    hwnd: HWND,
+    generation: u64,
+    hits: Vec<TextHit>,
+    end: Option<RunEnd>,
+) -> LPARAM {
+    let notebook = searched(hwnd).first().map_or(NotebookId(0), |s| s.id);
     Box::into_raw(Box::new(SearchBatch {
         generation,
-        hits,
+        hits: hits.into_iter().map(|hit| (notebook, hit)).collect(),
         progress: Progress::default(),
         end,
         skipped: Vec::new(),
@@ -1400,7 +1601,8 @@ pub(crate) mod writer_hooks {
     }
 }
 
-/// A replace is between its start and its report: the Search view keeps its notebook meanwhile.
+/// A replace is between its start and its report.
+#[cfg(test)]
 pub(crate) fn replacing(hwnd: HWND) -> bool {
     with_host(hwnd, |host| host.replacing).unwrap_or(false)
 }
@@ -1431,7 +1633,7 @@ pub(crate) fn replace_generation(hwnd: HWND) -> u64 {
 #[cfg(test)]
 pub(crate) fn test_counted(hwnd: HWND, generation: u64, count: ReplaceCount) -> LPARAM {
     let (candidates, capped) = search_view::replace_candidates(hwnd);
-    let (_, _, plan) = prepare(hwnd, candidates, capped, false).expect("a finished search");
+    let (_, plan) = prepare(hwnd, candidates, capped, false).expect("a finished search");
     Box::into_raw(Box::new(ReplaceCounted {
         generation,
         count,
@@ -1444,16 +1646,25 @@ pub(crate) fn test_counted(hwnd: HWND, generation: u64, count: ReplaceCount) -> 
 #[cfg(test)]
 pub(crate) fn test_apply(hwnd: HWND, generation: u64) {
     let (candidates, capped) = search_view::replace_candidates(hwnd);
-    let (_, _, plan) = prepare(hwnd, candidates, capped, false).expect("a finished search");
+    let (_, plan) = prepare(hwnd, candidates, capped, false).expect("a finished search");
     apply_plan(hwnd, generation, plan, true);
 }
 
-/// A boxed write report, as the write worker posts it.
+/// A boxed write report, as the write worker posts it, for the first notebook the replace in
+/// hand writes into, or else the first open notebook.
 #[cfg(test)]
-pub(crate) fn test_written(generation: u64, report: ReplaceReport) -> LPARAM {
+pub(crate) fn test_written(hwnd: HWND, generation: u64, report: ReplaceReport) -> LPARAM {
+    let notebook = with_host(hwnd, |host| {
+        host.replace_notebooks.first().map(|(id, _)| *id)
+    })
+    .flatten()
+    .or_else(|| library_host::notebooks(hwnd).first().map(|(id, _)| *id))
+    .unwrap_or(NotebookId(0));
     Box::into_raw(Box::new(ReplaceWritten {
         generation,
-        report,
+        reports: vec![(notebook, report)],
+        stale: Vec::new(),
+        closed: Vec::new(),
         tab_matches: 0,
         tab_notes: 0,
     })) as LPARAM
