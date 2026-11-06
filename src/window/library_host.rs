@@ -108,8 +108,15 @@ pub(crate) struct LibraryHost {
     /// The note an open Move to notebook picker moves, and the notebooks it lists, in row order.
     /// The row after the last is "Browse…".
     pub(crate) shown_move: Option<(PathBuf, Vec<PathBuf>)>,
+    /// What Move to notebook's folder step moves, into which open notebook, and the folders it
+    /// lists, in row order (multi-root move spec §3.4).
+    pub(crate) shown_move_folders: Option<(PathBuf, NotebookId, Vec<PathBuf>)>,
     /// Copies into the tree, queued on one worker thread (open editors spec §4.5).
     pub(crate) copy_worker: super::copy_host::CopyWorker,
+    /// A folder moving to a notebook on another drive, on its worker (multi-root move spec §2.3).
+    pub(crate) moving: Option<super::cross_move_host::Moving>,
+    /// The last folder move's generation, so a late post of an earlier one is told apart.
+    pub(crate) move_generation: u64,
     /// Files FastPad itself is writing on a worker (replace across notes, copies), by lowercase
     /// path: the watcher's report of them is not an outside change. `None` while the write runs,
     /// then until when a late report is still FastPad's own.
@@ -141,7 +148,10 @@ impl LibraryHost {
             check_request: 0,
             expansion_revision: 0,
             shown_move: None,
+            shown_move_folders: None,
             copy_worker: super::copy_host::CopyWorker::default(),
+            moving: None,
+            move_generation: 0,
             own_writes: std::collections::HashMap::new(),
             changed_only: false,
             shown_templates: None,
@@ -189,6 +199,14 @@ pub(crate) fn with_default_state<R>(
     f: impl FnOnce(&mut LibraryState) -> R,
 ) -> Option<R> {
     with_notebook(hwnd, default_notebook(hwnd)?, f)
+}
+
+/// Runs `f` on the folder move in progress, if any.
+pub(crate) fn with_moving<R>(
+    hwnd: HWND,
+    f: impl FnOnce(&mut Option<super::cross_move_host::Moving>, &mut u64) -> R,
+) -> Option<R> {
+    host(hwnd, |host| f(&mut host.moving, &mut host.move_generation))
 }
 
 /// Runs `f` on the window's copy worker.

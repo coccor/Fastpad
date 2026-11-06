@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::config::FileIconSet;
-use crate::library::tree::{RowKind, TreeRow};
+use crate::library::tree::{self, RowKind, TreeRow};
 use crate::window::design::metrics::{scale, sidebar_row};
 use crate::window::design::round::paint_focus_ring;
 use crate::window::design::text_scale::scale_text;
@@ -126,7 +126,11 @@ pub(super) fn draw_tree_row(
                 left: parts.chevron.left,
                 ..rect
             };
-            let words = placeholder_text(*placeholder);
+            // A moving folder's row carries its own progress text.
+            let words = match placeholder {
+                tree::Placeholder::Moving => row.name.as_str(),
+                _ => placeholder_text(*placeholder),
+            };
             unsafe { draw_text(dc, words, text, fonts.italic, muted, LINE) };
             return;
         }
@@ -906,7 +910,7 @@ impl NotebookView {
                 if let Some(layout) = self.inline_layout_in(area, dpi) {
                     self.paint_inline(dc, layout, list, palette, fonts, dpi);
                 }
-                // Why the pointer's place refuses the dragged row: a strip along the list's
+                // What a drop there does (Move to / Copy to …): a strip along the list's
                 // bottom edge, clear of the pointer's label.
                 if let Some(hint) = self.drag_hint() {
                     let height = self.list.row_height.min(height(list));
@@ -920,7 +924,7 @@ impl NotebookView {
                     };
                     unsafe {
                         fill(dc, strip, palette.hover_background);
-                        draw_text(dc, hint, text, fonts.text, palette.muted_foreground, LINE);
+                        draw_text(dc, &hint, text, fonts.text, palette.muted_foreground, LINE);
                     }
                 }
             }

@@ -9,7 +9,7 @@ use crate::window::notebook_layout::{self, PanelLayout};
 use crate::window::panel_cursor;
 #[cfg(test)]
 use crate::window::row_list;
-use crate::window::tree_drag::{self, DragSource, Hover, Reason, Verdict};
+use crate::window::tree_drag::{self, DragSource, Hover};
 use std::time::Instant;
 use windows_sys::Win32::Foundation::{POINT, RECT};
 use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, InvalidateRect, ScreenToClient};
@@ -357,37 +357,32 @@ impl NotebookView {
     /// changed. Whether a release there moves or copies the item.
     pub(super) fn drag_to(&mut self, x: i32, y: i32, now: Instant) -> bool {
         let hover = self.drag_hover(x, y);
-        // The notebook the pointer is over. Files and tabs copy into it; a row stays in its own
-        // and refuses the rest, with a hint (multi-root notebooks spec §4.5).
+        let hint_before = self.drag_hint();
+        // The notebook the pointer is over, which a drop there goes into: files, tabs and rows
+        // alike (multi-root move spec §3.1). A row stays its own notebook's (`drag_notebook`).
         let under = match hover {
             Hover::Row(index) => self.rows.get(index).map(|row| row.notebook),
             Hover::Below => self.rows.last().map(|row| row.notebook),
             Hover::Header | Hover::Outside => None,
         };
-        let row_kind = match self.drag.as_ref().map(|drag| &drag.source) {
-            Some(DragSource::Row(kind)) => Some(kind.clone()),
-            _ => None,
-        };
-        if row_kind.is_none()
-            && let Some(under) = under
-        {
-            self.drag_notebook = Some(under);
+        let is_row = matches!(
+            self.drag.as_ref().map(|drag| &drag.source),
+            Some(DragSource::Row(_))
+        );
+        if let Some(under) = under {
+            self.drop_notebook = Some(under);
+            if !is_row {
+                self.drag_notebook = Some(under);
+            }
         }
-        let refused =
-            row_kind
-                .zip(self.drag_notebook.zip(under))
-                .and_then(|(kind, (from, under))| {
-                    match tree_drag::accepts(from, under, &kind, Path::new("")) {
-                        Verdict::Rejected(reason @ Reason::OtherNotebook) => Some(reason),
-                        _ => None,
-                    }
-                });
+        let cross = is_row && self.drop_notebook != self.drag_notebook;
         let span = self
-            .drag_notebook
+            .drop_notebook
             .and_then(|id| Some((self.notebook_span(id)?, self.notebook_folder(id)?)));
         let Some(drag) = self.drag.as_mut() else {
             return false;
         };
+        drag.cross = cross;
         let changed = match span {
             Some(((contents, end), root)) => {
                 let hover = match hover {
@@ -416,22 +411,30 @@ impl NotebookView {
                 now,
             ),
         };
-        let hint_changed = std::mem::replace(&mut drag.refused, refused) != refused;
         let accepted = drag.target.is_some();
-        if changed || hint_changed {
+        if changed || self.drag_hint() != hint_before {
             self.invalidate();
         }
         accepted
     }
 
-    /// The hint a started drag shows while its pointer is somewhere it cannot drop for a reason
-    /// worth saying (multi-root notebooks spec §4.5).
-    pub(crate) fn drag_hint(&self) -> Option<&'static str> {
-        self.drag
-            .as_ref()
-            .filter(|drag| drag.started)?
-            .refused?
-            .hint()
+    /// What a started row drag will do where it is (multi-root move spec §3.1): "Move to
+    /// *Notebook* › *folder*" into another notebook, "Copy to …" with Ctrl, nothing for a move
+    /// inside its own notebook or where nothing takes it.
+    pub(crate) fn drag_hint(&self) -> Option<String> {
+        let drag = self.drag.as_ref().filter(|drag| drag.started)?;
+        let DragSource::Row(_) = &drag.source else {
+            return None;
+        };
+        let folder = drag.target.as_deref()?;
+        let (from, dest) = (self.drag_notebook?, self.drop_notebook?);
+        let root = self.notebook_folder(dest)?;
+        let place = crate::library::roots::notebook_prefixed(
+            &crate::window::library_host::notebook_name(&root),
+            &folder.to_string_lossy(),
+            true,
+        );
+        tree_drag::action_hint(tree_drag::drop_action(from, dest, drag.copy), &place)
     }
 
     /// Where the contents of the notebook `id` are in the rows: from the row after its root row
@@ -456,7 +459,7 @@ impl NotebookView {
         use crate::window::tree_drag::Highlight;
         let drag = self.drag.as_ref().filter(|drag| drag.started)?;
         let folder = drag.target.as_deref()?;
-        let (contents, end) = self.notebook_span(self.drag_notebook?)?;
+        let (contents, end) = self.notebook_span(self.drop_notebook?)?;
         let rows = &self.rows[contents..end];
         Some(match crate::window::tree_drag::highlight(rows, folder)? {
             Highlight::Root if contents > 0 && self.rows[contents - 1].kind == RowKind::Root => {

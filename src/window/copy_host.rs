@@ -165,6 +165,8 @@ fn run_worker(jobs: Receiver<CopyJob>, cancel: Arc<AtomicBool>) {
 #[cfg(test)]
 thread_local! {
     static FAIL_RECYCLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PARTLY_RECYCLE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Makes the next Recycle Bin step fail, as a network share would.
@@ -173,7 +175,25 @@ pub(crate) fn fail_next_recycle() {
     FAIL_RECYCLE.with(|fail| fail.set(true));
 }
 
+/// Makes the next Recycle Bin step remove `gone` and then fail, as a folder with a locked file
+/// can.
+#[cfg(test)]
+pub(crate) fn fail_next_recycle_after_removing(gone: PathBuf) {
+    PARTLY_RECYCLE.with(|partly| *partly.borrow_mut() = Some(gone));
+}
+
+/// Sends `path`, a file or a folder, to the Recycle Bin (`fail_next_recycle` in tests). A
+/// folder moved to another drive goes this way once its copy is checked.
+pub(crate) fn recycle_path(hwnd: HWND, path: &Path) -> bool {
+    recycle(hwnd, path)
+}
+
 fn recycle(hwnd: HWND, path: &Path) -> bool {
+    #[cfg(test)]
+    if let Some(gone) = PARTLY_RECYCLE.with(|partly| partly.borrow_mut().take()) {
+        let _ = std::fs::remove_file(gone);
+        return false;
+    }
     #[cfg(test)]
     if FAIL_RECYCLE.with(|fail| fail.replace(false)) {
         return false;
@@ -239,6 +259,11 @@ pub(crate) fn copy_into_of(
     let Some(root) = library_host::notebook_folder(hwnd, id) else {
         return;
     };
+    // Nothing is copied into a folder moving to another drive, or into its copy (final review
+    // 2, 3).
+    if super::cross_move_host::refuse_if_moving(hwnd, &root.join(folder)) {
+        return;
+    }
     let planned = tree_copy::plan(&sources, &root, folder, &|path: &Path| path.exists());
     let folder_label = match folder.file_name() {
         Some(name) => name.to_string_lossy().into_owned(),
@@ -431,6 +456,7 @@ pub(crate) fn test_done_payload(root: PathBuf, copied: Vec<PathBuf>) -> LPARAM {
             copied: Copied {
                 files: 1,
                 error: None,
+                created: true,
             },
         })
         .collect();

@@ -66,8 +66,13 @@ pub(crate) struct Drag {
     pub(crate) target: Option<PathBuf>,
     /// The collapsed folder row the pointer rests on, and since when (spec §3.3).
     pub(crate) resting: Option<(PathBuf, Instant)>,
-    /// Why the pointer's place refuses the item, when it is a reason worth a hint.
-    pub(crate) refused: Option<Reason>,
+    /// A row over another notebook than its own: any folder there takes it (multi-root move
+    /// spec §3.1).
+    pub(crate) cross: bool,
+    /// Ctrl is down: a row drop copies instead of moving.
+    pub(crate) copy: bool,
+    /// A dragged row's file or folder on disk, for a copy's checks.
+    pub(crate) row_path: Option<PathBuf>,
 }
 
 impl Drag {
@@ -83,8 +88,23 @@ impl Drag {
             pointer: (x, y),
             target: None,
             resting: None,
-            refused: None,
+            cross: false,
+            copy: false,
+            row_path: None,
         })
+    }
+
+    /// Whether `folder`, of the notebook at `root`, takes this drag: a row copied by
+    /// `tree_copy`'s rules, a row from another notebook anywhere, a row in its own notebook by
+    /// `accepts_here`, and a tab or files by `source_accepts`.
+    pub(crate) fn takes(&self, root: &Path, folder: &Path) -> bool {
+        match &self.source {
+            DragSource::Row(kind) if self.copy => self.row_path.as_ref().is_some_and(|path| {
+                draggable(kind) && tree_copy::any_accepted(std::slice::from_ref(path), root, folder)
+            }),
+            DragSource::Row(kind) if self.cross => draggable(kind),
+            source => source_accepts(source, root, folder),
+        }
     }
 
     /// The pointer moved to `point`, over `hover`: the target and the resting folder follow.
@@ -99,8 +119,7 @@ impl Drag {
         now: Instant,
     ) -> bool {
         self.pointer = point;
-        let target =
-            drop_folder(rows, hover).filter(|folder| source_accepts(&self.source, root, folder));
+        let target = drop_folder(rows, hover).filter(|folder| self.takes(root, folder));
         self.resting = rest_on(self.resting.take(), rows, hover, target.as_deref(), now);
         let changed = target != self.target;
         self.target = target;
@@ -147,48 +166,35 @@ pub(crate) fn drop_folder<R: AsRef<TreeRow>>(rows: &[R], hover: Hover) -> Option
     }
 }
 
-/// Why a drop is refused.
+/// What a row drop does (multi-root move spec §3.1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Reason {
-    /// The folder is in another notebook than the dragged row: moving between notebooks is not
-    /// supported yet (multi-root notebooks spec §4.5).
-    OtherNotebook,
-    /// The folder is not a place the row can go (spec §3.2).
-    NotThere,
+pub(crate) enum DropAction {
+    /// Inside its own notebook: the tree move it always was.
+    MoveHere,
+    /// Into another notebook.
+    MoveAcross,
+    /// Ctrl held: a copy, inside one notebook or across.
+    Copy,
 }
 
-impl Reason {
-    /// What the drag says about the refusal; `None` when the cursor says enough.
-    pub(crate) fn hint(self) -> Option<&'static str> {
-        match self {
-            Self::OtherNotebook => Some(crate::window::drag_label::OTHER_NOTEBOOK_HINT),
-            Self::NotThere => None,
-        }
+/// What a drop of a row of the notebook `from` into the notebook `dest` does.
+pub(crate) fn drop_action(from: NotebookId, dest: NotebookId, copy: bool) -> DropAction {
+    if copy {
+        DropAction::Copy
+    } else if from == dest {
+        DropAction::MoveHere
+    } else {
+        DropAction::MoveAcross
     }
 }
 
-/// Whether a drop is taken.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Verdict {
-    Accepted,
-    Rejected(Reason),
-}
-
-/// Whether `folder`, a folder of the notebook `dest`, takes `source`, a row of the notebook
-/// `from`: only inside one notebook (multi-root notebooks spec §4.5), and then by
-/// `accepts_here`.
-pub(crate) fn accepts(
-    from: NotebookId,
-    dest: NotebookId,
-    source: &RowKind,
-    folder: &Path,
-) -> Verdict {
-    if from != dest {
-        Verdict::Rejected(Reason::OtherNotebook)
-    } else if accepts_here(source, folder) {
-        Verdict::Accepted
-    } else {
-        Verdict::Rejected(Reason::NotThere)
+/// What the drag says it will do at `place` ("*Notebook* › *folder*"); nothing for a move
+/// inside one notebook, which the band says enough about.
+pub(crate) fn action_hint(action: DropAction, place: &str) -> Option<String> {
+    match action {
+        DropAction::MoveHere => None,
+        DropAction::MoveAcross => Some(format!("Move to {place}")),
+        DropAction::Copy => Some(format!("Copy to {place}")),
     }
 }
 
@@ -381,24 +387,51 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_of_another_notebook_refuses_with_a_reason_and_a_hint() {
-        // Break caught: a cross-notebook move accepted, or refused with no word on why.
+    fn a_folder_of_another_notebook_takes_a_row_even_at_the_same_relative_path() {
+        // Break caught: one notebook's own-folder rule refusing a.md on another notebook's
+        // root (multi-root move spec §3.1).
+        let root = Path::new(r"C:\B");
+        let mut drag = Drag::armed(DragSource::Row(note("a.md")), 0, 0).unwrap();
+        assert!(
+            !drag.takes(root, Path::new("")),
+            "its own root, same notebook"
+        );
+        drag.cross = true;
+        assert!(drag.takes(root, Path::new("")));
+        let mut folder_drag = Drag::armed(DragSource::Row(folder("work")), 0, 0).unwrap();
+        folder_drag.cross = true;
+        assert!(
+            folder_drag.takes(root, Path::new(r"work\inner")),
+            "another notebook's work is not itself"
+        );
+    }
+
+    #[test]
+    fn a_copy_of_a_row_takes_any_folder_but_its_own() {
+        let mut drag = Drag::armed(DragSource::Row(note(r"work\b.md")), 0, 0).unwrap();
+        drag.copy = true;
+        drag.row_path = Some(PathBuf::from(r"C:\A\work\b.md"));
+        let root = Path::new(r"C:\A");
+        assert!(!drag.takes(root, Path::new("work")), "a copy over itself");
+        assert!(drag.takes(root, Path::new("")));
+    }
+
+    #[test]
+    fn the_drop_action_and_its_hint() {
         let (a, b) = (NotebookId(1), NotebookId(2));
-        let note = RowKind::Note("a.md".into());
+        assert_eq!(drop_action(a, a, false), DropAction::MoveHere);
+        assert_eq!(drop_action(a, b, false), DropAction::MoveAcross);
+        assert_eq!(drop_action(a, a, true), DropAction::Copy);
+        assert_eq!(drop_action(a, b, true), DropAction::Copy);
+        assert_eq!(action_hint(DropAction::MoveHere, "A › work"), None);
         assert_eq!(
-            accepts(a, b, &note, Path::new("work")),
-            Verdict::Rejected(Reason::OtherNotebook)
-        );
-        assert_eq!(accepts(a, a, &note, Path::new("work")), Verdict::Accepted);
-        assert_eq!(
-            accepts(a, a, &note, Path::new("")),
-            Verdict::Rejected(Reason::NotThere)
+            action_hint(DropAction::MoveAcross, "B › projects").as_deref(),
+            Some("Move to B › projects")
         );
         assert_eq!(
-            Reason::OtherNotebook.hint(),
-            Some("Moving between notebooks isn't supported yet")
+            action_hint(DropAction::Copy, "B").as_deref(),
+            Some("Copy to B")
         );
-        assert_eq!(Reason::NotThere.hint(), None);
     }
 
     #[test]

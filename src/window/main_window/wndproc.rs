@@ -51,6 +51,11 @@ pub(super) unsafe extern "system" fn main_window_proc(
             if file_population_active(hwnd) {
                 return 0;
             }
+            // A folder still moving to another drive: cancel it, or keep the window (multi-root
+            // move spec §3.3).
+            if !crate::window::cross_move_host::may_close(hwnd, None) {
+                return 0;
+            }
             // A launch forwarded just before the review must be handled, not lost with the window.
             drain_ipc_requests(hwnd);
             crate::window::library_host::autosave_all(hwnd);
@@ -86,6 +91,9 @@ pub(super) unsafe extern "system" fn main_window_proc(
             // A copy into the notebook stops after the file in hand, and is waited for the same
             // way, so no copied file is left half written.
             crate::window::copy_host::stop(hwnd);
+            // A folder moving to another drive stops and removes its partial copy: the original
+            // stays whole.
+            crate::window::cross_move_host::stop(hwnd);
             // The notebook watcher's thread stops and is waited for.
             crate::window::library_host::stop_watcher(hwnd);
             // The panel goes with this window, not through `side_panel::destroy_windows`: its
@@ -540,6 +548,14 @@ pub(super) unsafe extern "system" fn main_window_proc(
             }
             if message == crate::window::WM_FASTPAD_REPLACE_RELOADED {
                 crate::window::text_search_host::replace_reloaded(hwnd, lparam);
+                return 0;
+            }
+            if message == crate::window::WM_FASTPAD_MOVE_PROGRESS {
+                crate::window::cross_move_host::move_progress(hwnd, wparam, lparam);
+                return 0;
+            }
+            if message == crate::window::WM_FASTPAD_MOVE_DONE {
+                crate::window::cross_move_host::move_done(hwnd, lparam);
                 return 0;
             }
             if message == crate::window::WM_FASTPAD_COPY_DONE {

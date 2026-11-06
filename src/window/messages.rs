@@ -95,6 +95,12 @@ pub const WM_FASTPAD_LIVE_MENU: u32 = WM_APP + 0x5F;
 /// `preview::view::MenuRequest` that lives for the call. Sent to the main window, which shows the
 /// menu and runs the choice. Not part of the deferred chain.
 pub const WM_FASTPAD_PREVIEW_MENU: u32 = WM_APP + 0x60;
+/// Not part of the deferred chain: a folder move's progress to another drive (multi-root move
+/// spec §3.3): `wParam` the move's generation, `lParam` `move_worker::pack(copied, total)`.
+pub const WM_FASTPAD_MOVE_PROGRESS: u32 = WM_APP + 0x61;
+/// Not part of the deferred chain: a folder move's outcome (`move_worker::Done`), as a `Box` the
+/// receiver frees. A post that fails because the window is gone is freed on the worker.
+pub const WM_FASTPAD_MOVE_DONE: u32 = WM_APP + 0x62;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeferredAction {

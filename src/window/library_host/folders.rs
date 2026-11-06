@@ -192,6 +192,9 @@ pub(crate) fn delete_folder_of(hwnd: HWND, notebook: NotebookId, relative: &Path
     let Some(root) = notebook_folder(hwnd, notebook) else {
         return;
     };
+    if crate::window::cross_move_host::refuse_item_if_moving(hwnd, &root.join(relative)) {
+        return;
+    }
     // Defence in depth: an empty or escaping path would recycle the notebook root or a folder
     // outside it.
     if !library::tree::is_plain_relative_folder(relative) {

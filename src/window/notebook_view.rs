@@ -148,6 +148,9 @@ pub(crate) struct RootKey {
     pub(crate) root_expanded: bool,
     /// Its scan stopped at the limit: a row after its last says so.
     pub(crate) truncated: bool,
+    /// A folder of it moving to another drive, and its progress row's text
+    /// (`cross_move_host::moving_row`).
+    pub(crate) moving: Option<(PathBuf, String)>,
 }
 
 /// The root `…` menu's "Set as default notebook", a local action on a reused command id.
@@ -160,6 +163,7 @@ pub(crate) const fn placeholder_text(placeholder: tree::Placeholder) -> &'static
         tree::Placeholder::Failed => PLACEHOLDER_FAILED,
         tree::Placeholder::Empty => PLACEHOLDER_EMPTY,
         tree::Placeholder::Truncated => TRUNCATED_ROW,
+        tree::Placeholder::Moving => "Moving…",
     }
 }
 
@@ -551,8 +555,12 @@ pub(crate) struct NotebookView {
     /// distance, which moves or copies (tree drag spec §3, open editors spec §4.3); or an
     /// Explorer drag over the panel.
     pub(crate) drag: Option<Drag>,
-    /// The notebook `drag` moves or copies within (multi-root notebooks spec §4.5).
+    /// The notebook `drag` comes from: a dragged row's own; for a tab or files, the one under
+    /// the pointer.
     pub(crate) drag_notebook: Option<NotebookId>,
+    /// The notebook under the pointer, whose folders the drag targets (multi-root move spec
+    /// §3.1).
+    pub(crate) drop_notebook: Option<NotebookId>,
     /// The right press that cancelled a drag: its release opens no menu.
     pub(crate) eat_right_up: bool,
     /// The label following the pointer while a drag is under way (tree drag spec §3.2).
@@ -648,6 +656,7 @@ impl NotebookView {
             thumb_grab: None,
             drag: None,
             drag_notebook: None,
+            drop_notebook: None,
             eat_right_up: false,
             drag_label: None,
             tracking_leave: false,
@@ -732,10 +741,34 @@ impl NotebookView {
             if tree_rows.is_empty() {
                 rows.push(placeholder_row(id, tree::Placeholder::Empty));
             }
+            let first = rows.len();
             rows.extend(tree_rows.into_iter().map(|mut row| {
                 row.depth = row.depth.saturating_add(1);
                 ViewRow { notebook: id, row }
             }));
+            // A folder moving to another drive: its progress and Cancel, right under its row
+            // (multi-root move spec §3.3).
+            if let Some((folder, text)) = &root.moving {
+                let at = rows[first..]
+                    .iter()
+                    .position(|row| {
+                        matches!(&row.kind, RowKind::Folder(path)
+                            if crate::library::model::same_path(path, folder))
+                    })
+                    .map(|offset| first + offset);
+                if let Some(at) = at {
+                    let depth = rows[at].depth.saturating_add(1);
+                    rows.insert(
+                        at + 1,
+                        view_row(
+                            id,
+                            RowKind::Placeholder(tree::Placeholder::Moving),
+                            depth,
+                            text.clone(),
+                        ),
+                    );
+                }
+            }
             // The scan stopped at its limit: said after its root's last row.
             if root.truncated {
                 rows.push(placeholder_row(id, tree::Placeholder::Truncated));

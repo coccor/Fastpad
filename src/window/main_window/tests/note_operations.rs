@@ -763,6 +763,12 @@ fn move_to_notebook_lists_open_notebooks_first_and_updates_an_open_destination()
         crate::window::command_palette::PickerKind::MoveToNotebook,
         crate::window::command_palette::PickerChoice::Item(0),
     );
+    // B is open: its folder step comes next, the root first (multi-root move spec §3.4).
+    crate::window::library_host::picked(
+        hwnd,
+        crate::window::command_palette::PickerKind::MoveToFolder,
+        crate::window::command_palette::PickerChoice::Item(0),
+    );
     assert!(ab.b.join("a.md").exists());
     let listed = |id| {
         crate::window::library_host::with_notebook(hwnd, id, |state| {

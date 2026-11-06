@@ -4,6 +4,7 @@
 
 pub mod capture;
 pub mod capture_file;
+pub mod cross_move;
 pub mod dates;
 pub mod external;
 pub mod facts;
@@ -75,6 +76,14 @@ pub enum FolderChange {
     Added(PathBuf),
     Removed(PathBuf),
     Renamed { old: PathBuf, new: PathBuf },
+}
+
+/// What a note or folder leaving for another notebook takes with it (`LibraryState::depart`),
+/// relative to the notebook it left.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Departure {
+    pub pinned: Vec<PathBuf>,
+    pub expanded: Vec<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -1062,6 +1071,77 @@ impl LibraryState {
         let change = FolderChange::Removed(relative.to_path_buf());
         self.change_folders(&change);
         self.folder_changes.push(change);
+    }
+
+    /// Follows a note or folder (`relative`) FastPad just moved to another notebook (multi-root
+    /// move spec §4.1): its records go (`Drop`, not deleted: the note lives on elsewhere), and
+    /// it leaves the notes, the folder list, the tree and the expanded and changed folders.
+    /// Returns the pinned notes and the expanded folders it took, relative to this notebook.
+    /// Touches no disk.
+    pub fn depart(&mut self, relative: &Path, is_folder: bool) -> Departure {
+        if relative.as_os_str().is_empty() {
+            return Departure::default();
+        }
+        let under = |path: &Path| {
+            if is_folder {
+                at_or_under(path, relative)
+            } else {
+                same_path(path, relative)
+            }
+        };
+        let leaving: Vec<(ids::NoteId, PathBuf, bool)> = self
+            .library
+            .notes
+            .iter()
+            .filter(|record| !record.deleted && !record.path.is_absolute() && under(&record.path))
+            .map(|record| (record.id, record.path.clone(), record.pinned))
+            .collect();
+        let mut departure = Departure::default();
+        for (id, path, pinned) in leaving {
+            if pinned {
+                departure.pinned.push(path);
+            }
+            let _ = self.apply(PendingOp::Drop { id });
+        }
+        departure.expanded = self
+            .local
+            .expanded
+            .iter()
+            .filter(|folder| is_folder && at_or_under(folder, relative))
+            .cloned()
+            .collect();
+        self.local
+            .expanded
+            .retain(|folder| !(is_folder && at_or_under(folder, relative)));
+        self.local.changed.retain(|note| !under(note));
+        if is_folder {
+            let change = FolderChange::Removed(relative.to_path_buf());
+            self.change_folders(&change);
+            self.folder_changes.push(change);
+            self.touched.retain(|path| !at_or_under(path, relative));
+        } else {
+            let absolute = self.folder.join(relative);
+            self.remove_note(&absolute);
+        }
+        departure
+    }
+
+    /// Follows notes and folders FastPad just moved here from another notebook (multi-root
+    /// move spec §4.1): `folders` (relative, parents first) are listed, `notes` (relative) are
+    /// added from disk, and `expanded` folders open. Pins come separately, as operations.
+    pub fn arrive(&mut self, folders: &[PathBuf], notes: &[PathBuf], expanded: &[PathBuf]) {
+        for folder in folders {
+            if !self.is_folder(folder) {
+                self.add_folder(folder);
+            }
+        }
+        for note in notes {
+            let absolute = self.folder.join(note);
+            self.add_note(&absolute);
+        }
+        for folder in expanded {
+            self.local.set_expanded(folder, true);
+        }
     }
 
     /// The in-memory part of a folder change: the folder list, the notes and the tree. A

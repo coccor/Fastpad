@@ -23,9 +23,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 const CLASS: &str = "FastPadDragLabel";
-/// What a drag says over a row of another notebook than the one it came from (multi-root
-/// notebooks spec §4.5).
-pub(crate) const OTHER_NOTEBOOK_HINT: &str = "Moving between notebooks isn't supported yet";
 /// About 85% opaque: the rows under it still show through.
 const OPACITY: u8 = 217;
 // At 96 DPI: how far right of and below the pointer's hot spot the label sits, clear of the

@@ -10,8 +10,8 @@ use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, COPY_FILE_FAIL_IF_EXISTS, CopyFileExW, CreateFileW,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, GetFileInformationByHandle, GetFinalPathNameByHandleW, MOVEFILE_COPY_ALLOWED,
-    MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING, VOLUME_NAME_DOS,
+    FILE_SHARE_WRITE, GetFileInformationByHandle, GetFinalPathNameByHandleW, GetVolumePathNameW,
+    MOVEFILE_COPY_ALLOWED, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING, VOLUME_NAME_DOS,
 };
 use windows_sys::Win32::UI::Shell::{
     FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING,
@@ -129,23 +129,40 @@ pub fn copy_file_no_replace(from: &Path, to: &Path) -> Result<()> {
 pub struct Copied {
     pub files: usize,
     pub error: Option<(std::path::PathBuf, crate::FastPadError)>,
+    /// The copy created `to` itself: only then may a clean-up remove it.
+    pub created: bool,
 }
 
 /// Copies the file or folder `from` to `to`, which must not exist: a folder is created with
 /// everything in it, never merged into one that is there. Stops at the first error, and after
 /// the file in hand once `cancel` is set. An explicit stack, so a deep folder can't overflow.
 pub fn copy_tree(from: &Path, to: &Path, cancel: &std::sync::atomic::AtomicBool) -> Copied {
+    copy_tree_reporting(from, to, cancel, &mut |_| {})
+}
+
+/// `copy_tree`, calling `progress` with the running count of files after each one.
+pub fn copy_tree_reporting(
+    from: &Path,
+    to: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+    progress: &mut dyn FnMut(usize),
+) -> Copied {
     use std::sync::atomic::Ordering;
     let mut copied = Copied {
         files: 0,
         error: None,
+        created: false,
     };
     let fail = |copied: &mut Copied, path: &Path, error: crate::FastPadError| {
         copied.error = Some((path.to_path_buf(), error));
     };
     if !from.is_dir() {
         match copy_file_no_replace(from, to) {
-            Ok(()) => copied.files = 1,
+            Ok(()) => {
+                copied.files = 1;
+                copied.created = true;
+                progress(1);
+            }
             Err(error) => fail(&mut copied, from, error),
         }
         return copied;
@@ -158,6 +175,9 @@ pub fn copy_tree(from: &Path, to: &Path, cancel: &std::sync::atomic::AtomicBool)
         if let Err(error) = std::fs::create_dir(&target) {
             fail(&mut copied, &target, error.into());
             break;
+        }
+        if target == to {
+            copied.created = true;
         }
         let entries = match std::fs::read_dir(&source) {
             Ok(entries) => entries,
@@ -182,7 +202,10 @@ pub fn copy_tree(from: &Path, to: &Path, cancel: &std::sync::atomic::AtomicBool)
                     return copied;
                 }
                 match copy_file_no_replace(&inner, &outer) {
-                    Ok(()) => copied.files += 1,
+                    Ok(()) => {
+                        copied.files += 1;
+                        progress(copied.files);
+                    }
                     Err(error) => {
                         fail(&mut copied, &inner, error);
                         return copied;
@@ -192,6 +215,108 @@ pub fn copy_tree(from: &Path, to: &Path, cancel: &std::sync::atomic::AtomicBool)
         }
     }
     copied
+}
+
+/// Whether `a` and `b` are on one volume (`GetVolumePathNameW`, compared ignoring case): a
+/// rename between them works. False when either can't be resolved.
+pub fn same_volume(a: &Path, b: &Path) -> bool {
+    #[cfg(test)]
+    if FORCE_OTHER_VOLUME.with(std::cell::Cell::get) {
+        return false;
+    }
+    match (volume_of(a), volume_of(b)) {
+        (Some(a), Some(b)) => a.to_lowercase() == b.to_lowercase(),
+        _ => false,
+    }
+}
+
+/// The root of the volume `path` is on (`C:\`, a mount point, `\\server\share\`).
+fn volume_of(path: &Path) -> Option<String> {
+    let path_wide = wide(path);
+    let mut buffer = vec![0u16; 1024];
+    let ok =
+        unsafe { GetVolumePathNameW(path_wide.as_ptr(), buffer.as_mut_ptr(), buffer.len() as u32) };
+    if ok == 0 {
+        return None;
+    }
+    let end = buffer.iter().position(|&unit| unit == 0)?;
+    Some(String::from_utf16_lossy(&buffer[..end]))
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_OTHER_VOLUME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Makes `same_volume` answer false on this thread, as two drives would.
+#[cfg(test)]
+pub fn force_other_volume_for_test(on: bool) {
+    FORCE_OTHER_VOLUME.with(|force| force.set(on));
+}
+
+/// The files under a folder when a copy of it started: path relative to it, size, write time.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Snapshot(pub Vec<(std::path::PathBuf, u64, u64)>);
+
+/// Why a copy does not match its source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Mismatch {
+    /// A source file has no copy (relative path).
+    Missing(std::path::PathBuf),
+    /// A copy's size differs from its source's.
+    Size(std::path::PathBuf),
+    /// The source file changed after the snapshot.
+    Changed(std::path::PathBuf),
+}
+
+/// The files under `root` now.
+pub fn snapshot(root: &Path) -> std::io::Result<Snapshot> {
+    use std::os::windows::fs::MetadataExt;
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(folder) = stack.pop() {
+        for entry in std::fs::read_dir(&folder)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                stack.push(path);
+            } else {
+                let metadata = entry.metadata()?;
+                let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+                files.push((relative, metadata.len(), metadata.last_write_time()));
+            }
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(Snapshot(files))
+}
+
+/// Whether `copy` holds every file of `before` (taken of `source`) at its size, and `source`
+/// still matches `before`.
+pub fn verify_copy(
+    source: &Path,
+    copy: &Path,
+    before: &Snapshot,
+) -> std::result::Result<(), Mismatch> {
+    use std::os::windows::fs::MetadataExt;
+    for (relative, size, mtime) in &before.0 {
+        let Ok(copied) = std::fs::metadata(copy.join(relative)) else {
+            return Err(Mismatch::Missing(relative.clone()));
+        };
+        if copied.len() != *size {
+            return Err(Mismatch::Size(relative.clone()));
+        }
+        let now = std::fs::metadata(source.join(relative));
+        if !now.is_ok_and(|now| now.len() == *size && now.last_write_time() == *mtime) {
+            return Err(Mismatch::Changed(relative.clone()));
+        }
+    }
+    Ok(())
+}
+
+/// How many files are under `root`, for a copy's progress.
+pub fn count_files(root: &Path) -> usize {
+    snapshot(root).map_or(0, |snapshot| snapshot.0.len())
 }
 
 /// Opens the file or folder at `path` for its attributes only: no access asked for, any sharing
@@ -491,5 +616,74 @@ mod tests {
             crate::platform::paths::notes_folder_in(&documents),
             documents.join("FastPad")
         );
+    }
+
+    #[test]
+    fn same_volume_is_true_inside_one_folder_and_false_when_forced() {
+        let dir = scratch("volume");
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        assert!(same_volume(&dir.join("a"), &dir.join("b")));
+        force_other_volume_for_test(true);
+        assert!(!same_volume(&dir.join("a"), &dir.join("b")));
+        force_other_volume_for_test(false);
+        assert!(same_volume(&dir.join("a"), &dir.join("b")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn three_files(dir: &Path) -> std::path::PathBuf {
+        let source = dir.join("src");
+        std::fs::create_dir_all(source.join("deep")).unwrap();
+        std::fs::write(source.join("a.md"), "aaa").unwrap();
+        std::fs::write(source.join("b.md"), "bb").unwrap();
+        std::fs::write(source.join("deep").join("c.md"), "c").unwrap();
+        source
+    }
+
+    #[test]
+    fn copy_tree_reporting_counts_each_file() {
+        let dir = scratch("progress");
+        let source = three_files(&dir);
+        assert_eq!(count_files(&source), 3);
+        let mut seen = Vec::new();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let copied = copy_tree_reporting(&source, &dir.join("out"), &cancel, &mut |n| seen.push(n));
+        assert!(copied.error.is_none());
+        assert_eq!(seen, vec![1, 2, 3]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_copy_accepts_a_faithful_copy_and_names_each_mismatch() {
+        // Break caught: a source recycled after a copy that missed a file, cut one short, or
+        // copied a file that was then written again.
+        let dir = scratch("verify");
+        let source = three_files(&dir);
+        let before = snapshot(&source).unwrap();
+        assert_eq!(before.0.len(), 3);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let out = dir.join("out");
+        assert!(copy_tree(&source, &out, &cancel).error.is_none());
+        assert_eq!(verify_copy(&source, &out, &before), Ok(()));
+        std::fs::write(out.join("b.md"), "b").unwrap();
+        assert_eq!(
+            verify_copy(&source, &out, &before),
+            Err(Mismatch::Size("b.md".into()))
+        );
+        std::fs::write(out.join("b.md"), "bb").unwrap();
+        std::fs::remove_file(out.join("deep").join("c.md")).unwrap();
+        assert_eq!(
+            verify_copy(&source, &out, &before),
+            Err(Mismatch::Missing(
+                std::path::PathBuf::from("deep").join("c.md")
+            ))
+        );
+        std::fs::write(out.join("deep").join("c.md"), "c").unwrap();
+        std::fs::write(source.join("a.md"), "changed").unwrap();
+        assert_eq!(
+            verify_copy(&source, &out, &before),
+            Err(Mismatch::Changed("a.md".into()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

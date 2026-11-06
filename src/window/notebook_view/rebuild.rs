@@ -27,6 +27,8 @@ pub(super) struct RootSnapshot {
     pub(super) failed: bool,
     /// Its scan stopped at the limit.
     pub(super) truncated: bool,
+    /// A folder of it moving to another drive, and its progress row's text.
+    pub(super) moving: Option<(PathBuf, String)>,
 }
 
 /// What a rebuild read from the library, the tabs and `folders.ini`'s cache.
@@ -64,6 +66,7 @@ pub(super) fn rebuild_key(hwnd: HWND) -> RebuildKey {
                 expansion,
                 root_expanded: library_host::root_expanded_of(hwnd, id),
                 truncated: truncated.unwrap_or(false),
+                moving: crate::window::cross_move_host::moving_row(hwnd, id),
             }
         })
         .collect();
@@ -123,6 +126,7 @@ pub(super) fn snapshot(hwnd: HWND) -> Snapshot {
                 rows,
                 failed: root.failed,
                 truncated: root.truncated,
+                moving: root.moving.clone(),
             }
         })
         .collect();

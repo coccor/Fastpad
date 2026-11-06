@@ -177,6 +177,20 @@ fn save_active_to(
         }
         return SaveOutcome::Failed;
     }
+    // A tab inside a folder moving to another drive keeps its edits until the move ends, then
+    // saves where the folder landed (multi-root move spec §3.3). Save As and a first save never
+    // write into it either: the copy would miss the file (final review 2).
+    let writes_to = new_path.clone().or_else(|| {
+        unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.tabs.active()?.path.clone())
+    });
+    if let Some(path) = writes_to
+        && crate::window::cross_move_host::holds(hwnd, &path)
+    {
+        if report_failure {
+            crate::window::cross_move_host::refuse_if_moving(hwnd, &path);
+        }
+        return SaveOutcome::Failed;
+    }
     let mut original_path: Option<std::path::PathBuf> = None;
     if let Some(path) = new_path {
         original_path = unsafe { app_ptr(hwnd) }

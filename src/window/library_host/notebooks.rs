@@ -494,6 +494,11 @@ pub(crate) fn close_notebook_of(hwnd: HWND, id: NotebookId) -> bool {
     let Some(closing) = notebook_folder(hwnd, id) else {
         return true;
     };
+    // A folder moving out of it asks first; one moving into it is cancelled (multi-root move
+    // spec §3.3).
+    if !crate::window::cross_move_host::may_close(hwnd, Some(id)) {
+        return false;
+    }
     if !save_before_leaving_of(hwnd, id) {
         return false;
     }

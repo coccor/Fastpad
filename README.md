@@ -202,9 +202,15 @@ notebook**. New notes and folders go to
 the notebook you're working in, otherwise the default one, and quick capture always uses the
 default. Search, Replace in files, Quick Open and Tags cover every open notebook, and each result
 names its notebook (`Work › projects`); the **All notebooks ▾** button in the Search view narrows a
-search to one notebook. Wikilinks stay inside
-their own notebook, and notes can't be dragged between notebooks yet: **Note: Move to notebook…**
-(**`Ctrl+Shift+M`**) moves a note to another notebook. FastPad reopens the same
+search to one notebook. Wikilinks stay inside their own notebook.
+
+Drag a note or folder onto any folder of another notebook to move it there (hold **Ctrl** to copy
+instead); its open tabs, pin and expanded folders go with it. If the move would break wikilinks,
+FastPad says how many first, and if the notes use images from the old notebook's attachments
+folder it offers to bring them along (**Move with images**). A folder going to a notebook on
+another drive is copied, checked, and only then sent to the Recycle Bin, with its progress and a
+Cancel on its row. From the keyboard, **Note: Move to notebook…** (**`Ctrl+Shift+M`**) moves the
+selected note or folder: pick the notebook, then a folder in it. FastPad reopens the same
 notebooks next time (`folders.ini` keeps them as `open=` lines, with the default marked
 `default=`). A notebook that isn't available at startup, such as one on an unplugged drive, is
 skipped with a notice but stays remembered until its drive returns.
