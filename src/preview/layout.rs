@@ -208,6 +208,7 @@ pub fn block_has_target(kind: &BlockKind) -> bool {
         BlockKind::Table { head, rows, .. } => {
             head.iter().any(rich) || rows.iter().flatten().any(rich)
         }
+        BlockKind::Properties(rows) => rows.iter().any(|(key, value)| rich(key) || rich(value)),
         BlockKind::Code { .. } | BlockKind::Rule => false,
     }
 }
@@ -476,7 +477,7 @@ impl<'a> LayoutContext<'a> {
                         layout.SetDrawingEffect(self.brushes.get(ColorRole::Link), range)
                     }
                     // Drawn as a fill behind the text by `push_laid_text`.
-                    InlineStyle::Mark => Ok(()),
+                    InlineStyle::Mark | InlineStyle::Chip => Ok(()),
                 }
             }
             .map_err(hresult_error)?;
@@ -796,6 +797,9 @@ fn layout_kind(
         } => push_details(
             context, *open, summary, children, x, y, width, style, output, margin,
         ),
+        BlockKind::Properties(rows) => {
+            push_properties(context, rows, x, y, width, style, output, margin)
+        }
     }
 }
 
@@ -882,6 +886,21 @@ fn push_laid_text(
                         rect: rect.inflate(unit),
                         radius: 2.0 * unit,
                         role: ColorRole::Mark,
+                    });
+                }
+            }
+            InlineStyle::Chip => {
+                for rect in range_rects(&layout, span.range.start, span.range.end, x, y)? {
+                    let rect = rect.inflate(2.0 * unit);
+                    output.ops.push(DrawOp::RoundedFill {
+                        rect,
+                        radius: 4.0 * unit,
+                        role: ColorRole::CodeBackground,
+                    });
+                    output.ops.push(DrawOp::RoundedStroke {
+                        rect,
+                        radius: 4.0 * unit,
+                        role: ColorRole::Border,
                     });
                 }
             }
@@ -1483,6 +1502,11 @@ fn push_details(
         .and_then(|key| context.details.get(key))
         .copied()
         .unwrap_or(open_attribute);
+    if let [BlockKind::Properties(rows)] = children {
+        return push_properties_panel(
+            context, open, key, summary, rows, children, x, y, width, style, output, margin,
+        );
+    }
     let marker = context.plain_layout(
         if open { "\u{25BE}" } else { "\u{25B8}" },
         false,
@@ -1553,6 +1577,237 @@ fn push_details(
         output.next_details += details;
     }
     Ok(Extent { content, margin })
+}
+
+/// The front matter's section: a rounded panel whose header row is the disclosure (triangle,
+/// summary, how many properties, and while collapsed the first few short values), and whose
+/// properties show below a divider when open.
+#[allow(clippy::too_many_arguments)]
+fn push_properties_panel(
+    context: &LayoutContext<'_>,
+    open: bool,
+    key: Option<DetailsKey>,
+    summary: &RichText,
+    rows: &[(RichText, RichText)],
+    children: &[BlockKind],
+    x: f32,
+    y: f32,
+    width: f32,
+    style: Style,
+    output: &mut Output<'_>,
+    margin: f32,
+) -> Result<Extent> {
+    let unit = context.fonts.unit();
+    let (pad_x, pad_y) = (12.0 * unit, 6.0 * unit);
+    let panel_index = output.ops.len();
+    let inner_x = x + pad_x;
+    let inner_width = (width - 2.0 * pad_x).max(1.0);
+    let marker = context.plain_layout(
+        if open { "\u{25BE}" } else { "\u{25B8}" },
+        false,
+        context.fonts.body_size,
+        DWRITE_FONT_WEIGHT_NORMAL,
+        100.0,
+    )?;
+    let marker_width = metrics(&marker)?.widthIncludingTrailingWhitespace + 4.0 * unit;
+    let row_top = y + pad_y;
+    // The row's disclosure comes before links inside the summary in keyboard order.
+    let target_index = output.targets.len();
+    let title = context.rich_layout(
+        summary,
+        context.fonts.body_size,
+        DWRITE_FONT_WEIGHT_SEMI_BOLD,
+        (inner_width - marker_width).max(1.0),
+        inner_width,
+    )?;
+    let title_width = metrics(&title.layout)?.width;
+    let summary_height = push_laid_text(
+        context,
+        summary,
+        title,
+        inner_x + marker_width,
+        row_top,
+        style.role,
+        false,
+        output,
+    )?;
+    // The count, and while collapsed a peek at the first short values: decoration, not text.
+    let after = inner_x + marker_width + title_width + 8.0 * unit;
+    let room = inner_x + inner_width - after;
+    let separator = "  \u{00B7}  ";
+    let mut detail = rows.len().to_string();
+    if !open {
+        let values = rows
+            .iter()
+            .map(|(_, value)| value.plain_text().trim())
+            .filter(|value| !value.is_empty() && value.chars().count() <= 32)
+            .take(3)
+            .collect::<Vec<_>>();
+        for count in (1..=values.len()).rev() {
+            let candidate = format!(
+                "{}{separator}{}",
+                rows.len(),
+                values[..count].join(separator)
+            );
+            let probe = context.plain_layout(
+                &candidate,
+                false,
+                context.fonts.body_size,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                100_000.0,
+            )?;
+            if metrics(&probe)?.widthIncludingTrailingWhitespace <= room {
+                detail = candidate;
+                break;
+            }
+        }
+    }
+    if room > 0.0 {
+        let layout = context.plain_layout(
+            &detail,
+            false,
+            context.fonts.body_size,
+            DWRITE_FONT_WEIGHT_NORMAL,
+            room,
+        )?;
+        unsafe { layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP) }.map_err(hresult_error)?;
+        output.ops.push(DrawOp::Text {
+            layout,
+            x: after,
+            y: row_top,
+            role: ColorRole::Muted,
+            run: None,
+        });
+    }
+    let row_height = summary_height.max(context.line_height);
+    let row_bottom = row_top + row_height + pad_y;
+    if let Some(key) = key {
+        output.targets.insert(
+            target_index,
+            Target {
+                kind: TargetKind::Disclosure {
+                    key,
+                    expanded: open,
+                },
+                text: summary_text(summary.plain_text()),
+                rects: vec![RectF::new(x, y, x + width, row_bottom)],
+                layout: marker.clone(),
+                range: text_range(0, 1),
+                scrolls: false,
+                clip: None,
+            },
+        );
+    }
+    output.ops.push(DrawOp::Text {
+        layout: marker,
+        x: inner_x,
+        y: row_top,
+        role: ColorRole::Muted,
+        run: None,
+    });
+    let mut bottom = row_bottom;
+    if open {
+        output.ops.push(DrawOp::Fill {
+            rect: RectF::new(x, bottom, x + width, bottom + 1.0),
+            role: ColorRole::Border,
+        });
+        let top = bottom + 1.0 + 8.0 * unit;
+        let inner = layout_children(context, children, inner_x, top, inner_width, style, output)?;
+        bottom = top + inner + 8.0 * unit;
+    } else {
+        let (headings, details) = count_nested(children);
+        output.next_heading += headings;
+        output.next_details += details;
+    }
+    let panel = RectF::new(x, y, x + width, bottom);
+    output.ops.insert(
+        panel_index,
+        DrawOp::RoundedStroke {
+            rect: panel,
+            radius: 6.0 * unit,
+            role: ColorRole::Border,
+        },
+    );
+    output.ops.insert(
+        panel_index,
+        DrawOp::RoundedFill {
+            rect: panel,
+            radius: 6.0 * unit,
+            role: ColorRole::CodeBackground,
+        },
+    );
+    Ok(Extent {
+        content: bottom - y,
+        margin,
+    })
+}
+
+/// Front matter properties: each key, muted, in a column as wide as the widest key (at most a
+/// third of the width), and its value beside it, wrapping within the rest.
+#[allow(clippy::too_many_arguments)]
+fn push_properties(
+    context: &LayoutContext<'_>,
+    rows: &[(RichText, RichText)],
+    x: f32,
+    y: f32,
+    width: f32,
+    style: Style,
+    output: &mut Output<'_>,
+    margin: f32,
+) -> Result<Extent> {
+    let unit = context.fonts.unit();
+    let gap = 16.0 * unit;
+    let mut key_width = 0.0_f32;
+    for (key, _) in rows {
+        let layout = context.rich_layout(
+            key,
+            context.fonts.body_size,
+            DWRITE_FONT_WEIGHT_NORMAL,
+            100_000.0,
+            width,
+        )?;
+        key_width = key_width.max(metrics(&layout.layout)?.widthIncludingTrailingWhitespace);
+    }
+    let key_width = key_width.min(width / 3.0).max(1.0);
+    let value_x = x + key_width + gap;
+    let value_width = (width - key_width - gap).max(1.0);
+    let mut cursor = y;
+    for (index, (key, value)) in rows.iter().enumerate() {
+        if index > 0 {
+            cursor += 4.0 * unit;
+        }
+        let key_height = push_rich_text(
+            context,
+            key,
+            context.fonts.body_size,
+            DWRITE_FONT_WEIGHT_NORMAL,
+            x,
+            cursor,
+            key_width,
+            TextAlign::Inherit,
+            ColorRole::Muted,
+            false,
+            output,
+        )?;
+        let value_height = push_rich_text(
+            context,
+            value,
+            context.fonts.body_size,
+            DWRITE_FONT_WEIGHT_NORMAL,
+            value_x,
+            cursor,
+            value_width,
+            TextAlign::Inherit,
+            style.role,
+            false,
+            output,
+        )?;
+        cursor += key_height.max(value_height).max(context.line_height);
+    }
+    Ok(Extent {
+        content: cursor - y,
+        margin,
+    })
 }
 
 /// A GitHub alert: a quote whose bar and bold title (its kind) are drawn in the link colour, and

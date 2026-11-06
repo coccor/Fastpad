@@ -271,6 +271,19 @@ impl<'a> Walk<'a, '_> {
                 }
                 self.frames.pop();
             }
+            // Copied as a table's body rows (row 0 is a table's header): key, then value.
+            BlockKind::Properties(rows) => {
+                if !visible {
+                    return;
+                }
+                self.enter(Frame::Table);
+                for (row, (key, value)) in rows.iter().enumerate() {
+                    let row = row + 1;
+                    self.push(RunText::Rich(key), RunKind::Cell { row, column: 0 });
+                    self.push(RunText::Rich(value), RunKind::Cell { row, column: 1 });
+                }
+                self.frames.pop();
+            }
             BlockKind::Details {
                 open,
                 summary,
@@ -605,7 +618,7 @@ fn style_open(style: &InlineStyle) -> Option<String> {
         InlineStyle::Mark => "<mark>".to_owned(),
         InlineStyle::Small => "<small>".to_owned(),
         InlineStyle::Keyboard => "<kbd>".to_owned(),
-        InlineStyle::Tag(_) => return None,
+        InlineStyle::Tag(_) | InlineStyle::Chip => return None,
     })
 }
 
@@ -622,7 +635,7 @@ fn style_close(style: &InlineStyle) -> &'static str {
         InlineStyle::Mark => "</mark>",
         InlineStyle::Small => "</small>",
         InlineStyle::Keyboard => "</kbd>",
-        InlineStyle::Tag(_) => "",
+        InlineStyle::Tag(_) | InlineStyle::Chip => "",
     }
 }
 

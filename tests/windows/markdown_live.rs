@@ -2290,7 +2290,7 @@ fn an_external_change_while_live_rerenders() {
 }
 
 #[test]
-fn front_matter_is_dimmed_and_not_a_heading() {
+fn front_matter_is_a_code_block_and_not_a_heading() {
     let (_scintilla, main, view) = live_tab("---\ntitle: x\n---\n\n# H\n");
     caret_to(&main, 18);
     let (front, revealed, height) = shown_line(view, 1);
@@ -2300,11 +2300,17 @@ fn front_matter_is_dimmed_and_not_a_heading() {
         height < view.row_metrics().0 as f32 * 1.5,
         "not a heading: {height}"
     );
-    assert_eq!(
-        shown_line(view, 2).0,
-        "---",
-        "the closing line is not a setext underline"
+    // The `---` lines are the block's fences: hidden, as a code block's are.
+    let (fence, _, fence_height) = shown_line(view, 2);
+    assert_eq!(fence, "", "the closing line is a fence");
+    assert!(
+        fence_height < view.row_metrics().0 as f32 * 1.5,
+        "the closing line is not a setext underline: {fence_height}"
     );
+    caret_to(&main, 5);
+    let (source, revealed, _) = shown_line(view, 2);
+    assert_eq!(source, "---");
+    assert!(revealed, "the caret's block shows its source");
 }
 
 /// `lines` lines of filler after `head`, so the view can scroll.
