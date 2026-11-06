@@ -287,7 +287,11 @@ pub(super) fn quick_open_rows(
     }
     let searchable = library_host::searchable_notebooks(hwnd);
     if searchable.is_empty() {
-        return (vec![PickerRow::Notice(command_palette::NO_NOTEBOOK)], None);
+        // Open but still loading lists nothing yet; only no notebook at all says so.
+        if library_host::notebooks(hwnd).is_empty() {
+            return (vec![PickerRow::Notice(command_palette::NO_NOTEBOOK)], None);
+        }
+        return (Vec::new(), None);
     }
     let several = library_host::several_notebooks(hwnd);
     let label_of = |id: library_host::NotebookId, found: QuickMatch| match searchable

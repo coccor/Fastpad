@@ -80,6 +80,8 @@ pub(super) fn clear_search(hwnd: HWND) {
 /// the view is hidden, once it shows again. With no notebook open at all, the query and the
 /// results are cleared.
 pub(crate) fn library_changed(hwnd: HWND) {
+    // A replace writing into a notebook that just closed stops writing there.
+    text_search_host::stop_closed_parts(hwnd);
     let open = library_host::notebooks(hwnd);
     let several = open.len() > 1;
     let all = library_host::searchable_notebooks(hwnd);

@@ -111,6 +111,9 @@ pub(crate) struct TextSearchHost {
     /// The notebooks the replace in hand writes into, and their folders: its report lands there,
     /// whatever the Search view shows by then (multi-root search spec §4.5).
     replace_notebooks: Vec<(NotebookId, PathBuf)>,
+    /// Each write part's stop flag, by notebook and folder: set when that notebook closes, so
+    /// the worker skips the rest of its part (spec §4.5).
+    part_stops: Vec<(NotebookId, PathBuf, Arc<AtomicBool>)>,
 }
 
 fn with_host<R>(hwnd: HWND, f: impl FnOnce(&mut TextSearchHost) -> R) -> Option<R> {
@@ -1029,7 +1032,9 @@ fn apply_plan(hwnd: HWND, generation: u64, plan: ReplacePlan, warned: bool) {
             writes.push(WritePart {
                 id: part.id,
                 folder: part.folder,
+                label: part.label,
                 targets: closed,
+                stop: Arc::new(AtomicBool::new(false)),
             });
         }
     }
@@ -1062,6 +1067,12 @@ fn apply_plan(hwnd: HWND, generation: u64, plan: ReplacePlan, warned: bool) {
     }) else {
         return;
     };
+    with_host(hwnd, |host| {
+        host.part_stops = writes
+            .iter()
+            .map(|part| (part.id, part.folder.clone(), Arc::clone(&part.stop)))
+            .collect();
+    });
     // The notebook watchers will report these writes: they are FastPad's own, not outside
     // changes.
     let own = writes
@@ -1097,7 +1108,10 @@ fn apply_plan(hwnd: HWND, generation: u64, plan: ReplacePlan, warned: bool) {
 struct WritePart {
     id: NotebookId,
     folder: PathBuf,
+    label: String,
     targets: Vec<ReplaceTarget>,
+    /// Set when the notebook closes while the write runs (`stop_closed_parts`).
+    stop: Arc<AtomicBool>,
 }
 
 /// Everything the write worker owns.
@@ -1134,10 +1148,27 @@ fn spawn_write(hwnd: HWND, job: WriteJob) -> JoinHandle<()> {
         #[cfg(test)]
         let _ended = writer_hooks::Ended;
         let mut reports = Vec::with_capacity(parts.len());
+        let mut closed = closed;
         for part in &parts {
-            let report =
-                text_replace::apply(&part.folder, &part.targets, &matcher, &template, &cancel);
-            reports.push((part.id, report));
+            #[cfg(test)]
+            if !std::ptr::eq(part, &parts[0]) {
+                writer_hooks::pause();
+            }
+            let stopped = || part.stop.load(Ordering::Relaxed);
+            if !stopped() {
+                let report = text_replace::apply_until(
+                    &part.folder,
+                    &part.targets,
+                    &matcher,
+                    &template,
+                    &mut || cancel.load(Ordering::Relaxed) || stopped(),
+                );
+                reports.push((part.id, report));
+            }
+            // Closed before or during its part: the rest of it is skipped, and said so.
+            if stopped() {
+                closed.push(part.label.clone());
+            }
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
@@ -1332,6 +1363,19 @@ fn apply_reloads(hwnd: HWND, reloaded: ReplaceReloaded) {
     }
 }
 
+/// A notebook may have closed (`search_view::library_changed`): a write still running skips the
+/// rest of that notebook's part (multi-root search spec §4.5).
+pub(crate) fn stop_closed_parts(hwnd: HWND) {
+    let stops = with_host(hwnd, |host| host.part_stops.clone()).unwrap_or_default();
+    for (id, folder, stop) in stops {
+        let open =
+            library_host::notebook_folder(hwnd, id).is_some_and(|open| same_path(&open, &folder));
+        if !open {
+            stop.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Ends the replace in hand: another may start, and the Search view's results open again.
 fn finish_replace(hwnd: HWND) {
     with_host(hwnd, |host| {
@@ -1339,6 +1383,7 @@ fn finish_replace(hwnd: HWND) {
         host.applying = false;
         host.replace_cancel = None;
         host.replace_notebooks.clear();
+        host.part_stops.clear();
     });
     search_view::set_replacing(hwnd, false);
 }
@@ -1355,6 +1400,7 @@ pub(crate) fn cancel_replace(hwnd: HWND) {
         host.replacing = false;
         host.applying = false;
         host.replace_notebooks.clear();
+        host.part_stops.clear();
         host.held = None;
         host.held_written = None;
         !host.held_reloads.is_empty()
@@ -1545,6 +1591,23 @@ pub(crate) fn generation(hwnd: HWND) -> u64 {
 #[cfg(test)]
 pub(crate) fn cancel_flag(hwnd: HWND) -> Option<Arc<AtomicBool>> {
     with_host(hwnd, |host| host.cancel.clone()).flatten()
+}
+
+/// A boxed batch, as the worker posts it, its hits found in the notebook `notebook`.
+#[cfg(test)]
+pub(crate) fn test_batch_in(
+    generation: u64,
+    notebook: NotebookId,
+    hits: Vec<TextHit>,
+    end: Option<RunEnd>,
+) -> LPARAM {
+    Box::into_raw(Box::new(SearchBatch {
+        generation,
+        hits: hits.into_iter().map(|hit| (notebook, hit)).collect(),
+        progress: Progress::default(),
+        end,
+        skipped: Vec::new(),
+    })) as LPARAM
 }
 
 /// A boxed batch, as the worker posts it, its hits found in the first notebook the view searches.

@@ -139,7 +139,7 @@ pub fn apply(
 }
 
 /// `apply`'s loop, asking `cancelled` before each note.
-fn apply_until(
+pub fn apply_until(
     notebook: &Path,
     targets: &[ReplaceTarget],
     matcher: &Matcher,

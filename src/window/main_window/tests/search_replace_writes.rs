@@ -1025,3 +1025,40 @@ fn replace_skips_a_notebook_closed_mid_replace() {
         "beta needle"
     );
 }
+
+#[test]
+fn closing_a_notebook_while_the_write_runs_skips_its_part() {
+    // Break caught (final review): B closed while the write worker is still on A, and B's
+    // notes written anyway after it closed, the report not saying so (spec §4.5).
+    use crate::window::text_search_host::writer_hooks;
+    struct Unpause;
+    impl Drop for Unpause {
+        fn drop(&mut self) {
+            writer_hooks::set_pause(0);
+        }
+    }
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("replace-close-mid-write", "alpha needle", "beta needle");
+    let hwnd = ab.window.hwnd;
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Search, false);
+    search_to_replace(hwnd, "needle", "pin");
+    crate::window::modal::take_last_confirm();
+    let _unpause = Unpause;
+    // The worker waits between the notebooks' parts (and after the last).
+    writer_hooks::set_pause(400);
+    crate::window::answer_next_confirm(|_| true);
+    crate::window::text_search_host::replace_all(hwnd);
+    let a = ab.a.join("a.md");
+    pump_until(hwnd, || {
+        std::fs::read_to_string(&a).is_ok_and(|text| text == "alpha pin")
+    });
+    assert!(crate::window::library_host::close_notebook_of(
+        hwnd, ab.b_id
+    ));
+    let report = wait_for_report(hwnd);
+    assert!(report.ends_with("Skipped B: it was closed."), "{report}");
+    assert_eq!(
+        std::fs::read_to_string(ab.b.join("b.md")).unwrap(),
+        "beta needle"
+    );
+}

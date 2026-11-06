@@ -206,6 +206,11 @@ impl SearchView {
                 if hover {
                     paint_hover(paint.hdc, scope, &palette, paint.background, dpi);
                 }
+                if self.scope_focused
+                    && windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() == self.panel
+                {
+                    crate::window::design::round::paint_focus_ring(paint.hdc, scope, &palette, dpi);
+                }
                 let inset = scale(SCOPE_INSET_AT_96_DPI, dpi);
                 draw_text(
                     paint.hdc,

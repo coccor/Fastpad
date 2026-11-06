@@ -813,6 +813,34 @@ fn quick_open_empty_query_lists_tabs_from_both() {
 }
 
 #[test]
+fn quick_open_while_the_notebook_loads_says_no_notebook_is_open_never() {
+    // Break caught (final review): Ctrl+P right after startup, while the only notebook is still
+    // loading, saying "No notebook is open", which is false and a changed one-notebook string.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("quick-open-loading");
+    std::fs::write(scratch.folder().join("n.md"), "n").unwrap();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).library.data_dir = Some(scratch.data());
+    ensure_sidebar(window.hwnd);
+    // Opened, but its load's answer is not pumped: it is still loading.
+    crate::window::library_host::open_folder(window.hwnd, &scratch.folder());
+    execute_command(window.hwnd, CommandId::QuickOpen);
+    type_query(window.hwnd, "n.md");
+    let notice = format!(
+        "{:?}",
+        crate::window::command_palette::PickerRow::Notice(
+            crate::window::command_palette::NO_NOTEBOOK
+        )
+    );
+    assert!(
+        !quick_open_names(window.hwnd).contains(&notice),
+        "{:?}",
+        quick_open_names(window.hwnd)
+    );
+}
+
+#[test]
 fn quick_open_with_one_notebook_is_unchanged() {
     // Break caught: the notebook name leaking into rows or the placeholder with one notebook.
     let _scintilla = load_native_scintilla();

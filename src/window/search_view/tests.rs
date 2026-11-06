@@ -602,23 +602,39 @@ fn tab_cycles_the_box_the_replace_field_and_the_results_and_wraps() {
     // empty result list, or Shift+Tab not the exact reverse.
     use FocusStop::{Box, Replace, Results};
     // The replace field open, results listed: Box -> Replace -> Results -> Box.
-    assert_eq!(next_stop(Box, false, true, true), Replace);
-    assert_eq!(next_stop(Replace, false, true, true), Results);
-    assert_eq!(next_stop(Results, false, true, true), Box);
-    assert_eq!(next_stop(Box, true, true, true), Results);
-    assert_eq!(next_stop(Results, true, true, true), Replace);
-    assert_eq!(next_stop(Replace, true, true, true), Box);
+    assert_eq!(next_stop(Box, false, true, true, false), Replace);
+    assert_eq!(next_stop(Replace, false, true, true, false), Results);
+    assert_eq!(next_stop(Results, false, true, true, false), Box);
+    assert_eq!(next_stop(Box, true, true, true, false), Results);
+    assert_eq!(next_stop(Results, true, true, true, false), Replace);
+    assert_eq!(next_stop(Replace, true, true, true, false), Box);
     // The replace field closed: Box <-> Results.
-    assert_eq!(next_stop(Box, false, false, true), Results);
-    assert_eq!(next_stop(Results, false, false, true), Box);
-    assert_eq!(next_stop(Box, true, false, true), Results);
-    assert_eq!(next_stop(Results, true, false, true), Box);
+    assert_eq!(next_stop(Box, false, false, true, false), Results);
+    assert_eq!(next_stop(Results, false, false, true, false), Box);
+    assert_eq!(next_stop(Box, true, false, true, false), Results);
+    assert_eq!(next_stop(Results, true, false, true, false), Box);
     // No results: the fields only, or the box stays put alone.
-    assert_eq!(next_stop(Box, false, true, false), Replace);
-    assert_eq!(next_stop(Replace, false, true, false), Box);
-    assert_eq!(next_stop(Replace, true, true, false), Box);
-    assert_eq!(next_stop(Box, false, false, false), Box);
-    assert_eq!(next_stop(Box, true, false, false), Box);
+    assert_eq!(next_stop(Box, false, true, false, false), Replace);
+    assert_eq!(next_stop(Replace, false, true, false, false), Box);
+    assert_eq!(next_stop(Replace, true, true, false, false), Box);
+    assert_eq!(next_stop(Box, false, false, false, false), Box);
+    assert_eq!(next_stop(Box, true, false, false, false), Box);
+}
+
+#[test]
+fn tab_reaches_the_scope_button_while_it_shows() {
+    // Break caught: a scope button keyboard users can't reach (multi-root search spec §4.1).
+    use FocusStop::{Box, Replace, Results, Scope};
+    assert_eq!(next_stop(Results, false, true, true, true), Scope);
+    assert_eq!(next_stop(Scope, false, true, true, true), Box);
+    assert_eq!(next_stop(Box, true, true, true, true), Scope);
+    assert_eq!(next_stop(Scope, true, true, true, true), Results);
+    assert_eq!(next_stop(Replace, false, true, false, true), Scope);
+    assert_eq!(
+        next_stop(Results, false, true, true, false),
+        Box,
+        "hidden: skipped"
+    );
 }
 
 #[test]

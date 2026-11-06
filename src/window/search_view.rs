@@ -239,6 +239,8 @@ pub(crate) struct SearchView {
     several: bool,
     /// The notebook the search is limited to, or `None` for all (spec §4.1). For the session.
     scope: Option<NotebookId>,
+    /// The scope button is the panel's keyboard stop: Enter or Space opens its menu.
+    scope_focused: bool,
     /// The title band's text: "Searching all notebooks", "Searching <name>" or "Search".
     header: String,
     /// Some notebook has loaded.
@@ -325,6 +327,7 @@ impl SearchView {
             open: false,
             several: false,
             scope: None,
+            scope_focused: false,
             header: TITLE.to_owned(),
             loaded: false,
             failed: false,

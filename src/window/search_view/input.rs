@@ -12,7 +12,7 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::UI::Controls::{EM_SETSEL, WM_MOUSELEAVE};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-    VIRTUAL_KEY, VK_CONTROL, VK_RETURN, VK_SHIFT, VK_TAB, VK_UP,
+    VIRTUAL_KEY, VK_CONTROL, VK_RETURN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     SendMessageW, WM_CAPTURECHANGED, WM_CHAR, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
@@ -24,27 +24,36 @@ pub(super) fn key_down(key: VIRTUAL_KEY) -> bool {
 }
 
 /// Where Tab and Shift+Tab move the caret in the Search view: the search box, the replace field
-/// while it is open, and the results, in that order, wrapping.
+/// while it is open, the results, and the scope button while it shows (multi-root search spec
+/// §4.1), in that order, wrapping.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FocusStop {
     Box,
     Replace,
     Results,
+    Scope,
 }
 
 /// The stop after `from` (before it with `back`). The replace field is skipped while it is
-/// closed, and the results while there are none.
+/// closed, the results while there are none, and the scope button while it doesn't show.
 pub(super) fn next_stop(
     from: FocusStop,
     back: bool,
     replace_open: bool,
     has_results: bool,
+    scope_shown: bool,
 ) -> FocusStop {
-    let order = [FocusStop::Box, FocusStop::Replace, FocusStop::Results];
+    let order = [
+        FocusStop::Box,
+        FocusStop::Replace,
+        FocusStop::Results,
+        FocusStop::Scope,
+    ];
     let usable = |stop: FocusStop| match stop {
         FocusStop::Box => true,
         FocusStop::Replace => replace_open,
         FocusStop::Results => has_results,
+        FocusStop::Scope => scope_shown,
     };
     let start = order.iter().position(|stop| *stop == from).unwrap_or(0);
     (1..=order.len())
@@ -87,6 +96,7 @@ pub(super) fn enter_results(hwnd: HWND, panel: HWND) {
         if view.results.is_empty() {
             return false;
         }
+        view.scope_focused = false;
         let area = view.list_area(client, dpi);
         let index = view.list.selected.unwrap_or(0);
         view.list.select(index, height(area));
@@ -105,24 +115,33 @@ pub(super) fn enter_results(hwnd: HWND, panel: HWND) {
 /// replace field while it is open, and the results while there are any, wrapping. Focused with
 /// nothing of the App borrowed.
 pub(super) fn cycle_focus(hwnd: HWND, panel: HWND, from: FocusStop, back: bool) {
-    let Some((edit, replace, has_results)) = with_view(hwnd, |view| {
+    let Some((edit, replace, has_results, scope)) = with_view(hwnd, |view| {
         (
             view.edit,
             view.replace_edit.filter(|_| view.replace_open),
             !view.results.is_empty(),
+            view.scope_shown(),
         )
     }) else {
         return;
     };
-    let to = next_stop(from, back, replace.is_some(), has_results);
+    let to = next_stop(from, back, replace.is_some(), has_results, scope);
     if to == from {
         return;
     }
+    with_view(hwnd, |view| view.scope_focused = to == FocusStop::Scope);
     let field = match to {
         FocusStop::Box => edit,
         FocusStop::Replace => replace,
         FocusStop::Results => {
             enter_results(hwnd, panel);
+            return;
+        }
+        FocusStop::Scope => {
+            unsafe {
+                SetFocus(panel);
+            }
+            invalidate(panel);
             return;
         }
     };
@@ -181,17 +200,23 @@ pub(crate) fn header_hit(hwnd: HWND, panel: HWND, x: i32, y: i32) -> bool {
 /// the scope and runs the query again. Shown with nothing of the App borrowed: the menu runs a
 /// modal loop.
 pub(super) fn scope_menu(hwnd: HWND, panel: HWND) {
-    let Some((scope, notebooks)) = with_view(hwnd, |view| (view.scope, view.notebooks.clone()))
-    else {
+    let Some(scope) = with_view(hwnd, |view| view.scope) else {
         return;
     };
+    // Every searchable notebook, not the view's list, which a scope narrows to one.
+    let notebooks = crate::window::library_host::searchable_notebooks(hwnd);
     let mut items = vec![("All notebooks".to_owned(), scope.is_none())];
     items.extend(
         notebooks
             .iter()
             .map(|s| (s.label.clone(), scope == Some(s.id))),
     );
-    let Some(picked) = choose_scope(hwnd, panel, &items) else {
+    // A modal loop, as every menu's: timers that read the tabs wait until it ends.
+    let picked = {
+        let _modal = crate::window::modal::ModalScope::enter(hwnd);
+        choose_scope(hwnd, panel, &items)
+    };
+    let Some(picked) = picked else {
         return;
     };
     let scope = picked
@@ -273,6 +298,20 @@ pub(crate) fn answer_next_scope_menu(
     answer: impl FnOnce(&[(String, bool)]) -> Option<usize> + 'static,
 ) {
     SCOPE_ANSWERS.with(|answers| answers.borrow_mut().push_back(Box::new(answer)));
+}
+
+/// Whether the scope button has the keyboard focus, for in-process tests.
+#[cfg(test)]
+pub(crate) fn scope_focused(hwnd: HWND) -> bool {
+    with_view(hwnd, |view| view.scope_focused).unwrap_or(false)
+}
+
+/// Moves the focus into the results, as Down from the box does, for in-process tests.
+#[cfg(test)]
+pub(crate) fn focus_results_for_test(hwnd: HWND) {
+    if let Some((_, panel)) = crate::window::side_panel::windows(hwnd) {
+        enter_results(hwnd, panel);
+    }
 }
 
 /// Clicks the scope button, for in-process tests.
@@ -448,6 +487,7 @@ pub(crate) fn handle(
         }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
             let at = point(lparam);
+            with_view(hwnd, |view| view.scope_focused = false);
             if let Some(option) = with_view(hwnd, |view| view.toggle_at(at, client, dpi)).flatten()
             {
                 toggle_option(hwnd, option);
@@ -554,6 +594,24 @@ pub(crate) fn handle(
             let key = wparam as u16;
             let ctrl = key_down(VK_CONTROL);
             let shift = key_down(VK_SHIFT);
+            // The scope button's stop (spec §4.1): Enter or Space opens its menu, Tab moves on,
+            // and any other key goes back to the results.
+            if with_view(hwnd, |view| view.scope_focused).unwrap_or(false) {
+                match key {
+                    VK_TAB if !ctrl => {
+                        cycle_focus(hwnd, panel, FocusStop::Scope, shift);
+                        return Some(0);
+                    }
+                    VK_RETURN | VK_SPACE => {
+                        scope_menu(hwnd, panel);
+                        return Some(0);
+                    }
+                    _ => {
+                        with_view(hwnd, |view| view.scope_focused = false);
+                        invalidate(panel);
+                    }
+                }
+            }
             // Tab and Shift+Tab move on to the search box or the replace field.
             if key == VK_TAB && !ctrl {
                 cycle_focus(hwnd, panel, FocusStop::Results, shift);
@@ -589,6 +647,13 @@ pub(crate) fn handle(
                 view.list.move_selection(movement, height(area))
             });
             invalidate(panel);
+            Some(0)
+        }
+        // Space on the scope button opened its menu: its character types nothing.
+        WM_CHAR
+            if wparam as u32 == 0x20
+                && with_view(hwnd, |view| view.scope_focused).unwrap_or(false) =>
+        {
             Some(0)
         }
         // Typing in the list goes on in the box.

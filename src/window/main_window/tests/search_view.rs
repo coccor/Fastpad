@@ -1194,3 +1194,80 @@ fn scope_button_hidden_with_one_notebook() {
         "Search text in A"
     );
 }
+
+#[test]
+fn the_scope_menu_still_lists_every_notebook_once_scoped() {
+    // Break caught (final review): the menu built from the scoped list, so after picking B
+    // only "All notebooks" and B are offered and A can't be picked directly (spec §4.1).
+    let _scintilla = load_native_scintilla();
+    let ab = searched_ab("search-scope-relist");
+    let hwnd = ab.window.hwnd;
+    crate::window::search_view::set_scope(hwnd, Some(ab.b_id));
+    let offered = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let seen = std::rc::Rc::clone(&offered);
+    crate::window::search_view::answer_next_scope_menu(move |items| {
+        *seen.borrow_mut() = items.to_vec();
+        Some(1)
+    });
+    crate::window::search_view::click_scope(hwnd);
+    assert_eq!(
+        *offered.borrow(),
+        [
+            ("All notebooks".to_owned(), false),
+            ("A".to_owned(), false),
+            ("B".to_owned(), true)
+        ]
+    );
+    assert_eq!(crate::window::search_view::scope(hwnd), Some(ab.a_id));
+}
+
+#[test]
+fn tab_reaches_the_scope_button_and_enter_opens_its_menu() {
+    // Break caught (final review): a scope button only the mouse and screen readers can use
+    // (spec §4.1: Enter or Space when focused).
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_RETURN, VK_TAB};
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+    let _scintilla = load_native_scintilla();
+    let ab = searched_ab("search-scope-keys");
+    let hwnd = ab.window.hwnd;
+    let panel = sidebar_panel(hwnd);
+    let key = |vk: u16| {
+        crate::window::search_view::handle(hwnd, panel, WM_KEYDOWN, usize::from(vk), 0);
+    };
+    crate::window::search_view::focus_results_for_test(hwnd);
+    key(VK_TAB);
+    assert!(crate::window::search_view::scope_focused(hwnd));
+    crate::window::search_view::answer_next_scope_menu(|_| Some(2));
+    key(VK_RETURN);
+    assert_eq!(crate::window::search_view::scope(hwnd), Some(ab.b_id));
+    key(VK_TAB);
+    assert!(
+        !crate::window::search_view::scope_focused(hwnd),
+        "on to the box"
+    );
+}
+
+#[test]
+fn a_batch_carrying_a_closed_notebooks_hits_lists_none_of_them() {
+    // Break caught (final review): a search still running when B closes posting B's hits
+    // afterwards, listed with no notebook to open them in (spec §4.3).
+    let _scintilla = load_native_scintilla();
+    let ab = searched_ab("search-closed-batch");
+    let hwnd = ab.window.hwnd;
+    assert!(crate::window::library_host::close_notebook_of(
+        hwnd, ab.b_id
+    ));
+    let generation = search_generation(hwnd);
+    let late = crate::window::text_search_host::test_batch_in(
+        generation,
+        ab.b_id,
+        vec![stray_hit("late")],
+        None,
+    );
+    crate::window::text_search_host::batch_arrived(hwnd, late);
+    assert!(
+        !search_rows(hwnd).iter().any(|(name, _)| name == "late"),
+        "{:?}",
+        search_rows(hwnd)
+    );
+}
