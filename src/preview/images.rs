@@ -1,9 +1,10 @@
 //! Image decoding off the UI thread. A short-lived worker decodes queued files with WIC into
 //! premultiplied BGRA pixels and posts `message` to `notify`; the UI thread drains results and
 //! creates Direct2D bitmaps on demand, keeping the pixels so bitmaps can be rebuilt after device
-//! loss.
+//! loss. The same worker renders Mermaid diagrams (`preview::mermaid`), keyed by their source.
 
 use crate::preview::dwrite::hresult_error;
+use crate::preview::mermaid::{self, DiagramKey};
 use crate::{FastPadError, Result};
 use std::collections::{HashMap, VecDeque};
 use std::os::windows::ffi::OsStrExt;
@@ -146,10 +147,14 @@ pub fn decode_image(path: &Path, max_width: u32) -> Result<DecodedImage> {
     }
 }
 
+/// Diagrams kept beyond those on screen: each edit of a diagram's source renders a new one.
+const MAX_DIAGRAMS: usize = 32;
+
 enum EntryState {
     Pending,
     Ready(DecodedImage),
-    Failed,
+    /// Why, for diagrams; files show their alt text instead.
+    Failed(String),
 }
 
 struct Entry {
@@ -157,6 +162,27 @@ struct Entry {
     bitmap: Option<ID2D1Bitmap>,
     /// The largest `max_width` queued so far (0 = unlimited).
     requested: u32,
+    /// Pixels per natural unit wanted: 1 for files, the DPI scale for diagrams, which are vector
+    /// and can be rasterized past their natural size.
+    scale: f32,
+    /// When a diagram was last requested or drawn, for evicting the oldest.
+    used: u64,
+}
+
+/// A diagram's state, for layout.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DiagramState<'a> {
+    /// Never requested, or evicted.
+    Unknown,
+    Pending,
+    /// Natural size in DIPs.
+    Ready(u32, u32),
+    Failed(&'a str),
+}
+
+enum Job {
+    File(PathBuf),
+    Diagram(DiagramKey, f32),
 }
 
 /// Whether a decode limited to `requested` pixels already satisfies a limit of `max_width`.
@@ -169,29 +195,86 @@ impl Entry {
     /// again only when it was scaled below both the natural width and the new limit.
     fn wants(&self, max_width: u32) -> bool {
         match &self.state {
-            EntryState::Failed => false,
+            EntryState::Failed(_) => false,
             EntryState::Pending => !covers(self.requested, max_width),
             EntryState::Ready(image) => {
+                let natural = (image.natural_width as f32 * self.scale).round() as u32;
                 let target = if max_width == 0 {
-                    image.natural_width
+                    natural
                 } else {
-                    max_width.min(image.natural_width)
+                    max_width.min(natural)
                 };
                 image.width < target && !covers(self.requested, target)
             }
+        }
+    }
+
+    fn new(state: EntryState, requested: u32, scale: f32, used: u64) -> Self {
+        Self {
+            state,
+            bitmap: None,
+            requested,
+            scale,
+            used,
+        }
+    }
+
+    fn bitmap(&mut self, target: &ID2D1RenderTarget) -> Option<ID2D1Bitmap> {
+        let EntryState::Ready(image) = &self.state else {
+            return None;
+        };
+        if self.bitmap.is_none() {
+            let properties = D2D1_BITMAP_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+            };
+            self.bitmap = unsafe {
+                target.CreateBitmap(
+                    D2D_SIZE_U {
+                        width: image.width,
+                        height: image.height,
+                    },
+                    Some(image.pixels.as_ptr().cast()),
+                    image.width * 4,
+                    &properties,
+                )
+            }
+            .ok();
+        }
+        self.bitmap.clone()
+    }
+
+    /// Takes a finished decode. A result no larger than the image already shown is dropped, and a
+    /// failed re-decode keeps the smaller image that already works.
+    fn finish(&mut self, result: std::result::Result<DecodedImage, String>) {
+        match (result, &self.state) {
+            (Ok(image), EntryState::Ready(current)) if image.width <= current.width => {}
+            (Ok(image), _) => {
+                self.state = EntryState::Ready(image);
+                self.bitmap = None;
+            }
+            (Err(_), EntryState::Ready(_)) => {}
+            (Err(error), _) => self.state = EntryState::Failed(error),
         }
     }
 }
 
 #[derive(Default)]
 struct Shared {
-    queue: VecDeque<(PathBuf, u32)>,
-    done: Vec<(PathBuf, Result<DecodedImage>)>,
+    queue: VecDeque<(Job, u32)>,
+    done: Vec<(Job, std::result::Result<DecodedImage, String>)>,
     worker_running: bool,
 }
 
 pub struct ImageCache {
     entries: HashMap<PathBuf, Entry>,
+    diagrams: HashMap<DiagramKey, Entry>,
+    /// Advances on every diagram request and draw.
+    clock: u64,
     shared: Arc<Mutex<Shared>>,
     /// `HWND` as an integer so the worker closure is `Send`.
     notify: isize,
@@ -202,6 +285,8 @@ impl ImageCache {
     pub fn new(notify: HWND, message: u32) -> Self {
         Self {
             entries: HashMap::new(),
+            diagrams: HashMap::new(),
+            clock: 0,
             shared: Arc::new(Mutex::new(Shared::default())),
             notify: notify as isize,
             message,
@@ -222,26 +307,65 @@ impl ImageCache {
             let state = if exists {
                 EntryState::Pending
             } else {
-                EntryState::Failed
+                EntryState::Failed(String::new())
             };
-            self.entries.insert(
-                path.to_owned(),
-                Entry {
-                    state,
-                    bitmap: None,
-                    requested: max_width,
-                },
-            );
+            self.entries
+                .insert(path.to_owned(), Entry::new(state, max_width, 1.0, 0));
             if !exists {
                 return;
             }
         }
+        self.queue(Job::File(path.to_owned()), max_width);
+    }
+
+    /// Queues a render of `key` at `scale` device pixels per DIP, at most `max_width` pixels wide
+    /// (0 = no limit). Repeated requests are free unless the diagram must be drawn larger.
+    pub fn request_diagram(&mut self, key: &DiagramKey, max_width: u32, scale: f32) {
+        self.clock += 1;
+        if let Some(entry) = self.diagrams.get_mut(key) {
+            entry.used = self.clock;
+            // A higher DPI needs more pixels even where the last render had no width limit.
+            let sharper = scale > entry.scale && !matches!(entry.state, EntryState::Failed(_));
+            entry.scale = entry.scale.max(scale);
+            if !sharper && !entry.wants(max_width) {
+                return;
+            }
+            entry.requested = max_width;
+        } else {
+            self.evict_diagrams();
+            self.diagrams.insert(
+                key.clone(),
+                Entry::new(EntryState::Pending, max_width, scale, self.clock),
+            );
+        }
+        let scale = self.diagrams[key].scale;
+        self.queue(Job::Diagram(key.clone(), scale), max_width);
+    }
+
+    /// Drops the least recently used diagrams beyond `MAX_DIAGRAMS`. Pending ones stay: their
+    /// results are on the way.
+    fn evict_diagrams(&mut self) {
+        while self.diagrams.len() >= MAX_DIAGRAMS {
+            let oldest = self
+                .diagrams
+                .iter()
+                .filter(|(_, entry)| !matches!(entry.state, EntryState::Pending))
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(key, _)| key.clone());
+            let Some(oldest) = oldest else {
+                return;
+            };
+            self.diagrams.remove(&oldest);
+        }
+    }
+
+    fn queue(&mut self, job: Job, max_width: u32) {
         let spawn = {
             let mut shared = self
                 .shared
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            shared.queue.push_back((path.to_owned(), max_width));
+            shared.queue.push_back((job, max_width));
             !std::mem::replace(&mut shared.worker_running, true)
         };
         if spawn {
@@ -257,15 +381,20 @@ impl ImageCache {
                         }
                         job
                     };
-                    let Some((path, max_width)) = job else {
+                    let Some((job, max_width)) = job else {
                         return;
                     };
-                    let result = decode_image(&path, max_width);
+                    let result = match &job {
+                        Job::File(path) => {
+                            decode_image(path, max_width).map_err(|error| error.to_string())
+                        }
+                        Job::Diagram(key, scale) => mermaid::render(key, max_width, *scale),
+                    };
                     shared
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
                         .done
-                        .push((path, result));
+                        .push((job, result));
                     unsafe { PostMessageW(notify as HWND, message, 0, 0) };
                 }
             });
@@ -282,21 +411,38 @@ impl ImageCache {
                 .done,
         );
         let changed = !done.is_empty();
-        for (path, result) in done {
-            if let Some(entry) = self.entries.get_mut(&path) {
-                match (result, &entry.state) {
-                    (Ok(image), EntryState::Ready(current)) if image.width <= current.width => {}
-                    (Ok(image), _) => {
-                        entry.state = EntryState::Ready(image);
-                        entry.bitmap = None;
-                    }
-                    // A failed re-decode keeps the smaller image that already works.
-                    (Err(_), EntryState::Ready(_)) => {}
-                    (Err(_), _) => entry.state = EntryState::Failed,
-                }
+        for (job, result) in done {
+            let entry = match &job {
+                Job::File(path) => self.entries.get_mut(path),
+                Job::Diagram(key, _) => self.diagrams.get_mut(key),
+            };
+            if let Some(entry) = entry {
+                entry.finish(result);
             }
         }
         changed
+    }
+
+    pub fn diagram(&self, key: &DiagramKey) -> DiagramState<'_> {
+        match self.diagrams.get(key).map(|entry| &entry.state) {
+            None => DiagramState::Unknown,
+            Some(EntryState::Pending) => DiagramState::Pending,
+            Some(EntryState::Ready(image)) => {
+                DiagramState::Ready(image.natural_width, image.natural_height)
+            }
+            Some(EntryState::Failed(error)) => DiagramState::Failed(error),
+        }
+    }
+
+    pub fn diagram_bitmap(
+        &mut self,
+        target: &ID2D1RenderTarget,
+        key: &DiagramKey,
+    ) -> Option<ID2D1Bitmap> {
+        self.clock += 1;
+        let entry = self.diagrams.get_mut(key)?;
+        entry.used = self.clock;
+        entry.bitmap(target)
     }
 
     /// The image's natural pixel size once decoded, whatever size it was decoded at.
@@ -310,49 +456,24 @@ impl ImageCache {
     pub fn is_failed(&self, path: &Path) -> bool {
         matches!(
             self.entries.get(path).map(|entry| &entry.state),
-            Some(EntryState::Failed)
+            Some(EntryState::Failed(_))
         )
     }
 
     pub fn bitmap(&mut self, target: &ID2D1RenderTarget, path: &Path) -> Option<ID2D1Bitmap> {
-        let entry = self.entries.get_mut(path)?;
-        let EntryState::Ready(image) = &entry.state else {
-            return None;
-        };
-        if entry.bitmap.is_none() {
-            let properties = D2D1_BITMAP_PROPERTIES {
-                pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                },
-                dpiX: 96.0,
-                dpiY: 96.0,
-            };
-            entry.bitmap = unsafe {
-                target.CreateBitmap(
-                    D2D_SIZE_U {
-                        width: image.width,
-                        height: image.height,
-                    },
-                    Some(image.pixels.as_ptr().cast()),
-                    image.width * 4,
-                    &properties,
-                )
-            }
-            .ok();
-        }
-        entry.bitmap.clone()
+        self.entries.get_mut(path)?.bitmap(target)
     }
 
     /// Device loss: bitmaps belong to the lost device; pixels stay for rebuilding.
     pub fn release_bitmaps(&mut self) {
-        for entry in self.entries.values_mut() {
+        for entry in self.entries.values_mut().chain(self.diagrams.values_mut()) {
             entry.bitmap = None;
         }
     }
 
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.diagrams.clear();
     }
 }
 
@@ -440,5 +561,82 @@ mod tests {
         assert_eq!(cache.size(&path), Some((244, 256)));
         cache.request(&path, 64);
         wait_for(&mut cache, &path, 64);
+    }
+
+    fn diagram(source: &str) -> DiagramKey {
+        let colors =
+            crate::preview::colors::preview_colors(crate::platform::theme::Theme::Light, false);
+        DiagramKey::new(
+            source,
+            &crate::preview::mermaid::DiagramStyle::new(colors, "Segoe UI", 16.0),
+        )
+    }
+
+    fn wait_for_diagram(cache: &mut ImageCache, key: &DiagramKey) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while matches!(cache.diagram(key), DiagramState::Pending)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            cache.drain();
+        }
+    }
+
+    #[test]
+    fn the_cache_renders_diagrams_at_the_dpi_scale_and_reports_failures() {
+        let mut cache = ImageCache::new(std::ptr::null_mut(), 0);
+        let key = diagram("flowchart LR\n  A --> B\n");
+        assert_eq!(cache.diagram(&key), DiagramState::Unknown);
+        cache.request_diagram(&key, 0, 1.5);
+        assert_eq!(cache.diagram(&key), DiagramState::Pending);
+        wait_for_diagram(&mut cache, &key);
+        let DiagramState::Ready(width, height) = cache.diagram(&key) else {
+            panic!("{:?}", cache.diagram(&key));
+        };
+        assert!(width > height);
+        // Natural size in DIPs, pixels at the scale.
+        let pixels = |cache: &ImageCache| match &cache.diagrams[&key].state {
+            EntryState::Ready(image) => image.width,
+            _ => 0,
+        };
+        assert!(pixels(&cache).abs_diff((width as f32 * 1.5).round() as u32) <= 1);
+        // The same request is free; a higher DPI renders again, sharper.
+        cache.request_diagram(&key, 0, 1.5);
+        assert!(cache.shared.lock().unwrap().queue.is_empty());
+        cache.request_diagram(&key, 0, 2.0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while pixels(&cache) < 2 * width - 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            cache.drain();
+        }
+        assert!(pixels(&cache).abs_diff(2 * width) <= 1);
+
+        let broken = diagram("flowchart LR\n  A -->\n");
+        cache.request_diagram(&broken, 0, 1.0);
+        wait_for_diagram(&mut cache, &broken);
+        assert!(matches!(cache.diagram(&broken), DiagramState::Failed(error) if !error.is_empty()));
+        cache.clear();
+        assert_eq!(cache.diagram(&key), DiagramState::Unknown);
+    }
+
+    #[test]
+    fn the_cache_keeps_only_the_most_recently_used_diagrams() {
+        let mut cache = ImageCache::new(std::ptr::null_mut(), 0);
+        let keys = (0..MAX_DIAGRAMS + 4)
+            .map(|index| diagram(&format!("flowchart LR\n  A{index} --> B\n")))
+            .collect::<Vec<_>>();
+        for key in &keys {
+            cache.request_diagram(key, 0, 1.0);
+            wait_for_diagram(&mut cache, key);
+            // The first stays in use, as a diagram on screen is.
+            cache.request_diagram(&keys[0], 0, 1.0);
+        }
+        assert!(cache.diagrams.len() <= MAX_DIAGRAMS);
+        assert!(matches!(cache.diagram(&keys[0]), DiagramState::Ready(..)));
+        assert_eq!(cache.diagram(&keys[1]), DiagramState::Unknown);
+        assert!(matches!(
+            cache.diagram(keys.last().unwrap()),
+            DiagramState::Ready(..)
+        ));
     }
 }

@@ -355,6 +355,11 @@ fn appearance(
         } else {
             palette.editor_background
         },
+        // Diagrams look as the preview draws them, whatever the syntax colours are.
+        diagram: crate::preview::colors::preview_colors(
+            host_window::effective_theme(hwnd),
+            palette.high_contrast,
+        ),
     };
     let fonts = LiveFonts::new(
         graphics,

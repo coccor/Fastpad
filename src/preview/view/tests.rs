@@ -527,3 +527,77 @@ fn a_worker_parse_of_the_same_document_keeps_expanded_sections() {
     );
     view.destroy();
 }
+
+/// Delivers finished diagram renders and repaints until `done` holds, for at most 10 s.
+fn pump_diagrams(
+    view: &PreviewView,
+    done: impl Fn(&[(String, bool)]) -> bool,
+) -> Vec<(String, bool)> {
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let mut msg = MSG::default();
+        while unsafe {
+            PeekMessageW(
+                &mut msg,
+                view.hwnd(),
+                WM_FASTPAD_PREVIEW_IMAGE,
+                WM_FASTPAD_PREVIEW_IMAGE,
+                PM_REMOVE,
+            )
+        } != 0
+        {}
+        unsafe { SendMessageW(view.hwnd(), WM_FASTPAD_PREVIEW_IMAGE, 0, 0) };
+        repaint(view);
+        let states = view.diagram_states();
+        if done(&states) || Instant::now() > deadline {
+            return states;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn replace_text(view: &PreviewView, source: &mut String, from: &str, to: &str) {
+    let position = source.find(from).unwrap();
+    source.replace_range(position..position + from.len(), to);
+    let update = view.apply_edits(
+        source.as_str(),
+        &[Edit {
+            position,
+            removed: from.len(),
+            inserted: to.len(),
+            lines_delta: 0,
+        }],
+        Instant::now(),
+        true,
+    );
+    // A document this small reparses in full; the diagrams must survive either update.
+    assert!(
+        matches!(update, Some(Update::Full | Update::Replaced { .. })),
+        "{update:?}"
+    );
+}
+
+#[test]
+fn mermaid_blocks_draw_as_diagrams_and_keep_the_last_one_while_an_edit_renders_or_fails() {
+    let parent = TestWindow::new(800, 600);
+    let mut source = "# Flow\n\n```mermaid\nflowchart LR\n  A --> B\n```\n\nafter\n".to_owned();
+    let view = view_with(&parent, &source);
+    let states = pump_diagrams(&view, |states| !states.is_empty());
+    assert_eq!(states, vec![("flowchart LR\n  A --> B".to_owned(), false)]);
+
+    // An edit draws the previous diagram until the new one is ready: never the code block.
+    replace_text(&view, &mut source, "--> B", "--> C");
+    repaint(&view);
+    let states = view.diagram_states();
+    assert_eq!(states.len(), 1, "{states:?}");
+    let states = pump_diagrams(&view, |states| {
+        states.iter().any(|(source, _)| source.ends_with('C'))
+    });
+    assert_eq!(states, vec![("flowchart LR\n  A --> C".to_owned(), false)]);
+
+    // A broken edit keeps the last diagram, under the reason it failed.
+    replace_text(&view, &mut source, "--> C", "-->");
+    let states = pump_diagrams(&view, |states| states.iter().any(|(_, error)| *error));
+    assert_eq!(states, vec![("flowchart LR\n  A --> C".to_owned(), true)]);
+    view.destroy();
+}

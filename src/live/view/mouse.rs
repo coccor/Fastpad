@@ -85,7 +85,7 @@ pub(super) fn position_at(state: &mut ViewState, (x, y): (i32, i32)) -> usize {
         text: &source,
         document,
         revealed: revealed.clone(),
-        images: &|dest: &str| pictures.resolve(dest),
+        images: &*pictures,
     };
     layout.position_at(&text, doc_x, doc_y).unwrap_or(0)
 }

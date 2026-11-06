@@ -395,7 +395,7 @@ mod blocks {
         text: &'a MemoryText,
         document: &'a LiveDocument,
         revealed: Range<usize>,
-        images: &'a dyn Fn(&str) -> ImageInfo,
+        images: &'a dyn crate::live::styles::LinePictures,
     ) -> Styled<'a, MemoryText> {
         Styled {
             text,
@@ -845,5 +845,134 @@ mod tables {
             let (_, measured) = layout.counts.get();
             assert_eq!(measured, 4);
         });
+    }
+}
+
+mod diagrams {
+    use super::layout;
+    use crate::live::blocks::LiveDocument;
+    use crate::live::layout::Decoration;
+    use crate::live::styles::{BodyStyle, DiagramInfo, ImageInfo, LinePictures, Styled, no_images};
+    use crate::live::text::{LiveText, MemoryText};
+    use crate::platform::theme::Theme;
+    use crate::preview::mermaid::{DiagramKey, DiagramStyle};
+    use std::ops::Range;
+
+    const SOURCE: &str = "para\n\n```mermaid\ngraph LR\n  A --> B\n```\n\nafter\n";
+    /// No line revealed.
+    const NONE: Range<usize> = usize::MAX - 1..usize::MAX;
+
+    fn key() -> DiagramKey {
+        let colors = crate::preview::colors::preview_colors(Theme::Light, false);
+        DiagramKey::new(
+            "graph LR\n  A --> B\n",
+            &DiagramStyle::new(colors, "Segoe UI", 16.0),
+        )
+    }
+
+    /// Every diagram in one state.
+    struct Diagrams(fn() -> DiagramInfo);
+
+    impl LinePictures for Diagrams {
+        fn image(&self, _: &str) -> ImageInfo {
+            ImageInfo::Unavailable
+        }
+
+        fn diagram(&self, source: &str) -> DiagramInfo {
+            assert_eq!(source, "graph LR\n  A --> B\n");
+            (self.0)()
+        }
+    }
+
+    /// Each line's height, body and decorations, at 600 DIPs wide.
+    fn lines(
+        pictures: &dyn LinePictures,
+        revealed: Range<usize>,
+    ) -> Vec<(f32, BodyStyle, Vec<Decoration>)> {
+        let text = MemoryText::new(SOURCE);
+        let document = LiveDocument::parse(text.text());
+        let styled = Styled {
+            text: &text,
+            document: &document,
+            revealed,
+            images: pictures,
+        };
+        let mut layout = layout(600.0);
+        layout.reset(&styled);
+        (0..styled.line_count())
+            .map(|line| {
+                let laid = layout.line(&styled, line).unwrap();
+                (
+                    laid.height,
+                    laid.style.block.body.clone(),
+                    laid.decorations.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn ready() -> Diagrams {
+        Diagrams(|| DiagramInfo::Ready {
+            key: key(),
+            size: (200, 100),
+        })
+    }
+
+    #[test]
+    fn a_rendered_block_is_its_diagram_centred_on_the_fence_with_the_rest_collapsed() {
+        let lines = lines(&ready(), NONE);
+        let (height, body, decorations) = &lines[2];
+        assert!(matches!(body, BodyStyle::Diagram { .. }), "{body:?}");
+        let [Decoration::Diagram { rect, key: drawn }] = decorations.as_slice() else {
+            panic!("{decorations:?}");
+        };
+        assert_eq!(*drawn, key());
+        assert_eq!(
+            (rect.right - rect.left, rect.bottom - rect.top),
+            (200.0, 100.0)
+        );
+        assert_eq!(rect.left, 200.0);
+        assert!(*height > 100.0);
+        for (height, body, decorations) in &lines[3..6] {
+            assert_eq!(*body, BodyStyle::Collapsed);
+            assert_eq!(*height, 0.0);
+            assert!(decorations.is_empty());
+        }
+        // The lines around it are untouched.
+        assert!(lines[0].0 > 0.0 && lines[7].0 > 0.0);
+    }
+
+    #[test]
+    fn a_pending_block_shows_a_placeholder_and_a_failed_one_its_code_under_the_reason() {
+        let pending = Diagrams(|| DiagramInfo::Pending(key()));
+        let lines_pending = lines(&pending, NONE);
+        assert!(matches!(
+            lines_pending[2].2.as_slice(),
+            [Decoration::Label { text, .. }] if text == "Mermaid diagram"
+        ));
+        assert_eq!(lines_pending[3].1, BodyStyle::Collapsed);
+
+        let failed = Diagrams(|| DiagramInfo::Failed("unexpected token".to_owned()));
+        let lines_failed = lines(&failed, NONE);
+        assert!(matches!(lines_failed[2].1, BodyStyle::DiagramError { .. }));
+        assert!(lines_failed[2].2.iter().any(|decoration| matches!(
+            decoration,
+            Decoration::Label { text, .. } if text == "Mermaid diagram error: unexpected token"
+        )));
+        for (height, body, _) in &lines_failed[3..6] {
+            assert!(matches!(body, BodyStyle::Code { .. }), "{body:?}");
+            assert!(*height > 0.0);
+        }
+    }
+
+    #[test]
+    fn a_revealed_block_and_a_view_without_diagrams_show_the_code() {
+        // The caret's block shows as source, every line of it.
+        for (_, body, _) in &lines(&ready(), 2..6)[2..6] {
+            assert!(matches!(body, BodyStyle::Code { .. }), "{body:?}");
+        }
+        for (_, body, _) in &lines(&no_images, NONE)[2..6] {
+            assert!(matches!(body, BodyStyle::Code { .. }), "{body:?}");
+        }
     }
 }
