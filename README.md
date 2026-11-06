@@ -189,11 +189,13 @@ a new folder and opens it as a notebook in one step.
 
 Opening another notebook adds it to the sidebar instead of replacing the first. Each open notebook
 is a collapsible root row of its own, and the sidebar button and tooltip read "*N* notebooks" once
-several are open. Every root has its own `…` menu with **Close notebook**, **Set as default
-notebook** and **Add to Favorites** (or **Remove from Favorites**). New notes and folders go to
+several are open. Every root has its own `…` menu with **Close notebook** and **Add to
+Favorites** (or **Remove from Favorites**); the other notebooks' menus also offer **Set as default
+notebook**. New notes and folders go to
 the notebook you're working in, otherwise the default one, and quick capture always uses the
 default. Search, Quick Open and Tags cover the notebook you're working in, wikilinks stay inside
-their own notebook, and notes can't be dragged between notebooks yet. FastPad reopens the same
+their own notebook, and notes can't be dragged between notebooks yet: **Note: Move to notebook…**
+(**`Ctrl+Shift+M`**) moves a note to another open notebook. FastPad reopens the same
 notebooks next time (`folders.ini` keeps them as `open=` lines, with the default marked
 `default=`). A notebook that isn't available at startup, such as one on an unplugged drive, is
 skipped with a notice but stays remembered until its drive returns.
@@ -205,8 +207,9 @@ skipped with a notice but stays remembered until its drive returns.
 - **Open Editors** lists every open tab above the tree. Drag files in from Explorer or from Open
   Editors to copy them into the notebook.
 - Star notebooks to keep them in **Favorites**, which highlights every open one and jumps to it in
-  the tree when you click it. Pick coloured, minimal or solid file icons, and
-  drive it all from the keyboard or a screen reader.
+  the tree when you click it.
+- Pick coloured, minimal or solid file icons, and drive it all from the keyboard or a screen
+  reader.
 
 Pins travel with the notebook in `.fastpad\library.ini`, and nothing is written into a folder until
 you pin something. Turn notes off with `notes_mode=false` in `fastpad.ini`.
@@ -290,7 +293,8 @@ inbox=inbox.md
 ### Quick capture
 
 Press **`Ctrl+Alt+N`** anywhere to jot something down without leaving what you're doing. The
-capture box appends it to your notebook's `inbox.md` as a time-stamped list item.
+capture box appends it to the default notebook's `inbox.md` (or wherever that notebook's
+`capture_target` points) as a time-stamped list item.
 
 - **`Ctrl+Enter`** saves and closes; **`Ctrl+Shift+Enter`** also opens the note. **`Esc`** closes
   and keeps what you typed for next time.
@@ -320,7 +324,7 @@ FastPad keeps up while it's open.
   last opened it, and it survives a restart. **Notes: Show changed notes** lists only those;
   **Notes: Clear changed marks** clears them.
 
-The open notebook is watched for changes as they happen, and other open files are checked when
+Each open notebook is watched for changes as they happen, and other open files are checked when
 FastPad comes back to the front. Changes inside folders such as `.git` and `node_modules` are
 ignored. To have every change wait for you instead, set `reload_changed_files=ask`.
 
