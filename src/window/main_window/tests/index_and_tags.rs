@@ -92,9 +92,14 @@ fn the_tags_view_lists_tags_and_opens_a_note_from_the_keyboard() {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_RETURN, VK_RIGHT};
     key(VK_RIGHT);
     let rows = crate::window::tags_view::shown_rows(window.hwnd);
+    assert!(
+        matches!(rows.last().map(|row| &row.kind), Some(TagRowKind::Note(note)) if note.path == std::path::Path::new("tagged.md")),
+        "{rows:?}"
+    );
     assert_eq!(
-        rows.last().map(|row| row.kind.clone()),
-        Some(TagRowKind::Note(std::path::PathBuf::from("tagged.md")))
+        rows.last().unwrap().detail,
+        "",
+        "one notebook: no notebook name"
     );
     key(VK_DOWN);
     key(VK_RETURN);
@@ -117,11 +122,11 @@ fn the_tags_view_says_so_when_there_are_no_tags() {
 }
 
 #[test]
-fn the_tags_view_shows_the_target_notebooks_tags() {
-    // Break caught: the Tags view listing the default notebook's tags while a note of another
-    // notebook is in front, or not saying whose tags they are (multi-root notebooks spec §5.3).
+fn the_tags_view_shows_every_notebooks_tags_whatever_is_in_front() {
+    // Break caught: the Tags view following the target notebook (phase 1) instead of listing
+    // every open notebook's tags (multi-root search spec §6).
     let _scintilla = load_native_scintilla();
-    let ab = notebooks_a_and_b("tags-target", "a #alpha\n", "b #beta\n");
+    let ab = notebooks_a_and_b("tags-all", "a #alpha\n", "b #beta\n");
     let hwnd = ab.window.hwnd;
     let tagged = |id, path: &str| {
         crate::window::library_host::note_index_of(hwnd, id)
@@ -131,16 +136,18 @@ fn the_tags_view_shows_the_target_notebooks_tags() {
     pump_until(hwnd, || tagged(ab.a_id, "a.md") && tagged(ab.b_id, "b.md"));
     super::super::open_path(hwnd, &ab.b.join("b.md")).unwrap();
     crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Tags, false);
+    let names = || {
+        crate::window::tags_view::shown_rows(hwnd)
+            .iter()
+            .map(|row| row.name.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(), ["#alpha", "#beta"]);
+    assert_eq!(
+        crate::window::tags_view::shown_header(hwnd),
+        "Tags in all notebooks"
+    );
 
-    let rows = crate::window::tags_view::shown_rows(hwnd);
-    let names = rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>();
-    assert_eq!(names, ["#beta"]);
-    assert_eq!(crate::window::tags_view::shown_header(hwnd), "Tags in B");
-
-    // Another notebook's note in front: the view follows it.
     super::super::open_path(hwnd, &ab.a.join("a.md")).unwrap();
-    let rows = crate::window::tags_view::shown_rows(hwnd);
-    let names = rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>();
-    assert_eq!(names, ["#alpha"]);
-    assert_eq!(crate::window::tags_view::shown_header(hwnd), "Tags in A");
+    assert_eq!(names(), ["#alpha", "#beta"]);
 }

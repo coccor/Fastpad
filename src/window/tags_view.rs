@@ -1,15 +1,19 @@
-//! The Tags view (second brain phase 1 spec §8.1): the open notebook's tags as a tree split on
-//! `/`, each with how many notes use it or a tag under it. Expanding a tag lists its notes, then
-//! its child tags. A click opens a note in the preview tab; a double click or Enter keeps it.
+//! The Tags view (second brain phase 1 spec §8.1): every open notebook's tags as one tree split
+//! on `/` (multi-root search spec §6), each with how many notes use it or a tag under it.
+//! Expanding a tag lists its notes, then its child tags. A click opens a note in the preview
+//! tab; a double click or Enter keeps it.
 
+#[cfg(test)]
 use crate::library::index::TagNode;
+use crate::library::index::{MergedTag, merge_tags};
 use crate::window::design::metrics::{panel_header, scale, sidebar_row};
-use crate::window::library_host::{self, NotebookId};
+use crate::window::library_host::{self, NoteRef, NotebookId};
 use crate::window::main_window::OpenMode;
 use crate::window::panel::fill;
 use crate::window::row_list::{self, ListKey, RowListState, RowLook, row_foreground};
 use crate::window::side_panel::{ViewPaint, draw_text, point_of};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+#[cfg(test)]
 use std::path::PathBuf;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -41,8 +45,8 @@ const NOTE_GLYPH: &str = "\u{E8A5}";
 
 pub(crate) const HEADER_TEXT: &str = "Tags";
 
-/// The header: "Tags in <name>" for the notebook the view lists (multi-root notebooks spec
-/// §5.3), else "Tags".
+/// The header: "Tags in <name>", the name being "all notebooks" with several open (multi-root
+/// search spec §6), else "Tags".
 pub(crate) fn header_text(notebook_name: Option<&str>) -> String {
     notebook_name.map_or_else(|| HEADER_TEXT.to_owned(), |name| format!("Tags in {name}"))
 }
@@ -56,8 +60,8 @@ pub(crate) const EMPTY_TEXT: &str =
 pub(crate) enum TagRowKind {
     /// A tag, by its full lowercase name.
     Tag { full: String, expanded: bool },
-    /// A note, relative to the notebook.
-    Note(PathBuf),
+    /// A note, in the open notebook it names.
+    Note(NoteRef),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,12 +72,25 @@ pub(crate) struct TagRow {
     pub name: String,
     /// For a tag: the notes that use it or a tag under it.
     pub count: usize,
+    /// A note's notebook label, drawn dim after its name while several notebooks are open; else
+    /// "".
+    pub detail: String,
 }
 
 /// The visible rows of `nodes`: each tag, and inside each expanded tag its notes, then its child
-/// tags, one level deeper.
-pub(crate) fn tag_rows(nodes: &[TagNode], expanded: &HashSet<String>) -> Vec<TagRow> {
-    fn walk(nodes: &[TagNode], depth: u16, expanded: &HashSet<String>, rows: &mut Vec<TagRow>) {
+/// tags, one level deeper. `labels` names each note's notebook; empty with one notebook open.
+pub(crate) fn tag_rows(
+    nodes: &[MergedTag<NotebookId>],
+    expanded: &HashSet<String>,
+    labels: &HashMap<NotebookId, String>,
+) -> Vec<TagRow> {
+    fn walk(
+        nodes: &[MergedTag<NotebookId>],
+        depth: u16,
+        expanded: &HashSet<String>,
+        labels: &HashMap<NotebookId, String>,
+        rows: &mut Vec<TagRow>,
+    ) {
         for node in nodes {
             let open = expanded.contains(&node.full);
             rows.push(TagRow {
@@ -84,23 +101,28 @@ pub(crate) fn tag_rows(nodes: &[TagNode], expanded: &HashSet<String>) -> Vec<Tag
                 depth,
                 name: format!("#{}", node.name),
                 count: node.count,
+                detail: String::new(),
             });
             if open {
-                rows.extend(node.notes.iter().map(|path| TagRow {
-                    kind: TagRowKind::Note(path.clone()),
+                rows.extend(node.notes.iter().map(|(notebook, path)| TagRow {
+                    kind: TagRowKind::Note(NoteRef {
+                        notebook: *notebook,
+                        path: path.clone(),
+                    }),
                     depth: depth + 1,
                     name: path.file_name().map_or_else(
                         || path.display().to_string(),
                         |name| name.to_string_lossy().into_owned(),
                     ),
                     count: 0,
+                    detail: labels.get(notebook).cloned().unwrap_or_default(),
                 }));
-                walk(&node.children, depth + 1, expanded, rows);
+                walk(&node.children, depth + 1, expanded, labels, rows);
             }
         }
     }
     let mut rows = Vec::new();
-    walk(nodes, 0, expanded, &mut rows);
+    walk(nodes, 0, expanded, labels, &mut rows);
     rows
 }
 
@@ -117,7 +139,7 @@ pub(crate) enum Mode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum TagAction {
     Toggle(String),
-    Open { note: PathBuf, keep: bool },
+    Open { note: NoteRef, keep: bool },
 }
 
 #[derive(Debug)]
@@ -130,10 +152,9 @@ pub(crate) struct TagsView {
     thumb_grab: Option<i32>,
     /// Bumped whenever the rows change order (`AccessibleView::accessible_generation`).
     order: u64,
-    /// The notebook whose tags the view lists: the target notebook when it last refreshed
-    /// (multi-root notebooks spec §5.3), its folder, and its display name for the header.
-    notebook: Option<(NotebookId, PathBuf)>,
-    notebook_name: Option<String>,
+    /// The header as of the last refresh: "Tags in all notebooks", "Tags in <name>" or "Tags",
+    /// with any notebooks left out counted after it.
+    header: String,
 }
 
 fn inside(rect: RECT, point: POINT) -> bool {
@@ -149,7 +170,12 @@ const fn height(rect: RECT) -> i32 {
 fn row_key(row: &TagRow) -> String {
     match &row.kind {
         TagRowKind::Tag { full, .. } => format!("t:{full}"),
-        TagRowKind::Note(path) => format!("n:{}:{}", row.depth, path.to_string_lossy()),
+        TagRowKind::Note(note) => format!(
+            "n:{}:{}:{}",
+            row.depth,
+            note.notebook.0,
+            note.path.to_string_lossy()
+        ),
     }
 }
 
@@ -162,14 +188,13 @@ impl TagsView {
             expanded: HashSet::new(),
             thumb_grab: None,
             order: 0,
-            notebook: None,
-            notebook_name: None,
+            header: HEADER_TEXT.to_owned(),
         }
     }
 
-    /// The header's text: "Tags in <name>" for the notebook the view lists, else "Tags".
+    /// The header's text, as of the last refresh.
     pub(crate) fn header(&self) -> String {
-        header_text(self.notebook_name.as_deref())
+        self.header.clone()
     }
 
     /// Replaces the rows, keeping the selection on the same tag or note.
@@ -355,7 +380,7 @@ impl TagsView {
                     );
                 }
             }
-            draw_text(
+            let drawn = draw_text(
                 hdc,
                 &row.name,
                 name,
@@ -363,6 +388,22 @@ impl TagsView {
                 foreground,
                 line | DT_LEFT | DT_END_ELLIPSIS,
             );
+            if !row.detail.is_empty() {
+                let detail = RECT {
+                    left: name.left + drawn + scale(GAP_AT_96_DPI, dpi),
+                    ..name
+                };
+                if detail.left < detail.right {
+                    draw_text(
+                        hdc,
+                        &row.detail,
+                        detail,
+                        paint.fonts.text,
+                        muted,
+                        line | DT_LEFT | DT_END_ELLIPSIS,
+                    );
+                }
+            }
         }
     }
 
@@ -474,34 +515,54 @@ fn point(lparam: LPARAM) -> POINT {
     POINT { x, y }
 }
 
-/// Re-reads the target notebook's tags from its index (multi-root notebooks spec §5.3). Part of
-/// `side_panel::refresh`.
+/// Re-reads every open notebook's tags from its index and merges them (multi-root search spec
+/// §6). Part of `side_panel::refresh`, and runs when an index lands.
 pub(crate) fn refresh(hwnd: HWND, panel: HWND) {
-    let target = library_host::target_notebook(hwnd)
-        .and_then(|id| Some((id, library_host::notebook_folder(hwnd, id)?)));
-    let name = target
-        .as_ref()
-        .and_then(|(id, _)| library_host::notebook_display_name(hwnd, *id));
-    let mode = match &target {
-        None => Mode::NoNotebook,
-        Some((id, _)) if !library_host::index_loaded_of(hwnd, *id) => Mode::Loading,
-        Some(_) => Mode::Tree,
-    };
-    let nodes = target
-        .as_ref()
-        .map(|(id, _)| library_host::note_index_of(hwnd, *id).tags())
-        .unwrap_or_default();
-    let mode = if mode == Mode::Tree && nodes.is_empty() {
-        Mode::Empty
+    let open = library_host::notebooks(hwnd);
+    let several = library_host::several_notebooks(hwnd);
+    // A notebook whose notes or index haven't loaded is left out for now, and counted.
+    let (indexed, unindexed): (Vec<_>, Vec<_>) = library_host::searchable_notebooks(hwnd)
+        .into_iter()
+        .partition(|s| library_host::index_loaded_of(hwnd, s.id));
+    let mut skipped = library_host::skipped_notebooks(hwnd);
+    skipped.loading += unindexed.len();
+    let name = if several {
+        Some("all notebooks".to_owned())
     } else {
-        mode
+        open.first()
+            .and_then(|(id, _)| library_host::notebook_display_name(hwnd, *id))
+    };
+    let header = format!(
+        "{}{}",
+        header_text(name.as_deref()),
+        if several {
+            library_host::skipped_suffix(skipped)
+        } else {
+            String::new()
+        }
+    );
+    let labels: HashMap<NotebookId, String> = if several {
+        indexed.iter().map(|s| (s.id, s.label.clone())).collect()
+    } else {
+        HashMap::new()
+    };
+    let nodes = merge_tags(
+        indexed
+            .iter()
+            .map(|s| (s.id, library_host::note_index_of(hwnd, s.id).tags()))
+            .collect(),
+    );
+    let mode = match () {
+        _ if open.is_empty() => Mode::NoNotebook,
+        _ if indexed.is_empty() => Mode::Loading,
+        _ if nodes.is_empty() => Mode::Empty,
+        _ => Mode::Tree,
     };
     let (client, dpi) = geometry(panel);
     with_view(hwnd, |view| {
-        view.notebook = target;
-        view.notebook_name = name;
+        view.header = header;
         let rows = if mode == Mode::Tree {
-            tag_rows(&nodes, &view.expanded)
+            tag_rows(&nodes, &view.expanded, &labels)
         } else {
             Vec::new()
         };
@@ -509,18 +570,6 @@ pub(crate) fn refresh(hwnd: HWND, panel: HWND) {
         view.set_rows(mode, rows, dpi, height(area));
     });
     invalidate(panel);
-}
-
-/// The target notebook may have changed (another tab came to the front): the view refreshes
-/// only when it now lists another notebook.
-pub(crate) fn target_changed(hwnd: HWND, panel: HWND) {
-    let target = library_host::target_notebook(hwnd);
-    let Some(shown) = with_view(hwnd, |view| view.notebook.as_ref().map(|(id, _)| *id)) else {
-        return;
-    };
-    if shown != target {
-        refresh(hwnd, panel);
-    }
 }
 
 pub(crate) fn refresh_metrics(hwnd: HWND, panel: HWND) {
@@ -579,14 +628,9 @@ fn run(hwnd: HWND, panel: HWND, action: TagAction) {
             refresh(hwnd, panel);
         }
         TagAction::Open { note, keep } => {
-            // Relative to the notebook the view lists.
-            let Some(folder) = with_view(hwnd, |view| view.notebook.clone())
-                .flatten()
-                .map(|(_, folder)| folder)
-            else {
+            let Some(path) = library_host::note_ref_path(hwnd, &note) else {
                 return;
             };
-            let path = folder.join(note);
             let (mode, focus) = if keep {
                 (OpenMode::Permanent, true)
             } else {
@@ -701,6 +745,14 @@ pub(crate) fn shown_header(hwnd: HWND) -> String {
     with_view(hwnd, |view| view.header()).unwrap_or_default()
 }
 
+/// Runs a click's or key's action, for in-process tests.
+#[cfg(test)]
+pub(crate) fn test_run(hwnd: HWND, action: TagAction) {
+    if let Some((_, panel)) = crate::window::side_panel::windows(hwnd) {
+        run(hwnd, panel, action);
+    }
+}
+
 /// The rows the view lists, for in-process tests.
 #[cfg(test)]
 pub(crate) fn shown_rows(hwnd: HWND) -> Vec<TagRow> {
@@ -754,7 +806,8 @@ impl crate::window::sidebar_accessibility::AccessibleView for TagsView {
                 ),
                 Some(*expanded),
             ),
-            TagRowKind::Note(_) => (row.name.clone(), None),
+            TagRowKind::Note(_) if row.detail.is_empty() => (row.name.clone(), None),
+            TagRowKind::Note(_) => (format!("{}, in {}", row.name, row.detail), None),
         };
         Some(outline_item(
             name, expanded, row.depth, selected, focused, rect, visible,
@@ -799,6 +852,7 @@ mod tests {
     fn the_header_names_the_notebook_whose_tags_it_lists() {
         // Break caught: with several notebooks open, nothing saying whose tags these are.
         assert_eq!(header_text(Some("Work")), "Tags in Work");
+        assert_eq!(header_text(Some("all notebooks")), "Tags in all notebooks");
         assert_eq!(header_text(None), "Tags");
     }
 
@@ -812,16 +866,41 @@ mod tests {
         }
     }
 
-    fn tree() -> Vec<TagNode> {
-        vec![
-            node(
-                "project",
-                "project",
-                &["plan.md"],
-                vec![node("atlas", "project/atlas", &[r"work\atlas.md"], vec![])],
-            ),
-            node("todo", "todo", &["a.md", "b.md"], vec![]),
-        ]
+    const ONE: NotebookId = NotebookId(1);
+
+    fn tree() -> Vec<MergedTag<NotebookId>> {
+        merge_tags(vec![(
+            ONE,
+            vec![
+                node(
+                    "project",
+                    "project",
+                    &["plan.md"],
+                    vec![node("atlas", "project/atlas", &[r"work\atlas.md"], vec![])],
+                ),
+                node("todo", "todo", &["a.md", "b.md"], vec![]),
+            ],
+        )])
+    }
+
+    fn note(path: &str) -> NoteRef {
+        NoteRef {
+            notebook: ONE,
+            path: PathBuf::from(path),
+        }
+    }
+
+    #[test]
+    fn note_rows_name_their_notebook_only_when_labels_are_given() {
+        // Break caught: the notebook's name missing from a note row with several notebooks
+        // open, or shown with one (multi-root search spec §6).
+        let expanded: HashSet<String> = ["todo".to_owned()].into();
+        let rows = tag_rows(&tree(), &expanded, &HashMap::new());
+        assert_eq!(rows[2].detail, "");
+        let labels: HashMap<NotebookId, String> = [(ONE, "Work".to_owned())].into();
+        let rows = tag_rows(&tree(), &expanded, &labels);
+        assert_eq!(rows[2].detail, "Work");
+        assert_eq!(rows[0].detail, "", "tag rows have no notebook");
     }
 
     fn names(rows: &[TagRow]) -> Vec<(String, u16)> {
@@ -832,7 +911,7 @@ mod tests {
 
     #[test]
     fn collapsed_tags_show_only_the_top_level() {
-        let rows = tag_rows(&tree(), &HashSet::new());
+        let rows = tag_rows(&tree(), &HashSet::new(), &HashMap::new());
         assert_eq!(
             names(&rows),
             [("#project".to_owned(), 0), ("#todo".to_owned(), 0)]
@@ -843,7 +922,7 @@ mod tests {
     #[test]
     fn an_expanded_tag_lists_its_notes_then_its_child_tags() {
         let expanded: HashSet<String> = ["project".to_owned(), "project/atlas".to_owned()].into();
-        let rows = tag_rows(&tree(), &expanded);
+        let rows = tag_rows(&tree(), &expanded, &HashMap::new());
         assert_eq!(
             names(&rows),
             [
@@ -854,10 +933,7 @@ mod tests {
                 ("#todo".to_owned(), 0),
             ]
         );
-        assert_eq!(
-            rows[3].kind,
-            TagRowKind::Note(PathBuf::from(r"work\atlas.md"))
-        );
+        assert_eq!(rows[3].kind, TagRowKind::Note(note(r"work\atlas.md")));
     }
 
     #[test]
@@ -869,7 +945,12 @@ mod tests {
             right: 260,
             bottom: 400,
         };
-        view.set_rows(Mode::Tree, tag_rows(&tree(), &HashSet::new()), 96, 400);
+        view.set_rows(
+            Mode::Tree,
+            tag_rows(&tree(), &HashSet::new(), &HashMap::new()),
+            96,
+            400,
+        );
         view.list.select(0, 400);
         assert_eq!(
             view.key(VK_RIGHT, client, 96),
@@ -883,7 +964,7 @@ mod tests {
         view.expanded.insert("todo".to_owned());
         view.set_rows(
             Mode::Tree,
-            tag_rows(&tree(), &view.expanded.clone()),
+            tag_rows(&tree(), &view.expanded.clone(), &HashMap::new()),
             96,
             400,
         );
@@ -891,7 +972,7 @@ mod tests {
         assert_eq!(
             view.key(VK_RETURN, client, 96),
             Some(Some(TagAction::Open {
-                note: PathBuf::from("a.md"),
+                note: note("a.md"),
                 keep: true
             }))
         );
