@@ -39,6 +39,9 @@ pub enum Placeholder {
     Empty,
     /// The scan stopped at its limit: the root's rows above are not all of its notes.
     Truncated,
+    /// A folder of this notebook is moving to another drive: its progress, and Cancel (multi-root
+    /// move spec §3.3). Under that folder's row.
+    Moving,
 }
 
 impl AsRef<TreeRow> for TreeRow {

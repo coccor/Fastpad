@@ -12,6 +12,8 @@ use crate::library::tree::{self, RowKind};
 use crate::library::{self, capture, capture_file};
 use crate::platform::files;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::HWND;
 
 /// Where a move goes.
@@ -24,10 +26,371 @@ pub(crate) enum Destination {
     Closed { root: PathBuf },
 }
 
+/// A folder on its way to another drive (spec §2.3, §3.3).
+pub(crate) struct Moving {
+    generation: u64,
+    started: Started,
+    plan: MovePlan,
+    /// Files copied of the total, as the worker last said.
+    progress: (usize, usize),
+    cancel: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for Moving {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Moving")
+            .field("generation", &self.generation)
+            .field("item", &self.started.item)
+            .field("progress", &self.progress)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What a folder move to another drive needs when it lands.
+#[derive(Clone, Debug)]
+struct Started {
+    from: NotebookId,
+    dest: NotebookId,
+    source_root: PathBuf,
+    dest_root: PathBuf,
+    dest_label: String,
+    item: Item,
+    landing: PathBuf,
+    with_images: bool,
+}
+
+impl Started {
+    fn source(&self) -> PathBuf {
+        self.source_root.join(self.item.path())
+    }
+
+    fn destination(&self) -> PathBuf {
+        self.dest_root.join(&self.landing)
+    }
+
+    fn name(&self) -> String {
+        name_of(self.item.path())
+    }
+}
+
+fn with_moving<R>(hwnd: HWND, f: impl FnOnce(&Moving) -> R) -> Option<R> {
+    library_host::with_moving(hwnd, |moving, _| moving.as_ref().map(f)).flatten()
+}
+
 /// The name of what the notebook `id` is moving to another drive, while it does.
 pub(crate) fn busy(hwnd: HWND, id: NotebookId) -> Option<String> {
-    let _ = (hwnd, id);
-    None
+    with_moving(hwnd, |moving| {
+        (moving.started.from == id).then(|| moving.started.name())
+    })
+    .flatten()
+}
+
+/// Whether `path` (absolute) is inside, or is, the folder moving to another drive: its tabs'
+/// writes wait, and it can't be renamed, deleted, dragged or moved meanwhile (spec §3.3).
+pub(crate) fn holds(hwnd: HWND, path: &Path) -> bool {
+    with_moving(hwnd, |moving| {
+        let source = moving.started.source();
+        library::model::same_path(&source, path) || library::is_inside(&source, path)
+    })
+    .unwrap_or(false)
+}
+
+/// `holds`, saying so: "Wait for the move of *work* to finish." True when it refused.
+pub(crate) fn refuse_if_moving(hwnd: HWND, path: &Path) -> bool {
+    if !holds(hwnd, path) {
+        return false;
+    }
+    if let Some(name) = with_moving(hwnd, |moving| moving.started.name()) {
+        push_notice(hwnd, format!("Wait for the move of {name} to finish."));
+    }
+    true
+}
+
+/// The folder (relative) of the notebook `id` moving to another drive and its progress row's
+/// text: "Moving to *B*… *k* of *n* — Cancel" (spec §3.3).
+pub(crate) fn moving_row(hwnd: HWND, id: NotebookId) -> Option<(PathBuf, String)> {
+    with_moving(hwnd, |moving| {
+        (moving.started.from == id).then(|| {
+            let (copied, total) = moving.progress;
+            (
+                moving.started.item.path().to_path_buf(),
+                format!(
+                    "Moving to {}… {copied} of {total} — Cancel",
+                    library_host::notebook_name(&moving.started.dest_root)
+                ),
+            )
+        })
+    })
+    .flatten()
+}
+
+/// The running move's files copied and total.
+#[cfg(test)]
+pub(crate) fn moving_progress(hwnd: HWND) -> Option<(usize, usize)> {
+    with_moving(hwnd, |moving| moving.progress)
+}
+
+/// Pumps the window's messages until no folder move is running.
+#[cfg(test)]
+pub(crate) fn wait_for_moves(hwnd: HWND) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while with_moving(hwnd, |_| ()).is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the move never came back"
+        );
+        super::main_window::pump_posted_messages(hwnd);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Cancels the folder moving out of the notebook `from`: the worker removes its partial copy.
+pub(crate) fn cancel_move(hwnd: HWND, from: NotebookId) {
+    with_moving(hwnd, |moving| {
+        if moving.started.from == from {
+            moving.cancel.store(true, Ordering::SeqCst);
+        }
+    });
+}
+
+/// Whether the window (`closing` `None`) or the notebook `closing` may close with a folder
+/// moving to another drive (spec §3.3): a move out of it, or any move when the window closes,
+/// asks "A move to *B* is still running. Cancel it and close?" and is cancelled on yes; a move
+/// into it is cancelled.
+pub(crate) fn may_close(hwnd: HWND, closing: Option<NotebookId>) -> bool {
+    let Some((from, dest, dest_root)) = with_moving(hwnd, |moving| {
+        (
+            moving.started.from,
+            moving.started.dest,
+            moving.started.dest_root.clone(),
+        )
+    }) else {
+        return true;
+    };
+    let cancel = |hwnd: HWND| {
+        with_moving(hwnd, |moving| moving.cancel.store(true, Ordering::SeqCst));
+    };
+    if closing == Some(dest) {
+        cancel(hwnd);
+        return true;
+    }
+    if closing.is_some_and(|id| id != from) {
+        return true;
+    }
+    let question = format!(
+        "A move to {} is still running. Cancel it and close?",
+        library_host::notebook_name(&dest_root)
+    );
+    let Some(identity) = (unsafe { super::main_window::window_identity(hwnd) }) else {
+        return false;
+    };
+    let chosen =
+        crate::window::modal::choose(hwnd, &question, &["Cancel move and close", "Keep running"]);
+    if !identity.is_live_for(hwnd) || chosen != 0 {
+        return false;
+    }
+    cancel(hwnd);
+    true
+}
+
+/// `WM_DESTROY`: a running move is cancelled and waited for; its partial copy goes.
+pub(crate) fn stop(hwnd: HWND) {
+    let moving = library_host::with_moving(hwnd, |moving, _| moving.take()).flatten();
+    if let Some(mut moving) = moving {
+        moving.cancel.store(true, Ordering::SeqCst);
+        if let Some(thread) = moving.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Starts the worker for a folder going to another drive, unless one is already moving.
+fn start_folder_move(hwnd: HWND, started: Started, plan: MovePlan) {
+    if let Some(name) = with_moving(hwnd, |moving| moving.started.name()) {
+        push_notice(hwnd, format!("Wait for the move of {name} to finish."));
+        return;
+    }
+    let (source, destination) = (started.source(), started.destination());
+    library_host::begin_own_writes(hwnd, [source.as_path(), destination.as_path()]);
+    let cancel = Arc::new(AtomicBool::new(false));
+    library_host::with_moving(hwnd, |moving, generation| {
+        *generation += 1;
+        let job = super::move_worker::Job {
+            target: hwnd as isize,
+            generation: *generation,
+            source,
+            destination,
+            cancel: Arc::clone(&cancel),
+        };
+        *moving = Some(Moving {
+            generation: *generation,
+            started,
+            plan,
+            progress: (0, 0),
+            cancel,
+            thread: Some(super::move_worker::spawn(job)),
+        });
+    });
+    side_panel::refresh(hwnd);
+}
+
+/// `WM_FASTPAD_MOVE_PROGRESS`: the progress row follows.
+pub(crate) fn move_progress(hwnd: HWND, wparam: usize, lparam: isize) {
+    let updated = library_host::with_moving(hwnd, |moving, _| {
+        let moving = moving
+            .as_mut()
+            .filter(|moving| moving.generation == wparam as u64)?;
+        moving.progress = super::move_worker::unpack(lparam);
+        Some(())
+    })
+    .flatten();
+    if updated.is_some() {
+        notebook_view::rebuild(hwnd);
+    }
+}
+
+/// `WM_FASTPAD_MOVE_DONE`: frees the outcome and applies it (spec §3.3).
+pub(crate) fn move_done(hwnd: HWND, lparam: isize) {
+    if lparam == 0 {
+        return;
+    }
+    let done = *unsafe { Box::from_raw(lparam as *mut super::move_worker::Done) };
+    let moving = library_host::with_moving(hwnd, |moving, _| {
+        if moving
+            .as_ref()
+            .is_some_and(|moving| moving.generation == done.generation)
+        {
+            moving.take()
+        } else {
+            None
+        }
+    })
+    .flatten();
+    let Some(mut moving) = moving else {
+        return;
+    };
+    if let Some(thread) = moving.thread.take() {
+        let _ = thread.join();
+    }
+    let started = moving.started.clone();
+    let (source, destination) = (started.source(), started.destination());
+    library_host::end_own_writes(hwnd, [source.as_path(), destination.as_path()]);
+    let name = started.name();
+    let open = |id| library_host::notebook_folder(hwnd, id).is_some();
+    match done.outcome {
+        super::move_worker::Outcome::Copied { .. }
+            if !open(started.from) || !open(started.dest) =>
+        {
+            // A notebook closed after the check: the move is dropped, and the copy with it, so
+            // the original is the only one.
+            let _ = std::fs::remove_dir_all(&destination);
+        }
+        super::move_worker::Outcome::Copied { .. } => {
+            land(hwnd, &started, &moving.plan);
+            side_panel::refresh(hwnd);
+            return;
+        }
+        super::move_worker::Outcome::Cancelled => {
+            push_notice(
+                hwnd,
+                format!("Move of {name} cancelled. Nothing was moved."),
+            );
+        }
+        super::move_worker::Outcome::Failed(error) => {
+            push_notice(
+                hwnd,
+                format!("Couldn't move {name}: {error}. Nothing was moved."),
+            );
+        }
+        super::move_worker::Outcome::Changed => {
+            push_notice(
+                hwnd,
+                format!("{name} changed while it was being moved. Nothing was moved."),
+            );
+        }
+    }
+    // Writes held during the move go where the files still are.
+    save_held(hwnd, &source);
+    side_panel::refresh(hwnd);
+}
+
+/// A checked copy landed: the original goes to the Recycle Bin, then the tabs, the libraries
+/// and the tree follow, as for a move on one drive. An original that can't be recycled stays,
+/// and both notebooks list what they have.
+fn land(hwnd: HWND, started: &Started, plan: &MovePlan) {
+    let (source, destination) = (started.source(), started.destination());
+    let name = started.name();
+    if !super::copy_host::recycle_path(hwnd, &source) {
+        let folders = folders_on_disk(&started.dest_root, &started.landing);
+        let notes: Vec<PathBuf> = plan.notes.iter().map(|(_, new)| new.clone()).collect();
+        library_host::with_notebook(hwnd, started.dest, |state| {
+            state.arrive(&folders, &notes, &[]);
+        });
+        library_host::request_index_of(hwnd, started.dest);
+        push_notice(
+            hwnd,
+            format!(
+                "{name} was copied to {}, but the original in {} couldn't be removed.",
+                library_host::notebook_name(&started.dest_root),
+                library_host::notebook_name(&started.source_root),
+            ),
+        );
+        save_held(hwnd, &source);
+        return;
+    }
+    for (id, path, _) in library_host::tabs_under(hwnd, &source) {
+        let target = destination.join(library::record_path(&source, &path));
+        if let Some(mut app) = unsafe { super::main_window::app_ptr(hwnd) } {
+            let _ = unsafe { app.as_mut() }.tabs.rebind_path(id, target);
+        }
+    }
+    library_host::reroot_save_folders(hwnd, &source, &destination);
+    hand_off(
+        hwnd,
+        started.from,
+        Some(started.dest),
+        &started.dest_root,
+        plan,
+        &started.item,
+        &started.landing,
+    );
+    let done = [(started.item.clone(), started.landing.clone())];
+    // The images stayed in the source: they come along now, as on one drive.
+    let failed = if started.with_images {
+        Facts::of(hwnd, started.from, &started.source_root).map_or(0, |source_facts| {
+            bring_images(
+                hwnd,
+                started.dest,
+                &started.source_root,
+                &started.dest_root,
+                &source_facts,
+                plan,
+                &done,
+            )
+        })
+    } else {
+        0
+    };
+    finish(
+        hwnd,
+        Some(started.dest),
+        &started.dest_label,
+        plan,
+        &done,
+        failed,
+    );
+    save_held(hwnd, &destination);
+}
+
+/// Saves the dirty tabs under `folder` (absolute) whose writes waited for a move.
+fn save_held(hwnd: HWND, folder: &Path) {
+    for (_, path, dirty) in library_host::tabs_under(hwnd, folder) {
+        if dirty {
+            library_host::save_before_move(hwnd, &path);
+        }
+    }
 }
 
 /// One notebook's facts, owned, for `cross_move::plan`.
@@ -125,6 +488,10 @@ pub(crate) fn move_items(hwnd: HWND, from: NotebookId, items: Vec<RowKind>, dest
             _ => None,
         })
         .collect();
+    // Nothing goes into a folder that is itself moving to another drive.
+    if refuse_if_moving(hwnd, &dest_root.join(&dest_folder)) {
+        return;
+    }
     if items.is_empty() {
         return;
     }
@@ -190,14 +557,28 @@ pub(crate) fn move_items(hwnd: HWND, from: NotebookId, items: Vec<RowKind>, dest
         return;
     }
     let same_drive = files::same_volume(&source_root, &dest_root);
-    if !same_drive && let Some(folder) = items.iter().find(|item| matches!(item, Item::Folder(_))) {
-        push_notice(
-            hwnd,
-            format!(
-                "Couldn't move {}: moving folders to another drive isn't ready yet.",
-                name_of(folder.path())
-            ),
-        );
+    if !same_drive && items.iter().any(|item| matches!(item, Item::Folder(_))) {
+        // A folder to another drive goes on the worker (spec §2.3), one at a time.
+        if let (Some(dest_id), [(item @ Item::Folder(_), landing)]) = (dest_id, &plan.moves[..]) {
+            let started = Started {
+                from,
+                dest: dest_id,
+                source_root,
+                dest_root,
+                dest_label,
+                item: item.clone(),
+                landing: landing.clone(),
+                with_images: answer == Answer::MoveWithImages,
+            };
+            start_folder_move(hwnd, started, plan);
+        } else {
+            push_notice(
+                hwnd,
+                format!(
+                    "Couldn't move {label}: move one folder at a time to another drive, into an open notebook."
+                ),
+            );
+        }
         return;
     }
     let paths: Vec<PathBuf> = plan

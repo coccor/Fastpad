@@ -70,6 +70,11 @@ fn autosave_active_with(hwnd: HWND, target: impl Fn(HWND) -> Option<PathBuf>) ->
     let Some(path) = target(hwnd) else {
         return Autosave::NotEligible;
     };
+    // Its folder is moving to another drive: the write waits for the move (multi-root move
+    // spec §3.3).
+    if crate::window::cross_move_host::holds(hwnd, &path) {
+        return Autosave::NotEligible;
+    }
     // The guard runs right before the write: nothing between here and `complete_save` yields.
     let active = |hwnd: HWND| {
         unsafe { app_ptr(hwnd) }.and_then(|app| {

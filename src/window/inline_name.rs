@@ -803,6 +803,15 @@ pub(crate) fn rename(hwnd: HWND, id: library_host::NotebookId, row: &RowKind) {
         RowKind::Folder(relative) => Purpose::RenameFolder(relative.clone()),
         RowKind::Draft | RowKind::Root | RowKind::Placeholder(_) => return,
     };
+    // A folder moving to another drive, or a note in it, keeps its name until the move ends
+    // (multi-root move spec §3.3).
+    if let (Some(root), Some(relative)) = (
+        library_host::notebook_folder(hwnd, id),
+        crate::window::tree_drag::source_path(row),
+    ) && crate::window::cross_move_host::refuse_if_moving(hwnd, &root.join(relative))
+    {
+        return;
+    }
     start(hwnd, id, purpose);
 }
 

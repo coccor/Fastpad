@@ -41,6 +41,7 @@ mod about_and_settings_dialog;
 mod command_palette;
 mod copy_host_and_panel_drop;
 mod cross_move;
+mod cross_move_drive;
 mod daily_notes_and_templates;
 mod editing_shortcuts;
 mod external_changes;

@@ -344,6 +344,9 @@ pub(crate) fn delete_note(hwnd: HWND) {
 /// After a confirm, sends `path` to the Recycle Bin and closes its tab if it has one. Any record
 /// stays, flagged deleted and marked missing, so the 30-day purge removes it.
 pub(crate) fn delete_file(hwnd: HWND, path: &Path) {
+    if crate::window::cross_move_host::refuse_if_moving(hwnd, path) {
+        return;
+    }
     // The callers checked the default notebook; a note of another one needs its own file.
     if let Some((owner, _)) = note_root(hwnd, path)
         && !ready_library_of(hwnd, Some(owner))

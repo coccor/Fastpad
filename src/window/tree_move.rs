@@ -210,6 +210,9 @@ pub(crate) fn drop_into_of(
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
+    if super::cross_move_host::refuse_if_moving(hwnd, &root.join(folder)) {
+        return;
+    }
     let is_folder = matches!(source, RowKind::Folder(_));
     let (listed, taken) = library_host::with_notebook(hwnd, id, |state| {
         let listed = if is_folder {

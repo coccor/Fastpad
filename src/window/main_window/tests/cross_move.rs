@@ -334,22 +334,6 @@ fn a_closed_destination_moves_nothing() {
 }
 
 #[test]
-fn a_folder_to_another_drive_is_refused_for_now() {
-    let _scintilla = load_native_scintilla();
-    let t = two("xmove-drive-later", &[(r"work\x.md", "x")], &[]);
-    let hwnd = t.window.hwnd;
-    crate::platform::files::force_other_volume_for_test(true);
-
-    cross_move_host::move_items(hwnd, t.a_id, vec![folder("work")], into(t.b_id, ""));
-
-    crate::platform::files::force_other_volume_for_test(false);
-    assert!(t.a.join(r"work\x.md").exists());
-    assert!(notices(hwnd).contains(
-        &"Couldn't move work: moving folders to another drive isn't ready yet.".to_owned()
-    ));
-}
-
-#[test]
 fn a_note_to_another_drive_moves_through_move_file() {
     // Break caught: a cross-drive note refused like a folder, or rename_no_replace used where it
     // cannot work.

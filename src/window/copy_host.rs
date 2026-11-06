@@ -173,6 +173,12 @@ pub(crate) fn fail_next_recycle() {
     FAIL_RECYCLE.with(|fail| fail.set(true));
 }
 
+/// Sends `path`, a file or a folder, to the Recycle Bin (`fail_next_recycle` in tests). A
+/// folder moved to another drive goes this way once its copy is checked.
+pub(crate) fn recycle_path(hwnd: HWND, path: &Path) -> bool {
+    recycle(hwnd, path)
+}
+
 fn recycle(hwnd: HWND, path: &Path) -> bool {
     #[cfg(test)]
     if FAIL_RECYCLE.with(|fail| fail.replace(false)) {

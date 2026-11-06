@@ -562,6 +562,10 @@ pub(crate) fn activate(hwnd: HWND, index: usize, how: Activation) {
             RowKind::Placeholder(tree::Placeholder::Failed) => {
                 crate::window::library_host::retry_load_of(hwnd, id);
             }
+            // "Moving to B… k of n — Cancel" cancels that move (multi-root move spec §3.3).
+            RowKind::Placeholder(tree::Placeholder::Moving) => {
+                crate::window::cross_move_host::cancel_move(hwnd, id);
+            }
             RowKind::Note(relative) => {
                 let Some(root) = crate::window::library_host::notebook_folder(hwnd, id) else {
                     return;

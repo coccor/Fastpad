@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::config::FileIconSet;
-use crate::library::tree::{RowKind, TreeRow};
+use crate::library::tree::{self, RowKind, TreeRow};
 use crate::window::design::metrics::{scale, sidebar_row};
 use crate::window::design::round::paint_focus_ring;
 use crate::window::design::text_scale::scale_text;
@@ -126,7 +126,11 @@ pub(super) fn draw_tree_row(
                 left: parts.chevron.left,
                 ..rect
             };
-            let words = placeholder_text(*placeholder);
+            // A moving folder's row carries its own progress text.
+            let words = match placeholder {
+                tree::Placeholder::Moving => row.name.as_str(),
+                _ => placeholder_text(*placeholder),
+            };
             unsafe { draw_text(dc, words, text, fonts.italic, muted, LINE) };
             return;
         }

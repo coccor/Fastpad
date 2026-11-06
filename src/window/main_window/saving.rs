@@ -177,6 +177,18 @@ fn save_active_to(
         }
         return SaveOutcome::Failed;
     }
+    // A tab inside a folder moving to another drive keeps its edits until the move ends, then
+    // saves where the folder landed (multi-root move spec §3.3).
+    if !is_save_as
+        && let Some(path) = unsafe { app_ptr(hwnd) }
+            .and_then(|app| unsafe { app.as_ref() }.tabs.active()?.path.clone())
+        && crate::window::cross_move_host::holds(hwnd, &path)
+    {
+        if report_failure {
+            crate::window::cross_move_host::refuse_if_moving(hwnd, &path);
+        }
+        return SaveOutcome::Failed;
+    }
     let mut original_path: Option<std::path::PathBuf> = None;
     if let Some(path) = new_path {
         original_path = unsafe { app_ptr(hwnd) }

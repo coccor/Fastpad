@@ -148,6 +148,13 @@ pub(super) fn arm_drag(
             .map(|(root, path)| root.join(path)),
         _ => None,
     };
+    // A row moving to another drive stays put until the move ends (multi-root move spec §3.3).
+    if row_path
+        .as_deref()
+        .is_some_and(|path| crate::window::cross_move_host::holds(hwnd, path))
+    {
+        return;
+    }
     with_view(hwnd, |view| {
         view.drag = Drag::armed(source, x, y).map(|mut drag| {
             drag.row_path = row_path;
