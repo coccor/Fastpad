@@ -10,6 +10,20 @@ FastPad ships one build in two forms, attached to every GitHub release:
 
 `Cargo.toml` is the only place the version is written.
 
+## Building and packaging locally
+
+```powershell
+pwsh -File tools/fetch-native.ps1           # download and SHA-256-verify Scintilla and Lexilla
+pwsh -File tools/build-native.ps1           # build the DLLs into native\out\x64
+cargo build --release
+cargo test -- --test-threads=1              # Windows integration tests must run serially
+pwsh -File tools/audit-dependencies.ps1     # allow only the pinned dependency closure
+pwsh -File tools/package.ps1                # dist\FastPad-<version>-windows-x64.zip
+pwsh -File tools/verify-package.ps1         # add -RequireSignature for signed release builds
+pwsh -File tools/package-installer.ps1      # dist\FastPad-<version>-windows-x64-setup.exe (Inno Setup 6)
+pwsh -File tools/verify-installer.ps1       # silent install, registration checks, uninstall
+```
+
 ## Cutting a release
 
 1. Bump `version` in `Cargo.toml`, run `cargo build` so `Cargo.lock` follows, and merge to `main`.
