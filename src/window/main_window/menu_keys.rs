@@ -1,4 +1,4 @@
-//! The menu band's menu mode, opening menus, menu keys, and accelerator translation.
+//! The menu column's menu mode, opening menus, menu keys, and accelerator translation.
 
 use super::*;
 
@@ -12,15 +12,8 @@ pub(crate) fn menu_mode(hwnd: HWND) -> Option<MenuMode> {
     unsafe { app_ptr(hwnd) }.and_then(|app| unsafe { app.as_ref() }.menu_mode)
 }
 
-pub(super) fn menu_band_height(hwnd: HWND) -> i32 {
-    menu_mode(hwnd).map_or(0, |_| {
-        menu_band::band_height(
-            unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) }.max(96),
-        )
-    })
-}
-
-/// The menu band's heading rectangles, or none outside menu mode.
+/// The menu column's heading rectangles, or none outside menu mode. The column sits in the
+/// window's top-left corner, right under the title strip.
 pub(super) fn menu_headings(hwnd: HWND) -> Vec<RECT> {
     if menu_mode(hwnd).is_none() {
         return Vec::new();
@@ -29,13 +22,13 @@ pub(super) fn menu_headings(hwnd: HWND) -> Vec<RECT> {
     let widths = menu_band::measure_titles(hwnd, title_chrome(hwnd).1.text());
     menu_band::heading_rects(
         &widths,
-        crate::window::side_panel::left_edge(hwnd),
+        crate::window::design::metrics::scale(menu_band::COLUMN_MARGIN_AT_96_DPI, dpi),
         title_layout(hwnd).height,
         dpi,
     )
 }
 
-/// Stores `mode`, re-laying out the window when the band appears or disappears.
+/// Stores `mode`, showing, repainting or removing the menu column's popup to match.
 fn set_menu_mode(hwnd: HWND, mode: Option<MenuMode>) {
     let Some(mut app) = (unsafe { app_ptr(hwnd) }) else {
         return;
@@ -45,11 +38,13 @@ fn set_menu_mode(hwnd: HWND, mode: Option<MenuMode>) {
     if previous == mode {
         return;
     }
-    if previous.is_some() != mode.is_some() {
-        layout_editor_and_find_bar(hwnd);
-    }
-    unsafe {
-        InvalidateRect(hwnd, std::ptr::null(), 0);
+    super::menu_overlay::sync(hwnd);
+}
+
+/// Keeps the menu column under the title strip when the window moves or resizes.
+pub(super) fn follow_menu_column(hwnd: HWND) {
+    if menu_mode(hwnd).is_some() {
+        super::menu_overlay::sync(hwnd);
     }
 }
 
@@ -177,7 +172,7 @@ pub(super) fn open_menu(hwnd: HWND, mut index: usize) {
     }
 }
 
-/// Keyboard navigation of the menu band; false leaves the key to the default handling.
+/// Keyboard navigation of the stacked menu column; false leaves the key to the default handling.
 pub(super) fn handle_menu_key(hwnd: HWND, message: u32, key: WPARAM) -> bool {
     let Some(mode) = menu_mode(hwnd) else {
         return false;
@@ -186,13 +181,15 @@ pub(super) fn handle_menu_key(hwnd: HWND, message: u32, key: WPARAM) -> bool {
         return false;
     };
     match key {
-        VK_LEFT | VK_RIGHT => {
-            let hot = menu_band::neighbor(mode.hot, key == VK_RIGHT);
+        VK_UP | VK_DOWN => {
+            let hot = menu_band::neighbor(mode.hot, key == VK_DOWN);
             set_menu_mode(hwnd, Some(MenuMode { hot, ..mode }));
         }
-        VK_DOWN | VK_UP | VK_RETURN => open_menu(hwnd, mode.hot),
+        // The dropdown opens to the right of its heading.
+        VK_RIGHT | VK_RETURN | VK_SPACE => open_menu(hwnd, mode.hot),
+        VK_LEFT => {}
         VK_ESCAPE => exit_menu_mode(hwnd),
-        // Alt and F10 toggle the band through `translate_accelerator`.
+        // Alt and F10 toggle the column through `translate_accelerator`.
         VK_MENU | VK_F10 | VK_SHIFT | VK_CONTROL => {}
         // Alt+letter arrives again as SC_KEYMENU with the letter, which opens the heading.
         _ if message == WM_SYSKEYDOWN => return false,
