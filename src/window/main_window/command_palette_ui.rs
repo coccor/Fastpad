@@ -9,7 +9,7 @@ pub(super) fn layout_command_palette(hwnd: HWND) {
     if !with_command_palette(hwnd, CommandPalette::is_visible).unwrap_or(false) {
         return;
     }
-    let top = title_layout(hwnd).height + menu_band_height(hwnd) + bar_band_height(hwnd);
+    let top = title_layout(hwnd).height + bar_band_height(hwnd);
     let mut rect = RECT::default();
     unsafe {
         GetClientRect(hwnd, &mut rect);

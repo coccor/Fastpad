@@ -18,7 +18,7 @@ pub(crate) fn layout_editor_and_find_bar(hwnd: HWND) {
     if group_hwnd(hwnd).is_none() {
         return;
     }
-    let title_height = title_layout(hwnd).height + menu_band_height(hwnd);
+    let title_height = title_layout(hwnd).height;
     let width = (rect.right - rect.left - left).max(0);
     let font = title_chrome(hwnd).1.text();
     // The name box spans the editor area under the title row, over the top groups.
@@ -455,9 +455,9 @@ pub(crate) fn layout_group(hwnd: HWND, group: HWND) {
     let font = title_chrome(hwnd).1.text();
     let width = client.right;
     let strip_height = crate::window::group_strip::strip_height(dpi);
-    // The menu band and the name box sit under the title row, over the top groups' content.
+    // The name box sits under the title row, over the top groups' content.
     let band = if is_top_group(hwnd, group) {
-        menu_band_height(hwnd) + name_box_band_height(hwnd, dpi)
+        name_box_band_height(hwnd, dpi)
     } else {
         0
     };
@@ -668,7 +668,7 @@ pub(crate) fn paint_group(hwnd: HWND, group: HWND) {
                 },
             );
         }
-        client.top = layout.height + menu_band_height(hwnd) + name_box_band_height(hwnd, dpi);
+        client.top = layout.height + name_box_band_height(hwnd, dpi);
     }
     if group_tab_count(hwnd, id) == 0 {
         unsafe {

@@ -4,7 +4,7 @@
 use super::*;
 
 #[test]
-fn alt_shows_a_painted_menu_band_that_pushes_the_editor_down_and_runs_dropdown_commands() {
+fn alt_shows_a_stacked_menu_column_in_the_corner_and_runs_dropdown_commands() {
     // Break caught: Alt attached a native menu bar, which Windows drew unthemed over the editor
     // (the reclaimed caption leaves it no room) and left a "File" remnant behind after Escape.
     use crate::window::menus::{DropdownExit, answer_next_dropdown};
@@ -33,7 +33,6 @@ fn alt_shows_a_painted_menu_band_that_pushes_the_editor_down_and_runs_dropdown_c
     let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
     // The editor group's tab strip is the title row, so the editor starts right below it.
     let title_height = super::super::title_layout(window.hwnd).height;
-    let band = super::super::menu_band::band_height(dpi);
 
     key_menu(0);
     assert_eq!(
@@ -47,21 +46,59 @@ fn alt_shows_a_painted_menu_band_that_pushes_the_editor_down_and_runs_dropdown_c
         unsafe { GetMenu(window.hwnd) }.is_null(),
         "no native menu bar"
     );
-    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(window.hwnd) }.max(96);
+    // The column floats over the window in its own popup, so nothing under it moves.
     assert_eq!(
         editor_top(),
-        title_height + band + crate::window::editor_toolbar::row_height(dpi)
+        title_height + crate::window::editor_toolbar::row_height(dpi)
     );
-    assert_eq!(super::super::menu_headings(window.hwnd).len(), 5);
+    // Break caught: the headings side by side in a band under the tabs instead of stacked in
+    // the top-left corner under the title strip.
+    let headings = super::super::menu_headings(window.hwnd);
+    assert_eq!(headings.len(), 5);
+    assert!(headings[0].top >= title_height);
+    assert!(headings[0].left < crate::window::design::metrics::scale(16, dpi));
+    for pair in headings.windows(2) {
+        assert_eq!(pair[0].bottom, pair[1].top);
+        assert_eq!(pair[0].left, pair[1].left);
+    }
+    let overlay = super::super::menu_overlay::overlay(window.hwnd);
+    assert!(!overlay.is_null());
+    let mut column = RECT::default();
+    let mut origin = windows_sys::Win32::Foundation::POINT::default();
+    unsafe {
+        GetWindowRect(overlay, &mut column);
+        windows_sys::Win32::Graphics::Gdi::ClientToScreen(window.hwnd, &mut origin);
+    }
+    assert_eq!(column.top - origin.y, title_height);
+    assert!(column.bottom - origin.y >= headings[4].bottom);
+
+    // Down and Up move along the column without opening anything.
+    for (key, hot) in [
+        (super::super::VK_DOWN, 1),
+        (super::super::VK_UP, 0),
+        (super::super::VK_UP, 4),
+    ] {
+        assert!(super::super::handle_menu_key(
+            window.hwnd,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+            key as usize,
+        ));
+        assert_eq!(
+            app_mut(window.hwnd).menu_mode,
+            Some(super::super::MenuMode { hot, open: false })
+        );
+    }
 
     key_menu(0);
     assert_eq!(app_mut(window.hwnd).menu_mode, None);
+    assert!(super::super::menu_overlay::overlay(window.hwnd).is_null());
     assert_eq!(
         editor_top(),
         title_height + crate::window::editor_toolbar::row_height(dpi)
     );
 
-    // Alt+E opens Edit; Right moves to Search, whose Escape leaves Search highlighted.
+    // Alt+E opens Edit; the pointer moving onto Search switches to it, whose Escape leaves
+    // Search highlighted.
     answer_next_dropdown(|hwnd, heading| {
         assert_eq!(heading, 1);
         assert_eq!(
@@ -83,7 +120,7 @@ fn alt_shows_a_painted_menu_band_that_pushes_the_editor_down_and_runs_dropdown_c
         })
     );
 
-    // Down opens the highlighted heading; a picked command leaves menu mode before it runs.
+    // Right opens the highlighted heading; a picked command leaves menu mode before it runs.
     answer_next_dropdown(|_, heading| {
         assert_eq!(heading, 2);
         DropdownExit::Command(CommandId::Find)
@@ -91,7 +128,7 @@ fn alt_shows_a_painted_menu_band_that_pushes_the_editor_down_and_runs_dropdown_c
     assert!(super::super::handle_menu_key(
         window.hwnd,
         windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
-        super::super::VK_DOWN as usize,
+        super::super::VK_RIGHT as usize,
     ));
     assert_eq!(app_mut(window.hwnd).menu_mode, None);
     assert!(app_mut(window.hwnd).find_bar().unwrap().is_visible());

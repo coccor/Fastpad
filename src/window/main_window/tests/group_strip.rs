@@ -233,7 +233,7 @@ fn a_caption_right_click_over_the_strip_opens_the_strip_menu() {
 }
 
 #[test]
-fn the_group_region_leaves_the_caption_buttons_and_the_menu_band_to_the_main_window() {
+fn the_group_region_leaves_the_caption_buttons_to_the_main_window() {
     // Break caught: the group window covering the app menu and caption buttons, or the menu
     // band shown under it, so the main window can neither paint them nor get their clicks.
     use windows_sys::Win32::Graphics::Gdi::{
@@ -263,18 +263,13 @@ fn the_group_region_leaves_the_caption_buttons_and_the_menu_band_to_the_main_win
         assert!(!covers(center.x, center.y));
     }
 
+    // The menu column floats in its own popup: the strip and the editor stay where they are.
     super::super::enter_menu_mode(window.hwnd, 0);
     let dpi = unsafe { GetDpiForWindow(window.hwnd) }.max(96);
-    let band = super::super::menu_band::band_height(dpi);
-    let heading = super::super::menu_headings(window.hwnd)[0];
-    assert!(!covers(
-        (heading.left + heading.right) / 2,
-        (heading.top + heading.bottom) / 2
-    ));
     assert!(covers(tab.x + left, tab.y));
     assert_eq!(
         origin_in(editor.hwnd(), window.hwnd).1,
-        title.height + band + crate::window::editor_toolbar::row_height(dpi)
+        title.height + crate::window::editor_toolbar::row_height(dpi)
     );
 }
 
