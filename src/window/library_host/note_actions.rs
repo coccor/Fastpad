@@ -4,6 +4,7 @@ use super::*;
 use crate::library;
 use crate::library::ops::PendingOp;
 use crate::library::title;
+use crate::library::tree::RowKind;
 use crate::window::command_palette::{Picker, PickerKind};
 use crate::window::main_window::{app_ptr, push_notice, window_identity};
 use std::path::{Path, PathBuf};
@@ -51,7 +52,8 @@ pub(super) fn move_destinations(hwnd: HWND, source: &Path) -> Vec<PathBuf> {
     destinations
 }
 
-/// Note: Move to notebook… (spec §6.6): picks another notebook, whose root receives the file.
+/// Note: Move to notebook… (spec §6.6, multi-root move spec §3.4): picks another notebook, then,
+/// for an open one, a folder in it.
 pub(crate) fn move_to_notebook(hwnd: HWND, path: &Path) {
     let Some(source) = note_root(hwnd, path) else {
         push_notice(
@@ -60,7 +62,27 @@ pub(crate) fn move_to_notebook(hwnd: HWND, path: &Path) {
         );
         return;
     };
-    let destinations = move_destinations(hwnd, &source.1);
+    show_move_picker(hwnd, path, &source.1);
+}
+
+/// Move to notebook… on the folder `relative` of the notebook `id` (multi-root move spec §3.4).
+pub(crate) fn move_folder_to_notebook(hwnd: HWND, id: NotebookId, relative: &Path) {
+    let Some(root) = notebook_folder(hwnd, id) else {
+        return;
+    };
+    if !library::tree::is_plain_relative_folder(relative) {
+        return;
+    }
+    show_move_picker(hwnd, &root.join(relative), &root);
+}
+
+/// Step 1 of Move to notebook…: the other notebooks for `path` (absolute), of the notebook at
+/// `source`.
+fn show_move_picker(hwnd: HWND, path: &Path, source: &Path) {
+    if crate::window::cross_move_host::refuse_if_moving(hwnd, path) {
+        return;
+    }
+    let destinations = move_destinations(hwnd, source);
     let mut items: Vec<String> = library::local::display_names(&destinations)
         .into_iter()
         .map(|(name, hint)| match hint {
@@ -91,17 +113,6 @@ pub(super) fn note_root(hwnd: HWND, path: &Path) -> Option<(NotebookId, PathBuf)
     library::is_inside(&root, path).then_some((id, root))
 }
 
-/// Whether some open tab already has `path`, by its stored path (which may no longer exist on
-/// disk, e.g. after the file it names was deleted or moved outside FastPad).
-pub(super) fn tab_open_for(hwnd: HWND, path: &Path) -> bool {
-    unsafe { app_ptr(hwnd) }.is_some_and(|app| {
-        unsafe { app.as_ref() }
-            .tabs
-            .find_stored_path(path)
-            .is_some()
-    })
-}
-
 /// Makes a `rebind_open_tab` failure visible: a tab is left pointing at a path that no longer
 /// exists, because another tab already had the new one open. A file moved outside FastPad onto
 /// a path another tab has open reaches this through the rescan; `move_note_to` refuses such a
@@ -118,122 +129,93 @@ pub(crate) fn report_rebind_failure(hwnd: HWND, old: &Path, new: &Path) {
     );
 }
 
-/// Moves `note` into `destination`'s root. A clash, another tab already at the target, or a
-/// failure changes nothing and says so. The pin goes, because pins belong to a notebook, and an
-/// open tab follows the file. A cross-volume move that copied but could not delete the source
-/// (spec: `MOVEFILE_COPY_ALLOWED`) leaves the source, its pin and its index entry alone: the
-/// library state must still match what's on disk.
-pub(super) fn move_note_to(hwnd: HWND, note: &Path, destination: &Path) {
-    let Some(file_name) = note.file_name() else {
+/// Move to notebook… chose the notebook `destination` for `item` (absolute, a note or a
+/// folder): an open notebook asks for a folder in it next (multi-root move spec §3.4); a folder
+/// inside an open notebook (from Browse…) is that folder; any other folder receives it at its
+/// root.
+pub(super) fn move_item_to_notebook(hwnd: HWND, item: &Path, destination: &Path) {
+    let open = notebooks(hwnd)
+        .into_iter()
+        .find(|(_, folder)| library::model::same_path(folder, destination));
+    if let Some((id, _)) = open {
+        let folders = folder_choices(hwnd, id);
+        let name = notebook_name(destination);
+        let mut items = vec![format!("{name} (root)")];
+        items.extend(
+            folders
+                .iter()
+                .skip(1)
+                .map(|folder| folder.to_string_lossy().into_owned()),
+        );
+        host(hwnd, |host| {
+            host.shown_move_folders = Some((item.to_path_buf(), id, folders));
+        });
+        crate::window::main_window::open_picker(
+            hwnd,
+            Picker {
+                kind: PickerKind::MoveToFolder,
+                items,
+                create: None,
+                initial: None,
+            },
+        );
+        return;
+    }
+    let dest = match note_root(hwnd, destination) {
+        Some((id, root)) => crate::window::cross_move_host::Destination::Open {
+            id,
+            folder: library::record_path(&root, destination),
+        },
+        None => crate::window::cross_move_host::Destination::Closed {
+            root: destination.to_path_buf(),
+        },
+    };
+    move_item_to(hwnd, item, dest);
+}
+
+/// The folders of the open notebook `id` a move may go into: the root (empty) first, then
+/// every folder by relative path in natural order.
+pub(super) fn folder_choices(hwnd: HWND, id: NotebookId) -> Vec<PathBuf> {
+    let mut folders = with_notebook(hwnd, id, |state| state.folders.clone()).unwrap_or_default();
+    folders.sort_by(|a, b| library::tree::natural_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
+    folders.dedup_by(|a, b| library::model::same_path(a, b));
+    std::iter::once(PathBuf::new()).chain(folders).collect()
+}
+
+/// Moves `item` (absolute) of its open notebook to `dest`, through the same planner, question
+/// and hand-off as a drag (multi-root move spec §3.4).
+pub(super) fn move_item_to(
+    hwnd: HWND,
+    item: &Path,
+    dest: crate::window::cross_move_host::Destination,
+) {
+    let Some((from, root)) = note_root(hwnd, item) else {
+        push_notice(
+            hwnd,
+            "Only notes in an open notebook can be moved to another notebook.".to_owned(),
+        );
         return;
     };
-    let target = destination.join(file_name);
-    let notebook = notebook_name(destination);
-    if library::model::same_path(&target, note) {
-        push_notice(
-            hwnd,
-            format!("{} is already in {notebook}.", title::note_title(note)),
-        );
-        return;
-    }
-    if target.exists() {
+    if let crate::window::cross_move_host::Destination::Open { id, .. } = &dest
+        && *id == from
+    {
         push_notice(
             hwnd,
             format!(
-                "{} already exists in {notebook}. Nothing was moved.",
-                file_name.to_string_lossy()
+                "{} is already in {}.",
+                title::note_title(item),
+                notebook_name(&root)
             ),
         );
         return;
     }
-    if tab_open_for(hwnd, &target) {
-        push_notice(
-            hwnd,
-            format!(
-                "Another tab already has {} open. Nothing was moved.",
-                file_name.to_string_lossy()
-            ),
-        );
-        return;
-    }
-    if !save_before_move(hwnd, note) {
-        return;
-    }
-    if let Err(error) = crate::platform::files::move_file(note, &target) {
-        push_notice(
-            hwnd,
-            format!(
-                "FastPad could not move {} to {notebook}: {error}",
-                note.display()
-            ),
-        );
-        return;
-    }
-    if note.exists() {
-        // MOVEFILE_COPY_ALLOWED can report success after copying across volumes even when it
-        // could not then delete the source (still open elsewhere, read-only, a locked volume).
-        // The source is still there, so its pin and index entry still describe it correctly.
-        push_notice(
-            hwnd,
-            format!(
-                "{} was copied to {notebook}, but the original could not be removed.",
-                title::note_title(note)
-            ),
-        );
-        return;
-    }
-    // The note leaves the notebook it was in (`source`) unless the target is in it too; an open
-    // destination notebook lists it at once (multi-root notebooks spec §5.3).
-    let source = note_root(hwnd, note);
-    let stays_inside = source
-        .as_ref()
-        .is_some_and(|(_, root)| library::is_inside(root, &target));
-    if let Some((source, _)) = source {
-        if stays_inside {
-            with_notebook(hwnd, source, |state| state.rename_note(note, &target));
-            schedule_write(hwnd);
-        } else {
-            let record = with_notebook(hwnd, source, |state| {
-                state.record_for(note).map(|record| record.id)
-            })
-            .flatten();
-            if let Some(id) = record {
-                report(
-                    hwnd,
-                    apply_op_of(hwnd, source, |_, _| Some(PendingOp::Drop { id })),
-                );
-            }
-            with_notebook(hwnd, source, |state| state.remove_note(note));
-        }
-    }
-    let arrived = (!stays_inside)
-        .then(|| note_root(hwnd, &target))
-        .flatten()
-        .map(|(destination, _)| destination);
-    if let Some(destination) = arrived {
-        with_notebook(hwnd, destination, |state| state.add_note(&target));
-        request_index_of(hwnd, destination);
-    }
-    match rebind_open_tab(hwnd, note, target.clone()) {
-        // The tab followed the note out of the notebook: a preview would be replaced by the
-        // next click in the tree, so it becomes a normal tab, as a rename makes it.
-        Ok(true) => promote_tab_for(hwnd, &target),
-        Ok(false) => {}
-        Err(()) => report_rebind_failure(hwnd, note, &target),
-    }
-    push_notice(
-        hwnd,
-        format!("Moved {} to {notebook}.", title::note_title(&target)),
-    );
-    crate::window::side_panel::refresh(hwnd);
-    // Links that would no longer reach the moved note (second brain phase 1 spec §7.6).
-    if stays_inside && let Some((source, root)) = note_root(hwnd, &target) {
-        let moved = (
-            library::record_path(&root, note),
-            library::record_path(&root, &target),
-        );
-        notes_moved_of(hwnd, source, &[moved]);
-    }
+    let relative = library::record_path(&root, item);
+    let kind = if item.is_dir() {
+        RowKind::Folder(relative)
+    } else {
+        RowKind::Note(relative)
+    };
+    crate::window::cross_move_host::move_items(hwnd, from, vec![kind], dest);
 }
 
 /// Writes the unsaved edits of `note`'s tab, if it has one, so they move with the file. A tab

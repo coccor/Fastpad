@@ -471,3 +471,100 @@ fn an_image_that_fails_keeps_its_link_and_the_notice_says_so() {
         notices(hwnd)
     );
 }
+
+fn picker_items(hwnd: HWND) -> Vec<String> {
+    with_command_palette(hwnd, |p| p.picker().map(|picker| picker.items.clone()))
+        .flatten()
+        .unwrap_or_default()
+}
+
+fn pick(hwnd: HWND, kind: crate::window::command_palette::PickerKind, index: usize) {
+    library_host::picked(
+        hwnd,
+        kind,
+        crate::window::command_palette::PickerChoice::Item(index),
+    );
+}
+
+#[test]
+fn move_to_notebook_takes_a_folder_and_a_destination_folder() {
+    // Break caught: Move to notebook… only for notes, or only into the other notebook's root
+    // (multi-root move spec §3.4).
+    use crate::window::command_palette::PickerKind;
+    let _scintilla = load_native_scintilla();
+    let t = two(
+        "xmove-picker-folder",
+        &[(r"work\x.md", "x")],
+        &[(r"projects\keep.md", "")],
+    );
+    let hwnd = t.window.hwnd;
+
+    library_host::move_folder_to_notebook(hwnd, t.a_id, Path::new("work"));
+    assert_eq!(picker_items(hwnd)[0], "B");
+    pick(hwnd, PickerKind::MoveToNotebook, 0);
+    assert_eq!(picker_items(hwnd), ["B (root)", "projects"]);
+    pick(hwnd, PickerKind::MoveToFolder, 1);
+
+    assert!(!t.a.join("work").exists());
+    assert!(t.b.join(r"projects\work\x.md").exists());
+    assert!(listed(hwnd, t.b_id, r"projects\work\x.md"));
+}
+
+#[test]
+fn the_folder_step_lists_the_root_then_folders_in_natural_order() {
+    use crate::window::command_palette::PickerKind;
+    let _scintilla = load_native_scintilla();
+    let t = two(
+        "xmove-picker-order",
+        &[("a.md", "a")],
+        &[(r"b10\n.md", ""), (r"b2\n.md", ""), (r"a\deep\n.md", "")],
+    );
+    let hwnd = t.window.hwnd;
+    library_host::move_to_notebook(hwnd, &t.a.join("a.md"));
+    pick(hwnd, PickerKind::MoveToNotebook, 0);
+    assert_eq!(
+        picker_items(hwnd),
+        ["B (root)", "a", r"a\deep", "b2", "b10"]
+    );
+    pick(hwnd, PickerKind::MoveToFolder, 0);
+    assert!(t.b.join("a.md").exists(), "the root");
+}
+
+#[test]
+fn a_folder_to_a_notebook_that_is_not_open_lands_in_its_root() {
+    use crate::window::command_palette::PickerKind;
+    let _scintilla = load_native_scintilla();
+    let t = two("xmove-picker-closed", &[(r"work\x.md", "x")], &[]);
+    let hwnd = t.window.hwnd;
+    assert!(library_host::close_notebook_of(hwnd, t.b_id));
+
+    library_host::move_folder_to_notebook(hwnd, t.a_id, Path::new("work"));
+    let items = picker_items(hwnd);
+    let b = items.iter().position(|item| item == "B").unwrap();
+    pick(hwnd, PickerKind::MoveToNotebook, b);
+
+    assert!(t.b.join(r"work\x.md").exists(), "no folder step");
+    assert!(!listed(hwnd, t.a_id, r"work\x.md"));
+}
+
+#[test]
+fn ctrl_shift_m_takes_the_selected_folder_row() {
+    // Break caught: the command ignoring a selected folder and moving the active tab's note.
+    let _scintilla = load_native_scintilla();
+    let t = two(
+        "xmove-picker-key",
+        &[(r"work\x.md", "x"), ("a.md", "a")],
+        &[],
+    );
+    let hwnd = t.window.hwnd;
+    super::super::open_path(hwnd, &t.a.join("a.md")).unwrap();
+    crate::window::notebook_view::rebuild(hwnd);
+    crate::window::notebook_view::select_row(hwnd, t.a_id, &folder("work"));
+    let panel = sidebar_windows(hwnd).1;
+    unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(panel) };
+
+    execute_command(hwnd, crate::window::commands::CommandId::NoteMoveToNotebook);
+
+    let (item, _) = app_mut(hwnd).library.shown_move.clone().unwrap();
+    assert_eq!(item, t.a.join("work"));
+}

@@ -1251,6 +1251,9 @@ fn a_palette_rename_and_a_move_turn_the_preview_into_a_normal_tab() {
     super::super::open_note(window.hwnd, &b, super::super::OpenMode::Preview, false).unwrap();
     assert!(app_mut(window.hwnd).tabs.preview_id().is_some());
     execute_command(window.hwnd, CommandId::NoteMoveToNotebook);
+    // The notebook isn't indexed here: the move asks about links it can't count (multi-root
+    // move spec §3.2).
+    crate::window::modal::answer_next_choice(|_| 0);
     crate::window::library_host::picked(
         window.hwnd,
         crate::window::command_palette::PickerKind::MoveToNotebook,

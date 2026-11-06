@@ -108,6 +108,9 @@ pub(crate) struct LibraryHost {
     /// The note an open Move to notebook picker moves, and the notebooks it lists, in row order.
     /// The row after the last is "Browse…".
     pub(crate) shown_move: Option<(PathBuf, Vec<PathBuf>)>,
+    /// What Move to notebook's folder step moves, into which open notebook, and the folders it
+    /// lists, in row order (multi-root move spec §3.4).
+    pub(crate) shown_move_folders: Option<(PathBuf, NotebookId, Vec<PathBuf>)>,
     /// Copies into the tree, queued on one worker thread (open editors spec §4.5).
     pub(crate) copy_worker: super::copy_host::CopyWorker,
     /// A folder moving to a notebook on another drive, on its worker (multi-root move spec §2.3).
@@ -145,6 +148,7 @@ impl LibraryHost {
             check_request: 0,
             expansion_revision: 0,
             shown_move: None,
+            shown_move_folders: None,
             copy_worker: super::copy_host::CopyWorker::default(),
             moving: None,
             move_generation: 0,

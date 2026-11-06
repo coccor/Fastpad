@@ -65,7 +65,24 @@ pub(crate) fn picked(hwnd: HWND, kind: PickerKind, choice: PickerChoice) {
                 }
                 None => return,
             };
-            move_note_to(hwnd, &note, &destination);
+            move_item_to_notebook(hwnd, &note, &destination);
+        }
+        (PickerKind::MoveToFolder, PickerChoice::Item(index)) => {
+            let Some((item, id, folders)) =
+                host(hwnd, |host| host.shown_move_folders.take()).flatten()
+            else {
+                return;
+            };
+            if let Some(folder) = folders.get(index) {
+                move_item_to(
+                    hwnd,
+                    &item,
+                    crate::window::cross_move_host::Destination::Open {
+                        id,
+                        folder: folder.clone(),
+                    },
+                );
+            }
         }
         (
             PickerKind::QuickOpen,

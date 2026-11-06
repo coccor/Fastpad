@@ -93,8 +93,10 @@ fn run_command(hwnd: HWND, command: CommandId, recorded: Option<std::path::PathB
         .then(|| recorded.or_else(|| crate::window::notebook_view::focused_note(hwnd)))
         .flatten();
     // Rename and Delete on a focused folder row act on the folder (notebook folders spec §4.2).
-    let tree_folder = (matches!(command, CommandId::NoteRename | CommandId::NoteDelete)
-        && tree_note.is_none())
+    let tree_folder = (matches!(
+        command,
+        CommandId::NoteRename | CommandId::NoteDelete | CommandId::NoteMoveToNotebook
+    ) && tree_note.is_none())
     .then(|| crate::window::notebook_view::focused_folder(hwnd))
     .flatten();
     // A focused (or recorded) note or folder lets a note-scoped command through even with no
@@ -387,7 +389,10 @@ fn run_command(hwnd: HWND, command: CommandId, recorded: Option<std::path::PathB
             }
         }
         CommandId::NoteMoveToNotebook => {
-            if let Some(path) = note_target(hwnd, tree_note.as_deref()) {
+            // A selected folder row moves the folder (multi-root move spec §3.4).
+            if let Some((id, folder)) = &tree_folder {
+                crate::window::library_host::move_folder_to_notebook(hwnd, *id, folder);
+            } else if let Some(path) = note_target(hwnd, tree_note.as_deref()) {
                 crate::window::library_host::move_to_notebook(hwnd, &path);
             }
         }

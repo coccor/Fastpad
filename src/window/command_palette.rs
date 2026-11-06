@@ -369,6 +369,8 @@ pub(crate) fn filter_entries(
 pub(crate) enum PickerKind {
     RecentFolder,
     MoveToNotebook,
+    /// Move to notebook's second step: a folder of the chosen open notebook.
+    MoveToFolder,
     /// Ctrl+P (quick-open spec §3): notes by name. Its rows come from `main_window`, not from
     /// `Picker::items`.
     QuickOpen,
@@ -1291,7 +1293,10 @@ impl CommandPalette {
             ),
             PickerKind::Language => Some(LANGUAGE_PLACEHOLDER),
             PickerKind::Encoding => Some(ENCODING_PLACEHOLDER),
-            PickerKind::RecentFolder | PickerKind::MoveToNotebook | PickerKind::Template => None,
+            PickerKind::RecentFolder
+            | PickerKind::MoveToNotebook
+            | PickerKind::MoveToFolder
+            | PickerKind::Template => None,
         }
     }
 

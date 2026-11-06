@@ -22,7 +22,6 @@ pub(crate) enum Destination {
     /// A folder (relative; empty is the root) of an open notebook.
     Open { id: NotebookId, folder: PathBuf },
     /// The root of a notebook that isn't open.
-    #[allow(dead_code, reason = "Move to notebook… sends it from a later commit")]
     Closed { root: PathBuf },
 }
 

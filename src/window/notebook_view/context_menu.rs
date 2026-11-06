@@ -105,6 +105,7 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
                     CommandId::NotesNewFromTemplate,
                 ),
                 MenuEntry::Separator,
+                MenuEntry::command("Move to notebook...", CommandId::NoteMoveToNotebook),
                 MenuEntry::local("Rename...\tF2", CommandId::NoteRename),
                 MenuEntry::command("Reveal in Explorer", CommandId::NoteRevealInExplorer),
                 MenuEntry::Separator,
@@ -125,6 +126,9 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
                 }
                 Some(CommandId::NoteRename) => {
                     crate::window::inline_name::rename(hwnd, id, &row.kind);
+                }
+                Some(CommandId::NoteMoveToNotebook) => {
+                    crate::window::library_host::move_folder_to_notebook(hwnd, id, relative);
                 }
                 Some(CommandId::NoteRevealInExplorer) => {
                     crate::window::library_host::reveal(hwnd, &path)
