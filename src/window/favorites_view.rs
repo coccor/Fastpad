@@ -12,7 +12,7 @@ use crate::window::menus::{self, MenuEntry};
 use crate::window::panel::fill;
 use crate::window::row_list::{self, ListKey, RowListState, RowLook, row_foreground};
 use crate::window::side_panel::{ViewPaint, draw_text, point_of};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     ClientToScreen, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
@@ -53,16 +53,19 @@ pub(crate) struct FavoriteRow {
     pub open: bool,
 }
 
-/// The favorites sorted by name, then by hint, with the open notebook marked.
-pub(crate) fn favorite_rows(favorites: &[PathBuf], open: Option<&Path>) -> Vec<FavoriteRow> {
-    let open = open.map(normalize_folder);
+/// The favorites sorted by name, then by hint, with every open notebook marked.
+pub(crate) fn favorite_rows(favorites: &[PathBuf], open: &[PathBuf]) -> Vec<FavoriteRow> {
+    let open = open
+        .iter()
+        .map(|folder| normalize_folder(folder))
+        .collect::<Vec<_>>();
     let mut rows = favorites
         .iter()
         .zip(local::display_names(favorites))
         .map(|(folder, (name, hint))| FavoriteRow {
             open: open
-                .as_ref()
-                .is_some_and(|open| same_path(open, &normalize_folder(folder))),
+                .iter()
+                .any(|open| same_path(open, &normalize_folder(folder))),
             folder: folder.clone(),
             name,
             hint,
@@ -525,8 +528,11 @@ fn point(lparam: LPARAM) -> POINT {
 /// Re-reads the favorites and the open notebook. Part of `side_panel::refresh`.
 pub(crate) fn refresh(hwnd: HWND, panel: HWND) {
     let favorites = library_host::favorites(hwnd);
-    let open = library_host::folder(hwnd);
-    let rows = favorite_rows(&favorites, open.as_deref());
+    let open = library_host::notebooks(hwnd)
+        .into_iter()
+        .map(|(_, folder)| folder)
+        .collect::<Vec<_>>();
+    let rows = favorite_rows(&favorites, &open);
     let (client, dpi) = geometry(panel);
     with_view(hwnd, |view| {
         let area = view.list_area(client, dpi);
@@ -690,8 +696,22 @@ pub(crate) fn run(hwnd: HWND, action: FavoriteAction, keyboard: bool) {
     match action {
         // Checked on a worker: a missing folder shows a notice and changes nothing (spec §4.3).
         // Once the notebook is open, the Notebook view shows it.
+        // A notebook that is already open is revealed in its tree instead: no check, no reopen.
         FavoriteAction::Open(folder) => {
-            library_host::open_listed_notebook_in_view(hwnd, &folder, keyboard);
+            let open = library_host::notebooks(hwnd)
+                .into_iter()
+                .find(|(_, open)| same_path(open, &normalize_folder(&folder)));
+            match open {
+                Some((id, _)) => {
+                    crate::window::side_panel::show_view(
+                        hwnd,
+                        crate::config::SidebarView::Notebook,
+                        keyboard,
+                    );
+                    crate::window::notebook_view::reveal_notebook(hwnd, id);
+                }
+                None => library_host::open_listed_notebook_in_view(hwnd, &folder, keyboard),
+            }
         }
         FavoriteAction::Remove(folder) => library_host::remove_favorite(hwnd, &folder),
         FavoriteAction::Reveal(folder) => library_host::reveal(hwnd, &folder),
@@ -813,7 +833,7 @@ impl crate::window::sidebar_accessibility::AccessibleView for FavoritesView {
 #[cfg(test)]
 mod tests {
     use super::{FavoriteAction, FavoritesView, KeyResult, favorite_rows};
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use windows_sys::Win32::Foundation::{POINT, RECT};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DELETE, VK_DOWN, VK_RETURN};
 
@@ -827,7 +847,7 @@ mod tests {
     fn view(favorites: &[&str]) -> FavoritesView {
         let favorites = favorites.iter().map(PathBuf::from).collect::<Vec<_>>();
         let mut view = FavoritesView::new(96);
-        view.set_rows(favorite_rows(&favorites, None), 96, 400);
+        view.set_rows(favorite_rows(&favorites, &[]), 96, 400);
         view
     }
 
@@ -837,7 +857,7 @@ mod tests {
         // (paths differ only in case), or two "Notes" folders shown identically.
         let favorites =
             [r"C:\b\Notes", r"C:\Work 10", r"C:\a\Notes", r"C:\Work 2"].map(PathBuf::from);
-        let rows = favorite_rows(&favorites, Some(Path::new(r"c:\WORK 2")));
+        let rows = favorite_rows(&favorites, &[PathBuf::from(r"c:\WORK 2")]);
         let names = rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>();
         assert_eq!(names, ["Notes", "Notes", "Work 2", "Work 10"]);
         assert_eq!(rows[0].folder, PathBuf::from(r"C:\a\Notes"));
@@ -864,7 +884,7 @@ mod tests {
         let favorites = [r"C:\a\Alpha", r"C:\b\Beta"].map(PathBuf::from);
         let mut view = FavoritesView::new(96);
         view.set_rows(
-            favorite_rows(&favorites, Some(Path::new(r"C:\a\Alpha"))),
+            favorite_rows(&favorites, &[PathBuf::from(r"C:\a\Alpha")]),
             96,
             400,
         );
@@ -978,7 +998,7 @@ mod tests {
         // Break caught: a stale selection index past the end after the last favorite was removed.
         let mut view = view(&[r"C:\a", r"C:\b"]);
         view.list.select(1, 400);
-        view.set_rows(favorite_rows(&[PathBuf::from(r"C:\a")], None), 96, 400);
+        view.set_rows(favorite_rows(&[PathBuf::from(r"C:\a")], &[]), 96, 400);
         assert_eq!(
             view.list.selected,
             Some(1),

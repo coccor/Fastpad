@@ -163,6 +163,12 @@ fn host<R>(hwnd: HWND, f: impl FnOnce(&mut LibraryHost) -> R) -> Option<R> {
     unsafe { app_ptr(hwnd) }.map(|mut app| f(&mut unsafe { app.as_mut() }.library))
 }
 
+/// How many listed-notebook checks have started (tests compare it before and after a click).
+#[cfg(test)]
+pub(crate) fn check_request(hwnd: HWND) -> u64 {
+    host(hwnd, |host| host.check_request).unwrap_or(0)
+}
+
 fn notes_mode(hwnd: HWND) -> bool {
     unsafe { app_ptr(hwnd) }.is_some_and(|app| unsafe { app.as_ref() }.settings.notes_mode)
 }

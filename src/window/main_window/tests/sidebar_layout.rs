@@ -611,3 +611,20 @@ fn a_text_size_change_refreshes_the_stored_sidebar_row_heights() {
     let sidebar = app_mut(window.hwnd).sidebar.as_ref().expect("a sidebar");
     assert_eq!(sidebar.favorites.row_height_for_test(), 39);
 }
+
+#[test]
+fn the_notebook_label_counts_open_notebooks() {
+    // Break caught: the label naming only the default notebook while several are open.
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("label-count", "a", "b");
+    let hwnd = ab.window.hwnd;
+    assert_eq!(
+        crate::window::activity_bar::notebook_label(hwnd),
+        "2 notebooks"
+    );
+    crate::window::library_host::close_notebook_of(hwnd, ab.b_id);
+    assert_eq!(
+        crate::window::activity_bar::notebook_label(hwnd),
+        "Notebook: A"
+    );
+}

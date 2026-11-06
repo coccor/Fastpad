@@ -154,10 +154,21 @@ pub(crate) fn button_at(rects: &[RECT; BUTTONS], x: i32, y: i32) -> Option<Activ
 
 /// The Notebook button's tooltip and accessible name: "Notebook: <name>" while a notebook is
 /// open, `ActivityButton::Notebook.label()` otherwise.
-pub(crate) fn notebook_label(name: Option<&str>) -> String {
+pub(crate) fn notebook_label_for(name: Option<&str>) -> String {
     match name {
         Some(name) => format!("Notebook: {name}"),
         None => ActivityButton::Notebook.label().to_owned(),
+    }
+}
+
+/// The Notebook button's label for the window's open notebooks: "Notebook: <name>" for one,
+/// "<N> notebooks" for several (multi-root notebooks spec 5.4).
+pub(crate) fn notebook_label(hwnd: HWND) -> String {
+    let open = super::library_host::notebooks(hwnd);
+    match open.as_slice() {
+        [] => notebook_label_for(None),
+        [(_, folder)] => notebook_label_for(Some(&super::library_host::notebook_name(folder))),
+        several => format!("{} notebooks", several.len()),
     }
 }
 
@@ -373,14 +384,14 @@ fn paint(main: HWND, bar: HWND) {
 pub(crate) fn bar_items(
     rects: [RECT; BUTTONS],
     view: SidebarView,
-    notebook: Option<&str>,
+    notebook: &str,
     focused: Option<usize>,
 ) -> Vec<AccessibleItem> {
     ActivityButton::ALL
         .into_iter()
         .map(|button| {
             let name = if button == ActivityButton::Notebook {
-                notebook_label(notebook)
+                notebook.to_owned()
             } else {
                 button.label().to_owned()
             };
@@ -408,13 +419,12 @@ fn bar_geometry(bar: HWND) -> (RECT, u32) {
 pub(crate) fn accessible_items(bar: HWND) -> Vec<AccessibleItem> {
     let main = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetParent(bar) };
     let (client, dpi) = bar_geometry(bar);
-    let notebook =
-        super::library_host::folder(main).map(|folder| super::library_host::notebook_name(&folder));
+    let notebook = notebook_label(main);
     let focused = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() } == bar;
     bar_items(
         button_rects(client, dpi),
         super::side_panel::current_view(main),
-        notebook.as_deref(),
+        &notebook,
         focused.then(|| super::side_panel::bar_focus(main)),
     )
 }
@@ -539,7 +549,7 @@ pub(crate) fn paint_keyboard_focus(
 
 #[cfg(test)]
 mod tests {
-    use super::{ActivityButton, button_at, button_rects, logo_rect, notebook_label, scale};
+    use super::{ActivityButton, button_at, button_rects, logo_rect, notebook_label_for, scale};
     use crate::config::SidebarView;
     use windows_sys::Win32::Foundation::RECT;
 
@@ -631,7 +641,7 @@ mod tests {
     fn the_notebook_label_names_the_open_notebook() {
         // Break caught: a Notebook tooltip that never says which notebook is open, or one that
         // reads "Notebook: " with nothing after it while none is.
-        assert_eq!(notebook_label(Some("Work")), "Notebook: Work");
-        assert_eq!(notebook_label(None), "Notebook");
+        assert_eq!(notebook_label_for(Some("Work")), "Notebook: Work");
+        assert_eq!(notebook_label_for(None), "Notebook");
     }
 }

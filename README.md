@@ -183,9 +183,20 @@ typing. Both panes scroll together.
 
 <img src="docs/images/notebook.png" alt="The notebook sidebar with folders and notes, and a note open in the editor" width="800">
 
-Open any folder and it becomes your notebook: a tree in the sidebar, folders as they are on disk,
+Open any folder and it becomes a notebook: a tree in the sidebar, folders as they are on disk,
 pinned notes first. Notes are plain files, so nothing is locked in. **File → New notebook…** names
-a new folder and opens it as your notebook in one step.
+a new folder and opens it as a notebook in one step.
+
+Opening another notebook adds it to the sidebar instead of replacing the first. Each open notebook
+is a collapsible root row of its own, and the sidebar button and tooltip read "*N* notebooks" once
+several are open. Every root has its own `…` menu with **Close notebook**, **Set as default
+notebook** and **Add to Favorites** (or **Remove from Favorites**). New notes and folders go to
+the notebook you're working in, otherwise the default one, and quick capture always uses the
+default. Search, Quick Open and Tags cover the notebook you're working in, wikilinks stay inside
+their own notebook, and notes can't be dragged between notebooks yet. FastPad reopens the same
+notebooks next time (`folders.ini` keeps them as `open=` lines, with the default marked
+`default=`). A notebook that isn't available at startup, such as one on an unplugged drive, is
+skipped with a notice but stays remembered until its drive returns.
 
 - **Write fast.** New notes are named inline and save themselves once they're in the notebook.
   Create, rename, move (drag and drop) and delete notes and folders right in the tree.
@@ -193,7 +204,8 @@ a new folder and opens it as your notebook in one step.
   options, and jump to any note by typing part of its name. Nothing is indexed; results stream in.
 - **Open Editors** lists every open tab above the tree. Drag files in from Explorer or from Open
   Editors to copy them into the notebook.
-- Star notebooks to keep them in **Favorites**, pick coloured, minimal or solid file icons, and
+- Star notebooks to keep them in **Favorites**, which highlights every open one and jumps to it in
+  the tree when you click it. Pick coloured, minimal or solid file icons, and
   drive it all from the keyboard or a screen reader.
 
 Pins travel with the notebook in `.fastpad\library.ini`, and nothing is written into a folder until
