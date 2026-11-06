@@ -35,6 +35,21 @@ pub(crate) struct NoteRef {
 
 /// Every loaded open notebook, in sidebar order, with its label.
 pub(crate) fn searchable_notebooks(hwnd: HWND) -> Vec<Searchable> {
+    with_searchable_states(hwnd, |loaded| {
+        loaded
+            .iter()
+            .map(|(searchable, _)| searchable.clone())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Runs `f` on every loaded open notebook at once, in sidebar order, each with its loaded
+/// state: for views that read several notebooks' notes without copying them.
+pub(crate) fn with_searchable_states<R>(
+    hwnd: HWND,
+    f: impl FnOnce(&[(Searchable, &LibraryState)]) -> R,
+) -> Option<R> {
     host(hwnd, |host| {
         let folders: Vec<PathBuf> = host
             .notebooks
@@ -42,18 +57,22 @@ pub(crate) fn searchable_notebooks(hwnd: HWND) -> Vec<Searchable> {
             .map(|slot| slot.folder.clone())
             .collect();
         let labels = crate::library::roots::notebook_labels(&folders);
-        host.notebooks
+        let loaded: Vec<(Searchable, &LibraryState)> = host
+            .notebooks
             .iter()
             .zip(labels)
-            .filter(|(slot, _)| slot.state.is_some())
-            .map(|(slot, label)| Searchable {
-                id: slot.id,
-                folder: slot.folder.clone(),
-                label,
+            .filter_map(|(slot, label)| {
+                let state = slot.state.as_ref()?;
+                let searchable = Searchable {
+                    id: slot.id,
+                    folder: slot.folder.clone(),
+                    label,
+                };
+                Some((searchable, state))
             })
-            .collect()
+            .collect();
+        f(&loaded)
     })
-    .unwrap_or_default()
 }
 
 /// How many open notebooks `searchable_notebooks` leaves out, and why.

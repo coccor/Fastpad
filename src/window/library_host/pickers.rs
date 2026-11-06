@@ -67,23 +67,38 @@ pub(crate) fn picked(hwnd: HWND, kind: PickerKind, choice: PickerChoice) {
             };
             move_note_to(hwnd, &note, &destination);
         }
-        (PickerKind::QuickOpen, PickerChoice::Note { path, line }) => {
-            crate::window::main_window::open_quick_open_choice(hwnd, &path, line);
+        (
+            PickerKind::QuickOpen,
+            PickerChoice::Note {
+                notebook,
+                path,
+                line,
+            },
+        ) => {
+            crate::window::main_window::open_quick_open_choice(hwnd, notebook, &path, line);
         }
-        (PickerKind::QuickOpen, PickerChoice::View { path, group }) => {
+        (
+            PickerKind::QuickOpen,
+            PickerChoice::View {
+                notebook,
+                path,
+                group,
+            },
+        ) => {
             // The tab listed, in the group listed: never a new view (split editors spec §7).
-            let id =
-                crate::window::main_window::quick_open_notebook(hwnd).and_then(|(_, folder)| {
-                    let app = unsafe { app_ptr(hwnd) }?;
-                    unsafe { app.as_ref() }
-                        .tabs
-                        .find_stored_path(&folder.join(&path))
-                });
+            let id = notebook_folder(hwnd, notebook).and_then(|folder| {
+                let app = unsafe { app_ptr(hwnd) }?;
+                unsafe { app.as_ref() }
+                    .tabs
+                    .find_stored_path(&folder.join(&path))
+            });
             match id {
                 Some(id) if crate::window::main_window::focus_view(hwnd, group, id) => {
                     crate::window::main_window::focus_content(hwnd);
                 }
-                _ => crate::window::main_window::open_quick_open_choice(hwnd, &path, None),
+                _ => {
+                    crate::window::main_window::open_quick_open_choice(hwnd, notebook, &path, None)
+                }
             }
         }
         (PickerKind::QuickOpen, PickerChoice::GoToLine(line)) => {
