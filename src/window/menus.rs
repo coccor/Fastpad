@@ -14,8 +14,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetMenuItemCount, GetMenuState, GetSubMenu, HACCEL, HMENU, MF_BYCOMMAND, MF_BYPOSITION,
     MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_HILITE, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED,
     MSG, MSGF_MENU, SetWindowsHookExW, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN,
-    TPM_VERTICAL, TPMPARAMS, TrackPopupMenuEx, TranslateAcceleratorW, UnhookWindowsHookEx,
-    WH_MSGFILTER, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE,
+    TPMPARAMS, TrackPopupMenuEx, TranslateAcceleratorW, UnhookWindowsHookEx, WH_MSGFILTER,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     MENUITEMINFOW, MFS_CHECKED, MFS_ENABLED, MFS_GRAYED, MFS_UNCHECKED, MFT_RADIOCHECK, MFT_STRING,
@@ -632,32 +632,21 @@ pub(crate) fn highlight_state(menu: HMENU) -> HighlightState {
     }
 }
 
-/// What Left/Right does in a dropdown: Right on a submenu item opens it and Left inside a submenu
-/// closes it (both left to Windows, `None`); otherwise the arrows move to the neighboring heading.
-pub(crate) fn arrow_exit(
-    right: bool,
-    current: usize,
-    highlight: HighlightState,
-) -> Option<DropdownExit> {
-    let submenu_owns_the_key = if right {
-        highlight.on_popup_item && !highlight.in_submenu
-    } else {
-        highlight.in_submenu
-    };
-    if submenu_owns_the_key {
-        None
-    } else {
-        Some(DropdownExit::Switch(menu_band::neighbor(current, right)))
-    }
+/// What Left/Right does in a dropdown, which opens to the right of its heading in the stacked
+/// menu column. Right is always Windows' own (it opens a submenu, or does nothing on a command),
+/// and so is Left inside a submenu, which closes it (`None`). Left anywhere else closes the
+/// dropdown and goes back to its heading in the column, as Escape does.
+pub(crate) fn arrow_exit(right: bool, highlight: HighlightState) -> Option<DropdownExit> {
+    (!right && !highlight.in_submenu).then_some(DropdownExit::Escape)
 }
 
 thread_local! {
     static DROPDOWN: RefCell<Option<DropdownTracking>> = const { RefCell::new(None) };
 }
 
-/// Opens `menu` below heading `current` (`headings` are client rectangles) and reports how it
-/// closed. Moving between headings needs a message filter: a popup menu's modal loop otherwise
-/// swallows Left/Right and pointer movement over the band.
+/// Opens `menu` to the right of heading `current` (`headings` are client rectangles) and reports
+/// how it closed. Moving between headings needs a message filter: a popup menu's modal loop
+/// otherwise swallows Left and pointer movement over the menu column.
 pub(crate) fn track_dropdown(
     hwnd: HWND,
     menu: HMENU,
@@ -699,9 +688,9 @@ pub(crate) fn track_dropdown(
     let selected = unsafe {
         TrackPopupMenuEx(
             menu,
-            TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_VERTICAL,
-            anchor.left,
-            anchor.bottom,
+            TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
+            anchor.right,
+            anchor.top,
             hwnd,
             &params,
         )
@@ -750,37 +739,38 @@ unsafe extern "system" fn dropdown_filter(code: i32, wparam: WPARAM, lparam: LPA
             let mut tracking = tracking.borrow_mut();
             let state = tracking.as_mut()?;
             let under_pointer = menu_band::heading_at(&state.headings, message.pt.x, message.pt.y);
-            let exit = match message.message {
+            let (exit, end_menu) = match message.message {
                 WM_KEYDOWN
                     if message.wParam == VK_LEFT as usize
                         || message.wParam == VK_RIGHT as usize =>
                 {
-                    arrow_exit(
-                        message.wParam == VK_RIGHT as usize,
-                        state.current,
-                        highlight_state(state.menu),
-                    )?
+                    (
+                        arrow_exit(
+                            message.wParam == VK_RIGHT as usize,
+                            highlight_state(state.menu),
+                        )?,
+                        true,
+                    )
                 }
-                WM_KEYDOWN if message.wParam == VK_ESCAPE as usize => DropdownExit::Escape,
+                // The popup's own Escape handling closes it; only the reason is recorded.
+                WM_KEYDOWN if message.wParam == VK_ESCAPE as usize => (DropdownExit::Escape, false),
                 WM_MOUSEMOVE => match under_pointer {
-                    Some(index) if index != state.current => DropdownExit::Switch(index),
+                    Some(index) if index != state.current => (DropdownExit::Switch(index), true),
                     _ => return None,
                 },
-                WM_LBUTTONDOWN if under_pointer == Some(state.current) => DropdownExit::Dismissed,
+                WM_LBUTTONDOWN if under_pointer == Some(state.current) => {
+                    (DropdownExit::Dismissed, true)
+                }
                 _ => return None,
             };
             state.exit = Some(exit);
-            Some(exit)
+            Some(end_menu)
         });
-        match exit {
-            // The popup's own Escape handling closes it; only the reason is recorded.
-            Some(DropdownExit::Escape) | None => {}
-            Some(_) => {
-                unsafe {
-                    EndMenu();
-                }
-                return 1;
+        if exit == Some(true) {
+            unsafe {
+                EndMenu();
             }
+            return 1;
         }
     }
     unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
@@ -1177,11 +1167,10 @@ mod tests {
     }
 
     #[test]
-    fn arrows_open_and_close_a_submenu_before_switching_headings() {
-        // Break caught: Right on View → Language jumped to the next heading instead of opening
+    fn arrows_open_and_close_a_submenu_before_going_back_to_the_column() {
+        // Break caught: Right on View → Language jumped to another heading instead of opening
         // the submenu, and Left inside the submenu left View instead of closing the submenu.
         use super::{DropdownExit, HighlightState, arrow_exit};
-        use crate::window::menu_band::neighbor;
         let plain = HighlightState::default();
         let on_popup = HighlightState {
             on_popup_item: true,
@@ -1192,25 +1181,13 @@ mod tests {
             in_submenu: true,
         };
 
-        assert_eq!(arrow_exit(true, 2, on_popup), None);
-        assert_eq!(arrow_exit(false, 2, inside), None);
-        assert_eq!(
-            arrow_exit(true, 2, plain),
-            Some(DropdownExit::Switch(neighbor(2, true)))
-        );
-        assert_eq!(
-            arrow_exit(false, 2, plain),
-            Some(DropdownExit::Switch(neighbor(2, false)))
-        );
-        assert_eq!(
-            arrow_exit(false, 2, on_popup),
-            Some(DropdownExit::Switch(neighbor(2, false)))
-        );
-        // Right on a leaf inside the submenu moves on, as Windows' own menu bar does.
-        assert_eq!(
-            arrow_exit(true, 2, inside),
-            Some(DropdownExit::Switch(neighbor(2, true)))
-        );
+        assert_eq!(arrow_exit(true, on_popup), None);
+        assert_eq!(arrow_exit(true, plain), None);
+        assert_eq!(arrow_exit(true, inside), None);
+        assert_eq!(arrow_exit(false, inside), None);
+        // Left in the dropdown itself goes back to its heading in the stacked column.
+        assert_eq!(arrow_exit(false, plain), Some(DropdownExit::Escape));
+        assert_eq!(arrow_exit(false, on_popup), Some(DropdownExit::Escape));
     }
 
     #[test]

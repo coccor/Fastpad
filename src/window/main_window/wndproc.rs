@@ -14,6 +14,11 @@ pub(super) unsafe extern "system" fn main_window_proc(
         WM_SIZE => {
             layout_editor_and_find_bar(hwnd);
             invalidate_title_strip(hwnd);
+            follow_menu_column(hwnd);
+            0
+        }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_MOVE => {
+            follow_menu_column(hwnd);
             0
         }
         WM_SETFOCUS => {
@@ -184,7 +189,6 @@ pub(super) unsafe extern "system" fn main_window_proc(
                     .unwrap_or_default();
                 let status = current_status_bar(hwnd);
                 let (palette, fonts, pointer) = title_chrome(hwnd);
-                let headings = menu_headings(hwnd);
                 unsafe {
                     crate::window::titlebar::paint(
                         hwnd,
@@ -195,7 +199,6 @@ pub(super) unsafe extern "system" fn main_window_proc(
                             palette,
                             fonts,
                             pointer,
-                            menu: menu_mode(hwnd).map(|mode| (mode, headings.as_slice())),
                         },
                     )
                 };

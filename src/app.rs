@@ -71,8 +71,10 @@ pub struct App {
     /// The shortcuts in force: the defaults until settings load, then with the user's overrides.
     pub(crate) keymap: crate::window::keymap::Keymap,
     pub(crate) menu_bar: Option<MenuBar>,
-    /// Present while the Alt/F10 menu band is showing.
+    /// Present while the Alt/F10 menu column is showing.
     pub(crate) menu_mode: Option<MenuMode>,
+    /// The popup that shows the menu column, null outside menu mode.
+    pub(crate) menu_overlay: HWND,
     /// Where focus returns when menu mode ends; the frame holds it meanwhile for the key handling.
     pub(crate) menu_return_focus: HWND,
     pub(crate) name_box: Option<crate::window::name_box::NameBox>,
@@ -162,6 +164,7 @@ impl App {
             menu_bar: None,
             menu_mode: None,
             menu_return_focus: std::ptr::null_mut(),
+            menu_overlay: std::ptr::null_mut(),
             name_box: None,
             command_palette: None,
             language_manager: None,

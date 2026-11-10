@@ -195,10 +195,8 @@ fn the_sidebar_takes_the_left_edge_and_everything_else_starts_right_of_it() {
             0,
         )
     };
-    assert_eq!(
-        super::super::menu_headings(window.hwnd)[0].left,
-        left + crate::window::design::metrics::scale(4, dpi)
-    );
+    // The menu column sits in the window's top-left corner, over the sidebar.
+    assert!(super::super::menu_headings(window.hwnd)[0].left < left);
     unsafe {
         SendMessageW(
             window.hwnd,
