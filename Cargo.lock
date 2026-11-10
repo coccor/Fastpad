@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "fastpad"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "mermaid-rs-renderer",
  "pulldown-cmark",
