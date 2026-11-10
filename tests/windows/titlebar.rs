@@ -27,11 +27,11 @@ use windows_sys::Win32::UI::HiDpi::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_F10, VK_MENU, VK_SPACE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, GetClientRect, GetMenu, GetWindowRect, HTCLOSE, HTLEFT, HTMAXBUTTON,
-    HTMINBUTTON, HTTOP, IsIconic, IsWindow, IsZoomed, MINMAXINFO, OBJID_CLIENT, PostMessageW,
-    STATE_SYSTEM_SELECTED, SW_RESTORE, SendMessageW, ShowWindow, WM_CANCELMODE, WM_COMMAND,
-    WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
-    WM_SYSKEYDOWN, WM_SYSKEYUP,
+    FindWindowExW, GW_OWNER, GetClientRect, GetMenu, GetWindow, GetWindowRect, HTCLOSE, HTLEFT,
+    HTMAXBUTTON, HTMINBUTTON, HTTOP, IsIconic, IsWindow, IsWindowVisible, IsZoomed, MINMAXINFO,
+    OBJID_CLIENT, PostMessageW, STATE_SYSTEM_SELECTED, SW_RESTORE, SendMessageW, ShowWindow,
+    WM_CANCELMODE, WM_COMMAND, WM_GETMINMAXINFO, WM_GETOBJECT, WM_KEYDOWN, WM_NCHITTEST,
+    WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 use windows_sys::core::{BSTR, GUID, HRESULT};
 
@@ -70,7 +70,7 @@ fn wm_command_exit_routes_through_app_execute() -> TestResult<()> {
 }
 
 #[test]
-fn alt_and_f10_from_the_focused_editor_toggle_the_themed_menu_band() -> TestResult<()> {
+fn alt_and_f10_from_the_focused_editor_toggle_the_menu_column() -> TestResult<()> {
     let _dpi = DpiContext::per_monitor_v2()?;
     let mut process = FastPadProcess::spawn(["--new-window"])?;
     let hwnd = process.wait_for_main_window(Duration::from_secs(3))?;
@@ -89,16 +89,18 @@ fn alt_and_f10_from_the_focused_editor_toggle_the_themed_menu_band() -> TestResu
                 0
             );
         }
-        // The band is painted in the client area and pushes the editor down; a native menu bar
-        // would be drawn unthemed over the reclaimed caption instead.
-        wait_for_editor_top(hwnd, editor, |top| top > resting_top)?;
+        // The column is drawn in its own owned popup that floats over the window, so nothing
+        // below it moves; a native menu bar would be drawn unthemed over the reclaimed caption.
+        wait_for_menu_column(hwnd, true)?;
+        assert_eq!(editor_top(hwnd, editor), resting_top);
         assert!(unsafe { GetMenu(hwnd) }.is_null());
 
         assert_ne!(
             unsafe { PostMessageW(hwnd, WM_KEYDOWN, VK_ESCAPE as usize, 0) },
             0
         );
-        wait_for_editor_top(hwnd, editor, |top| top == resting_top)?;
+        wait_for_menu_column(hwnd, false)?;
+        assert_eq!(editor_top(hwnd, editor), resting_top);
     }
     process.close()
 }
@@ -246,21 +248,44 @@ fn settings_shows_an_owned_dialog_that_escape_closes() -> TestResult<()> {
     process.close()
 }
 
-fn wait_for_editor_top(
-    hwnd: windows_sys::Win32::Foundation::HWND,
-    editor: windows_sys::Win32::Foundation::HWND,
-    expected: impl Fn(i32) -> bool,
-) -> TestResult<()> {
+/// Waits until a visible menu-column popup owned by `hwnd` is `shown`, or none is.
+fn wait_for_menu_column(hwnd: windows_sys::Win32::Foundation::HWND, shown: bool) -> TestResult<()> {
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
     loop {
-        let top = editor_top(hwnd, editor);
-        if expected(top) {
+        if menu_column_is_shown(hwnd) == shown {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
-            return Err(format!("the menu band did not settle; editor top is {top}").into());
+            let state = if shown {
+                "did not appear"
+            } else {
+                "did not close"
+            };
+            return Err(format!("the menu column {state}").into());
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn menu_column_is_shown(owner: windows_sys::Win32::Foundation::HWND) -> bool {
+    let class = wide_null("FastPadMenuColumn");
+    let mut popup = std::ptr::null_mut();
+    loop {
+        popup = unsafe {
+            FindWindowExW(
+                std::ptr::null_mut(),
+                popup,
+                class.as_ptr(),
+                std::ptr::null(),
+            )
+        };
+        if popup.is_null() {
+            return false;
+        }
+        if unsafe { GetWindow(popup, GW_OWNER) } == owner && unsafe { IsWindowVisible(popup) } != 0
+        {
+            return true;
+        }
     }
 }
 
