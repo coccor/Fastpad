@@ -322,33 +322,33 @@ fn appearance(
                     crate::config::defaults::DEFAULT_FONT_SIZE,
                 )
             });
-    // The Markdown roles as the source view colours them; high contrast keeps to system pairs.
+    // Rendered Markdown in the preview's colours, so Live and the preview look alike; revealed
+    // markup in the source view's marker colour. High contrast keeps to system pairs.
+    let preview = crate::preview::colors::preview_colors(
+        host_window::effective_theme(hwnd),
+        palette.high_contrast,
+    );
     let roles = crate::languages::syntax_colors(host_window::effective_theme(hwnd));
-    let role = |color: u32| {
-        if palette.high_contrast {
-            palette.editor_foreground
-        } else {
-            color
-        }
-    };
     let colors = LiveColors {
         background: palette.editor_background,
-        text: palette.editor_foreground,
+        text: preview.text,
         selection: palette.selection_background,
         inactive_selection: palette.inactive_selection_background,
         caret: palette.editor_foreground,
         line_number: palette.line_number_foreground,
-        heading: role(roles.heading),
-        emphasis: role(roles.emphasis),
-        marker: role(roles.operator),
-        link: role(roles.link),
-        code: role(roles.code),
-        code_background: if palette.high_contrast {
-            palette.editor_background
+        heading: preview.heading,
+        emphasis: preview.text,
+        marker: if palette.high_contrast {
+            palette.editor_foreground
         } else {
-            roles.code_background
+            roles.operator
         },
-        dim: role(roles.comment),
+        link: preview.link,
+        code: preview.text,
+        code_background: preview.code_background,
+        dim: preview.muted,
+        border: preview.border,
+        quote_bar: preview.quote_bar,
         // The edited block stands out as the current line does, and only when that does.
         active_block: if highlight_block {
             palette.caret_line_background
@@ -356,10 +356,7 @@ fn appearance(
             palette.editor_background
         },
         // Diagrams look as the preview draws them, whatever the syntax colours are.
-        diagram: crate::preview::colors::preview_colors(
-            host_window::effective_theme(hwnd),
-            palette.high_contrast,
-        ),
+        diagram: preview,
     };
     let fonts = LiveFonts::new(
         graphics,
