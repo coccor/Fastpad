@@ -10,13 +10,22 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels that pull request's run still in progress. Runs on main and
+# release tags always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
+  # Caches hold only dependencies; incremental artifacts of the crate itself would be thrown away.
+  CARGO_INCREMENTAL: 0
 
 jobs:
   unit-linux:
     # The library is Windows-only today, so Linux runs formatting and a Windows-target Clippy
-    # type-check (no linking). Unit and integration tests execute in windows-integration.
+    # type-check (no linking). It is the only Clippy run: a Windows host would check the same target
+    # with the same flags. Unit and integration tests execute in windows-tests.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,32 +33,57 @@ jobs:
         run: rustup target add x86_64-pc-windows-msvc
       - name: Format check
         run: cargo fmt --all -- --check
+      # Caches are saved only from main; pull requests restore main's.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy (x86_64-pc-windows-msvc type-check, warnings denied)
         run: cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets --all-features -- -D warnings
 
-  windows-integration:
+  windows-tests:
+    # The suite is split across runners: in_process and markdown_live each `include!` lib.rs, so each
+    # reruns the library's unit tests and takes about as long as the library's own run. Within a
+    # shard the Windows tests still run serially.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [unit-and-integration, in_process, markdown_live]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Cache pinned native source archives
-        uses: actions/cache@v4
+      - uses: ./.github/actions/native-dlls
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: native/cache
-          key: native-archives-${{ hashFiles('native/dependencies.json') }}
-      - name: Fetch pinned Scintilla and Lexilla sources
-        shell: pwsh
-        run: ./tools/fetch-native.ps1
-      - name: Verify native archive hashes and versions
-        shell: pwsh
-        run: ./tools/fetch-native.ps1 -VerifyOnly
-      - name: Build native DLLs from pinned sources
-        shell: pwsh
-        run: ./tools/build-native.ps1
-      # Same explicit target as the test step so Clippy and tests share one target directory.
-      - name: Clippy (warnings denied)
-        run: cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets --all-features -- -D warnings
+          shared-key: windows-test
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 'unit-and-integration' }}
       - name: Unit and Windows integration tests (serial)
-        run: cargo test --locked --target x86_64-pc-windows-msvc -- --test-threads=1
+        shell: pwsh
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          $selection = if ($env:SHARD -ne "unit-and-integration") {
+            @("--test", $env:SHARD)
+          } else {
+            # Every test target except the ones with a shard of their own, read from Cargo.toml so a
+            # new [[test]] cannot be left out.
+            $sharded = @("in_process", "markdown_live")
+            $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed." }
+            $targets = ($metadata.packages | Where-Object name -eq "fastpad").targets
+            $tests = @($targets | Where-Object { $_.kind -contains "test" -and $sharded -notcontains $_.name } | ForEach-Object { "--test"; $_.name })
+            @("--lib", "--bins") + $tests
+          }
+          cargo test --locked --target x86_64-pc-windows-msvc @selection -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  windows-integration:
+    # The required status check on main: passes only when every windows-tests shard passed.
+    needs: windows-tests
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: All Windows test shards passed
+        run: test "${{ needs.windows-tests.result }}" = success
 
   dependency-audit:
     runs-on: ubuntu-latest
@@ -59,8 +93,10 @@ jobs:
         shell: pwsh
         run: ./tools/audit-dependencies.ps1
 
+  # package, benchmark-trend and live-perf build release binaries, so they start alongside the tests
+  # instead of after them; a test failure still fails the run.
   package:
-    needs: [windows-integration, dependency-audit]
+    needs: dependency-audit
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -69,6 +105,10 @@ jobs:
         with:
           path: native/cache
           key: native-archives-${{ hashFiles('native/dependencies.json') }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target/package"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build portable ZIP
         shell: pwsh
         run: ./tools/package.ps1
@@ -96,18 +136,13 @@ jobs:
   benchmark-trend:
     # Hosted runners are noisy and unrepresentative: samples are uploaded for trend comparison only.
     # Absolute millisecond thresholds are enforced only on the documented reference machine.
-    needs: windows-integration
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Cache pinned native source archives
-        uses: actions/cache@v4
+      - uses: ./.github/actions/native-dlls
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: native/cache
-          key: native-archives-${{ hashFiles('native/dependencies.json') }}
-      - name: Build native DLLs from pinned sources
-        shell: pwsh
-        run: ./tools/build-native.ps1
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build release binaries
         run: cargo build --locked --release --bins
       - name: Collect 30 startup samples
@@ -122,23 +157,15 @@ jobs:
     # The Live Markdown view's typing latency (Live editor phase 4 plan, Decision 9): each
     # scenario's keystroke p95 is held to the 4 ms budget, scaled because hosted runners are
     # slower than the reference machine and draw without a GPU. The p95s go to the job summary.
-    needs: windows-integration
     runs-on: windows-latest
     env:
       FASTPAD_PERF_SCALE: "2.5"
     steps:
       - uses: actions/checkout@v4
-      - name: Cache pinned native source archives
-        uses: actions/cache@v4
+      - uses: ./.github/actions/native-dlls
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: native/cache
-          key: native-archives-${{ hashFiles('native/dependencies.json') }}
-      - name: Fetch pinned Scintilla and Lexilla sources
-        shell: pwsh
-        run: ./tools/fetch-native.ps1
-      - name: Build native DLLs from pinned sources
-        shell: pwsh
-        run: ./tools/build-native.ps1
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Filtered to the typing_in_live tests: a bare --ignored would also run the asset
       # regeneration tests.
       - name: Live typing scenarios (release, serial)

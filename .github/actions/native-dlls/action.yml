@@ -1,0 +1,35 @@
+name: Native DLLs
+description: >
+  Fetches and verifies the pinned Scintilla and Lexilla archives, then restores native/out/x64 from
+  the cache or builds it from those sources. The DLL cache key covers the pinned versions, the build
+  scripts, and the runner image (which pins the MSVC toolset), so a change to any of them rebuilds.
+
+runs:
+  using: composite
+  steps:
+    - name: Cache pinned native source archives
+      uses: actions/cache@v4
+      with:
+        path: native/cache
+        key: native-archives-${{ hashFiles('native/dependencies.json') }}
+    - name: Fetch pinned Scintilla and Lexilla sources
+      shell: pwsh
+      run: ./tools/fetch-native.ps1
+    - name: Verify native archive hashes and versions
+      shell: pwsh
+      run: ./tools/fetch-native.ps1 -VerifyOnly
+    # ImageVersion is a runner machine variable, which the `env` expression context does not see.
+    - name: Read the runner image version
+      id: image
+      shell: pwsh
+      run: '"version=$env:ImageVersion" >> $env:GITHUB_OUTPUT'
+    - name: Cache built native DLLs
+      id: dlls
+      uses: actions/cache@v4
+      with:
+        path: native/out/x64
+        key: native-dlls-${{ runner.os }}-${{ steps.image.outputs.version }}-${{ hashFiles('native/dependencies.json', 'tools/build-native.ps1', 'tools/fetch-native.ps1', 'tools/msvc.ps1') }}
+    - name: Build native DLLs from pinned sources
+      if: steps.dlls.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: ./tools/build-native.ps1
