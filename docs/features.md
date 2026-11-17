@@ -296,7 +296,8 @@ Source / Split / Preview control as Markdown.
 - **Open in FastDraw** (*FastDraw: Open in FastDraw* in the command palette, the tab's right-click menu,
   and the toolbar button left of the view control) opens the diagram in the editor at
   [fastdraw.dev](https://fastdraw.dev/edit/) in your browser. The diagram travels after the `#` of the
-  link, so no server receives it. Diagrams over 2 MB are too large to open by link.
+  link, so no server receives it. A diagram whose link is over 32,000 characters is too large to open by
+  link.
 - Drawing is local and offline, in Rust (the [fastdraw](https://github.com/coccor/fastdraw) renderer),
   and nothing is fetched. `.fdraw` files over 1 MB are not read.
 

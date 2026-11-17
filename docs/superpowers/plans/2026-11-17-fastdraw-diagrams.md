@@ -16,7 +16,7 @@
 - Refused look paths: absolute, starting `\\` or `//`, or with a drive prefix (`C:x` included). Refusal error text: `FastPad reads look files only by a relative path; "<path>" was not read`.
 - Error band text: `Line <n>: <message>`, plus ` (and <k> more)` when k more errors follow.
 - Failed-state title for diagrams: `FastPad can't draw this diagram`. Panic text: `FastDraw could not draw this diagram`.
-- `.fdraw` files over 1 MB are not read. Editor links over 2 MB are not opened: notice `This diagram is too large to open by link.`; shell failure notice `FastPad could not open fastdraw.dev.`
+- `.fdraw` files over 1 MB are not read. Editor links over 32,000 characters are not opened: notice `This diagram is too large to open by link.`; shell failure notice `FastPad could not open fastdraw.dev.`
 - Command palette label `FastDraw: Open in FastDraw`; toolbar tooltip `Open in FastDraw (fastdraw.dev)`; glyph `\u{E8A7}`.
 - Nothing is fetched from the network. No commit adds `Co-Authored-By` trailers.
 - Before launching a dev build by hand, copy `native/out/x64` DLLs into `target/debug` (no highlighting otherwise). CI runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`, `cargo test -- --test-threads=1`, and `tools/audit-dependencies.ps1`; every task leaves all four passing.
@@ -123,7 +123,7 @@
 
 - [ ] **Step 1: Write failing tests.** `open_in_fastdraw_sends_the_tab_to_the_editor`: open a FastDraw tab `flow.fdraw` with `a: node "A" at 0,0`, run `CommandId::OpenInFastDraw`, assert one opened URL equal to `fastdraw_render::editor_link("flow.fdraw", <text>, None)` and starting `https://fastdraw.dev/edit/#fdraw=`. `the_command_does_nothing_on_other_tabs`: on a `.txt` tab nothing is opened. `the_tab_menu_offers_open_in_fastdraw_only_on_fastdraw_tabs` (menu entries built by a helper `tab_menu_entries(hwnd)` that tests read). Toolbar: `segment_at`-style hit test `button_at` returns the button for a point inside its rect on a FastDraw tab, and the toolbar has no button on an SVG tab.
 - [ ] **Step 2: Run** `cargo test --lib open_in_fastdraw the_tab_menu window::editor_toolbar -- --test-threads=1` — Expected: FAIL.
-- [ ] **Step 3: Implement.** The look passed is `draw(text, path, false).look`. Over 2 MB → notice; `shell_open` false → notice. Toolbar: one 24-px button with glyph `\u{E8A7}` left of the track, separated by `TRACK_PADDING * 2`, sharing the hover/press painting and the tooltip tool list (tool index `segments.len()`); a click dispatches `CommandId::OpenInFastDraw`.
+- [ ] **Step 3: Implement.** The look passed is `draw(text, path, false).look`. Over 32,000 characters → notice; `shell_open` false → notice. Toolbar: one 24-px button with glyph `\u{E8A7}` left of the track, separated by `TRACK_PADDING * 2`, sharing the hover/press painting and the tooltip tool list (tool index `segments.len()`); a click dispatches `CommandId::OpenInFastDraw`.
 - [ ] **Step 4: Run** the same command — Expected: PASS.
 - [ ] **Step 5: Commit** `feat(fastdraw): Open in FastDraw`.
 

@@ -690,6 +690,38 @@ fn open_in_fastdraw_sends_the_tab_to_the_editor() {
 }
 
 #[test]
+fn a_diagram_too_large_for_a_link_is_not_opened() {
+    // Break caught: a link longer than the 32,767-character command line ShellExecute passes it
+    // on, which would open a cut link or nothing.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    // Labels of pseudo-random letters, so the link's compression cannot shrink them.
+    let mut seed = 0x2545_f491_u32;
+    let mut letter = || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        char::from(b'a' + (seed >> 24) as u8 % 26)
+    };
+    let text = (0..800)
+        .map(|i| {
+            let label = (0..40).map(|_| letter()).collect::<String>();
+            format!("n{i}: rect \"{label}\" at 0,{}\n", i * 60)
+        })
+        .collect::<String>();
+    let link = fastdraw_render::editor_link("big.fdraw", &text, None);
+    assert!(link.len() > 32_000 && link.len() < 2 * 1024 * 1024);
+    open_diagram(&window, "big.fdraw", &text);
+    crate::window::preview_host::take_opened();
+
+    execute_command(window.hwnd, CommandId::OpenInFastDraw);
+
+    assert!(crate::window::preview_host::take_opened().is_empty());
+    assert!(
+        notices(window.hwnd).contains(&"This diagram is too large to open by link.".to_owned())
+    );
+}
+
+#[test]
 fn the_command_does_nothing_on_other_tabs() {
     // Break caught: Open in FastDraw sending a plain text tab's content to the web.
     let _scintilla = load_native_scintilla();

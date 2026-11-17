@@ -129,7 +129,8 @@ seen. Other SVGs and Mermaid diagrams do not pay for the FastDraw fonts until a 
   editor's text, and the look file as `render` read it (none when refused), through the existing
   `preview_host::shell_open`. A failure gives the notice "FastPad could not open fastdraw.dev.", as
   `about.rs` does for its links.
-- A link longer than 2 MB is not opened; a notice says "This diagram is too large to open by link."
+- A link longer than 32,000 characters is not opened (the shell passes it on a command line of at most
+  32,767 characters); a notice says "This diagram is too large to open by link."
 
 ## 5. Diagrams in Markdown notes
 

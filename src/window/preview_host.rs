@@ -1416,8 +1416,9 @@ pub(crate) fn shell_open(hwnd: HWND, url: &str) -> bool {
     result as isize > 32
 }
 
-/// An editor link longer than this is not opened.
-const MAX_EDITOR_LINK_BYTES: usize = 2 * 1024 * 1024;
+/// An editor link longer than this is not opened: ShellExecute passes it on a command line, which
+/// holds at most 32,767 characters.
+const MAX_EDITOR_LINK_CHARS: usize = 32_000;
 
 /// Opens the active FastDraw tab in the editor at fastdraw.dev, the diagram and the look file it
 /// reads travelling in the link. Does nothing on any other tab.
@@ -1448,7 +1449,7 @@ pub(crate) fn open_in_fastdraw(hwnd: HWND) {
     };
     let look = crate::preview::fastdraw::draw(&text, path.as_deref(), false).look;
     let link = fastdraw_render::editor_link(&name, &text, look.as_ref());
-    if link.len() > MAX_EDITOR_LINK_BYTES {
+    if link.encode_utf16().count() > MAX_EDITOR_LINK_CHARS {
         host_window::push_notice(
             hwnd,
             "This diagram is too large to open by link.".to_owned(),
