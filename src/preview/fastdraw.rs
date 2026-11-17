@@ -38,6 +38,162 @@ fn refusal(look: &str) -> String {
     format!("FastPad reads look files only by a relative path; \"{look}\" was not read")
 }
 
+/// Look files over this size are not read (the renderer's own limit).
+const MAX_LOOK_BYTES: u64 = 1_000_000;
+
+/// FastDraw's whitespace (JavaScript's), which separates words and marks continuation lines.
+fn is_space(c: char) -> bool {
+    matches!(
+        c,
+        '\t' | '\n' | '\u{B}' | '\u{C}' | '\r' | ' ' | '\u{A0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200A}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202F}'
+                | '\u{205F}'
+                | '\u{3000}'
+                | '\u{FEFF}'
+    )
+}
+
+/// `line` without its `//` comment (one outside quotes).
+fn strip_comment(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut quoted = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if quoted => i += 1,
+            b'"' => quoted = !quoted,
+            b'/' if !quoted && bytes.get(i + 1) == Some(&b'/') => return &line[..i],
+            _ => {}
+        }
+        i += 1;
+    }
+    line
+}
+
+/// One word of a statement: its value, and whether it is a plain word (not quoted, not `key=value`).
+struct Word {
+    value: String,
+    plain: bool,
+}
+
+/// The words of `line` as FastDraw splits them: quotes group and are dropped, a backslash in
+/// quotes escapes, and `key=value` keeps the value.
+fn words(line: &str) -> Vec<Word> {
+    let mut out = Vec::new();
+    let mut chars = line.chars().peekable();
+    loop {
+        while chars.next_if(|&c| is_space(c)).is_some() {}
+        let Some(&first) = chars.peek() else {
+            return out;
+        };
+        let mut value = String::new();
+        let mut quoted = false;
+        while let Some(c) = chars.next_if(|&c| quoted || !is_space(c)) {
+            if c == '"' {
+                quoted = !quoted;
+            } else if c == '\\' && quoted && chars.peek().is_some() {
+                let escaped = chars.next().unwrap_or_default();
+                value.push(if escaped == 'n' { '\n' } else { escaped });
+            } else {
+                value.push(c);
+            }
+        }
+        if first == '"' {
+            out.push(Word {
+                value,
+                plain: false,
+            });
+        } else if let Some(key) = property_key_len(&value) {
+            out.push(Word {
+                value: value[key + 1..].to_owned(),
+                plain: false,
+            });
+        } else {
+            out.push(Word { value, plain: true });
+        }
+    }
+}
+
+/// The key's length when `word` is `key=value` (a key is a letter, then letters, digits, `_./#-`).
+fn property_key_len(word: &str) -> Option<usize> {
+    let bytes = word.as_bytes();
+    if !bytes.first()?.is_ascii_alphabetic() {
+        return None;
+    }
+    let end = bytes.iter().position(|&c| {
+        !(c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'/' | b'#' | b'-'))
+    })?;
+    (bytes[end] == b'=').then_some(end)
+}
+
+/// FastDraw's statements: each line with its 1-based number, plus the indented lines after it.
+fn statements(text: &str) -> Vec<(u32, Vec<Word>)> {
+    let mut out: Vec<(u32, Vec<Word>)> = Vec::new();
+    for (index, raw) in text.split('\n').enumerate() {
+        let raw = raw.strip_suffix('\r').unwrap_or(raw);
+        let trimmed = raw.trim_matches(is_space);
+        if trimmed.is_empty() || trimmed == "#" || trimmed.starts_with("# ") {
+            continue;
+        }
+        let code = strip_comment(raw);
+        if code.trim_matches(is_space).is_empty() {
+            continue;
+        }
+        let line_words = words(code);
+        match out.last_mut() {
+            Some((_, last)) if raw.starts_with(is_space) => last.extend(line_words),
+            _ => out.push((index as u32 + 1, line_words)),
+        }
+    }
+    out
+}
+
+/// The statements of `text` that start with the plain word `head`.
+fn statements_named(text: &str, head: &str) -> impl Iterator<Item = (u32, Vec<Word>)> {
+    statements(text)
+        .into_iter()
+        .filter(move |(_, words)| words.first().is_some_and(|w| w.plain && w.value == head))
+}
+
+/// What each `dark` statement of a look file names.
+fn dark_values(look: &str) -> Vec<String> {
+    statements_named(look, "dark")
+        .filter_map(|(_, words)| words.into_iter().nth(1).map(|w| w.value))
+        .collect()
+}
+
+/// The line of the diagram's `look` statement.
+fn look_line(text: &str) -> Option<u32> {
+    statements_named(text, "look").next().map(|(line, _)| line)
+}
+
+/// The diagram's own look file as `render` reads it: named by a relative path ending in `.look`,
+/// relative to `file`, at most 1 MB. `None` for a bundled look, a refused path or a file that
+/// cannot be read.
+pub fn read_look(text: &str, file: &Path) -> Option<fastdraw_render::LookFile> {
+    let path = fastdraw_render::look_path(text)?;
+    if refused(&path) || !path.to_lowercase().ends_with(".look") {
+        return None;
+    }
+    let full = file.parent().unwrap_or(Path::new("")).join(&path);
+    let mut bytes = Vec::new();
+    std::fs::File::open(full)
+        .ok()?
+        .take(MAX_LOOK_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_LOOK_BYTES {
+        return None;
+    }
+    Some(fastdraw_render::LookFile {
+        path,
+        text: String::from_utf8_lossy(&bytes).into_owned(),
+    })
+}
+
 /// Draws `text`, which lives in `file` (the base of a relative look path), in the light or dark
 /// look. Never panics.
 pub fn draw(text: &str, file: Option<&Path>, dark: bool) -> Drawn {
@@ -59,12 +215,23 @@ fn draw_unguarded(text: &str, file: Option<&Path>, dark: bool) -> Drawn {
     let refused_look = fastdraw_render::look_path(text).filter(|look| refused(look));
     // A refused look is never handed to the renderer's file reading.
     let file = if refused_look.is_some() { None } else { file };
+    // The renderer reads the dark look a look file names by any path, so a refused one keeps the
+    // diagram light: nothing beyond its own look file is read.
+    let refused_dark = file
+        .filter(|_| dark)
+        .and_then(|file| read_look(text, file))
+        .and_then(|look| dark_values(&look.text).into_iter().find(|v| refused(v)));
+    let dark = dark && refused_dark.is_none();
     let drawing = fastdraw_render::render(&Source { text, file, dark });
     crate::preview::svg::add_fastdraw_fonts();
     crate::preview::svg::add_font_files(&drawing.font_files);
 
     let mut show = true;
     let mut errors = Vec::new();
+    if let Some(value) = &refused_dark {
+        let line = look_line(text).unwrap_or(1);
+        errors.push(format!("Line {line}: {}", refusal(value)));
+    }
     for issue in drawing.issues.iter().filter(|i| i.level == Level::Error) {
         let message = match &refused_look {
             Some(look) if issue.message.starts_with("look file not found") => refusal(look),
@@ -233,15 +400,103 @@ mod tests {
 
     #[test]
     fn a_dark_diagram_uses_night_paper() {
-        assert_ne!(
-            draw("a: node \"A\" at 0,0\n", None, true).paper,
-            draw("a: node \"A\" at 0,0\n", None, false).paper
+        let night = draw("look night\na: rect \"A\" at 0,0\n", None, false).paper;
+        assert_eq!(draw("a: rect \"A\" at 0,0\n", None, true).paper, night);
+        assert_ne!(draw("a: rect \"A\" at 0,0\n", None, false).paper, night);
+    }
+
+    /// A fresh folder in the temp directory, removed when dropped.
+    struct Folder(PathBuf);
+
+    impl Folder {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("fastpad-fastdraw-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn write(&self, name: &str, text: &str) -> PathBuf {
+            let path = self.0.join(name);
+            std::fs::write(&path, text).unwrap();
+            path
+        }
+    }
+
+    impl Drop for Folder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_look_files_absolute_dark_line_is_not_read() {
+        // Break caught: a relative look file naming a network or absolute dark look, which the
+        // renderer would read (an SMB connection for `\\server\x.look`).
+        let elsewhere = Folder::new("elsewhere");
+        let evil = elsewhere.write("evil.look", "color paper #123456\n");
+        let evil = evil.to_string_lossy().replace('\\', "/");
+        let folder = Folder::new("dark-refused");
+        folder.write(
+            "x.look",
+            &format!("color paper #0e2440 // light\ndark \"{evil}\"\n"),
+        );
+        let diagram = folder.write("d.fdraw", "");
+        let d = draw(
+            "a: rect \"A\" at 0,0\nlook \"x.look\"\n",
+            Some(&diagram),
+            true,
+        );
+        assert_eq!(d.paper, 0x0e_2440);
+        assert!(d.show && !d.svg.is_empty());
+        assert_eq!(
+            d.errors,
+            [format!(
+                "Line 2: FastPad reads look files only by a relative path; \"{evil}\" was not read"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_look_files_bundled_or_relative_dark_line_still_draws_dark() {
+        let night = draw("look night\na: rect \"A\" at 0,0\n", None, false).paper;
+        let folder = Folder::new("dark-allowed");
+        folder.write("x.look", "color paper #0e2440\ndark night\n");
+        folder.write("y.look", "color paper #0e2440\ndark \"./y-night.look\"\n");
+        folder.write("y-night.look", "color paper #345678\n");
+        let diagram = folder.write("d.fdraw", "");
+        let named = draw(
+            "look \"x.look\"\na: rect \"A\" at 0,0\n",
+            Some(&diagram),
+            true,
+        );
+        assert_eq!((named.paper, named.errors.len()), (night, 0));
+        let relative = draw(
+            "look \"y.look\"\na: rect \"A\" at 0,0\n",
+            Some(&diagram),
+            true,
+        );
+        assert_eq!((relative.paper, relative.errors.len()), (0x34_5678, 0));
+    }
+
+    #[test]
+    fn dark_values_are_found_as_the_renderer_parses_them() {
+        let text = "# a note\n\
+            dark \"C:/a.look\" // dark c:/no.look\n\
+            canvas\n  dark \"//inside/canvas.look\"\n\
+            dark\n  \"\\\\\\\\server\\\\b.look\"\n\
+            dark key=D:/c.look\n\
+            dark night\n";
+        assert_eq!(
+            dark_values(text),
+            ["C:/a.look", r"\\server\b.look", "D:/c.look", "night"]
         );
     }
 
     #[test]
     fn text_rasterizes_with_ink_after_fonts_are_added() {
-        let d = draw("a: node \"Hello\" at 0,0\n", None, false);
+        let d = draw("a: rect \"Hello\" at 0,0\n", None, false);
         let image = rasterize(&d, 0, 1.0).unwrap();
         let paper = [
             (d.paper & 0xFF) as u8,
