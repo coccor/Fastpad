@@ -173,7 +173,8 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         .filter_map(|line| match &layout.laid_line(line)?.style.block.body {
             BodyStyle::Image { dest, .. } => match pictures.resolve(dest) {
                 ImageInfo::Pending(path) => Some(path),
-                // A `.fdraw` is asked for again whatever its state: a changed file is drawn anew.
+                // A `.fdraw` is asked for again whatever its state: a changed file is drawn anew
+                // (the cache looks at its files at most once a second).
                 ImageInfo::Ready { path, .. } if is_fdraw(&path) => Some(path),
                 ImageInfo::Unavailable => {
                     crate::preview::links::resolve_image_path(dest, pictures.folder.as_deref())

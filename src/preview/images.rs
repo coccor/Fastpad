@@ -11,6 +11,7 @@ use std::collections::{HashMap, VecDeque};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::GENERIC_READ;
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT,
@@ -148,6 +149,9 @@ pub fn decode_image(path: &Path, max_width: u32) -> Result<DecodedImage> {
     }
 }
 
+/// A `.fdraw`'s files are looked at for changes at most this often: requests come on every paint.
+const STAMP_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Diagrams kept beyond those on screen: each edit of a diagram's source renders a new one.
 const MAX_DIAGRAMS: usize = 32;
 
@@ -170,6 +174,8 @@ struct Entry {
     used: u64,
     /// What a `.fdraw` was drawn from, to notice when its files change.
     stamp: Option<Stamp>,
+    /// When `stamp` was last compared with the files.
+    checked: Option<Instant>,
 }
 
 /// Whether `path` is a FastDraw diagram.
@@ -234,6 +240,7 @@ impl Entry {
             scale,
             used,
             stamp: None,
+            checked: None,
         }
     }
 
@@ -320,6 +327,9 @@ pub struct ImageCache {
     /// Decodes queued so far, for tests.
     #[cfg(test)]
     queued: usize,
+    /// Times a `.fdraw` stamp was compared with the files, for tests.
+    #[cfg(test)]
+    stamp_checks: usize,
     /// `HWND` as an integer so the worker closure is `Send`.
     notify: isize,
     message: u32,
@@ -335,19 +345,31 @@ impl ImageCache {
             shared: Arc::new(Mutex::new(Shared::default())),
             #[cfg(test)]
             queued: 0,
+            #[cfg(test)]
+            stamp_checks: 0,
             notify: notify as isize,
             message,
         }
     }
 
     /// Queues a decode of `path` at most `max_width` pixels wide (0 = natural size). Repeated
-    /// requests are free unless the image must be decoded larger than before.
+    /// requests are free unless the image must be decoded larger than before. A `.fdraw`'s files
+    /// are looked at for changes at most once per `STAMP_INTERVAL`.
     pub fn request(&mut self, path: &Path, max_width: u32) {
         if let Some(entry) = self.entries.get_mut(path) {
-            let changed = entry
-                .stamp
-                .as_ref()
-                .is_some_and(|stamp| !stamp.current(path));
+            let now = Instant::now();
+            let due = entry
+                .checked
+                .is_none_or(|at| now.duration_since(at) >= STAMP_INTERVAL);
+            let changed = due
+                && entry.stamp.as_ref().is_some_and(|stamp| {
+                    entry.checked = Some(now);
+                    #[cfg(test)]
+                    {
+                        self.stamp_checks += 1;
+                    }
+                    !stamp.current(path)
+                });
             if !changed && !entry.wants(max_width) {
                 return;
             }
@@ -906,6 +928,31 @@ b: rect \"B\" at 600,0
         let _ = std::fs::remove_file(path);
     }
 
+    /// Moves `path`'s last change check `STAMP_INTERVAL` into the past.
+    fn let_a_second_pass(cache: &mut ImageCache, path: &Path) {
+        let entry = cache.entries.get_mut(path).unwrap();
+        entry.checked = entry.checked.map(|at| at - STAMP_INTERVAL);
+    }
+
+    #[test]
+    fn a_fdraw_is_checked_for_changes_at_most_once_a_second() {
+        // Break caught: every paint stat-ing each visible diagram on the UI thread, which stalls
+        // on a slow network share.
+        let path = fdraw_file("throttled", b"a: rect \"A\" at 0,0\n");
+        let mut cache = ImageCache::new(std::ptr::null_mut(), 0);
+        cache.request(&path, 0);
+        wait_for_settled(&mut cache, &path);
+        let before = cache.stamp_checks;
+        cache.request(&path, 0);
+        cache.request(&path, 0);
+        assert_eq!(cache.stamp_checks, before + 1);
+        // A second later the files are looked at again.
+        let_a_second_pass(&mut cache, &path);
+        cache.request(&path, 0);
+        assert_eq!(cache.stamp_checks, before + 2);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn changing_the_look_file_decodes_the_fdraw_again() {
         let dir = std::env::temp_dir().join(format!("fastpad-look-{}", std::process::id()));
@@ -921,6 +968,7 @@ b: rect \"B\" at 600,0
         cache.request(&path, 0);
         assert_eq!(cache.queued, 1);
         bump(&look, 10);
+        let_a_second_pass(&mut cache, &path);
         cache.request(&path, 0);
         assert_eq!(cache.queued, 2);
         let _ = std::fs::remove_dir_all(dir);
