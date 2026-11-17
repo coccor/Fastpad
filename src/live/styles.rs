@@ -24,6 +24,8 @@ use std::rc::Rc;
 pub enum Paint {
     Text,
     Heading,
+    /// H5 and H6, muted as the preview draws them.
+    MutedHeading,
     Emphasis,
     Marker,
     Link,
@@ -45,7 +47,7 @@ impl Paint {
             Self::Quote => 1,
             Self::Emphasis => 2,
             Self::Marker => 3,
-            Self::Heading => 4,
+            Self::Heading | Self::MutedHeading => 4,
             Self::Code => 5,
             Self::Link => 6,
             Self::Dim => 7,
@@ -192,6 +194,7 @@ pub fn effects(kind: SpanKind, revealed: bool) -> &'static [Effect] {
     match kind {
         SpanKind::Hidden => &[],
         // Size and weight come from the line's heading level.
+        SpanKind::Heading(5 | 6) => &[Color(Paint::MutedHeading)],
         SpanKind::Heading(_) => &[Color(Paint::Heading)],
         SpanKind::Bold => &[Bold],
         SpanKind::Italic => &[Italic],
@@ -893,10 +896,10 @@ mod tests {
     }
 
     #[test]
-    fn a_checked_task_hides_its_box_and_is_struck() {
+    fn a_checked_task_hides_its_box_and_keeps_its_colour() {
         let (style, line) = style_of("- [x] done", 0, false);
         assert_eq!(drawn(&style, &line), "done");
-        assert!(style.colour_runs().contains(&(6..10, Paint::Dim)));
+        assert!(style.colour_runs().is_empty());
     }
 
     fn spans_of(text: &str) -> Vec<Span> {

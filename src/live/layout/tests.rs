@@ -439,7 +439,7 @@ mod blocks {
         layout.reset(&lines);
         let em = layout.fonts().size;
         let laid = layout.line(&lines, 0).unwrap();
-        assert!(near(laid.indent, em * 1.5), "{}", laid.indent);
+        assert!(near(laid.indent, em * 2.0), "{}", laid.indent);
         assert_eq!(String::from_utf16_lossy(laid.offsets.layout_text()), "item");
         let bullet = laid
             .decorations
@@ -449,9 +449,9 @@ mod blocks {
                 _ => None,
             })
             .unwrap();
-        assert!(bullet.0.0 < em * 1.5 && bullet.1 == 1, "{bullet:?}");
+        assert!(bullet.0.0 < em * 2.0 && bullet.1 == 1, "{bullet:?}");
         let caret = layout.caret_rect(&lines, 2).unwrap();
-        assert!(near(caret.left, em * 1.5), "{}", caret.left);
+        assert!(near(caret.left, em * 2.0), "{}", caret.left);
         assert_eq!(layout.line(&lines, 2).unwrap().indent, 0.0);
     }
 
@@ -486,7 +486,7 @@ mod blocks {
             .map(|position| layout.caret_rect(&lines, position).unwrap().left)
             .collect::<Vec<_>>();
         let leftmost = lefts.iter().copied().fold(f32::MAX, f32::min);
-        assert!(near(leftmost, em * 1.5), "{leftmost}");
+        assert!(near(leftmost, em * 2.0), "{leftmost}");
         // Several rows start there.
         assert!(lefts.iter().filter(|left| near(**left, leftmost)).count() > 2);
     }
@@ -516,7 +516,7 @@ mod blocks {
             });
         assert_eq!(number, Some((true, "1.".to_owned())));
         let (layout, em) = laid_out("- a\n  - b", 400.0, 1, NONE);
-        assert!(near(line(&layout, 1).indent, em * 3.0));
+        assert!(near(line(&layout, 1).indent, em * 4.0));
     }
 
     #[test]
@@ -655,7 +655,7 @@ mod tables {
     use super::layout;
     use crate::live::blocks::LiveDocument;
     use crate::live::layout::{Decoration, LiveLayout};
-    use crate::live::styles::{Paint, Styled, no_images};
+    use crate::live::styles::{Styled, no_images};
     use crate::live::text::{LiveText, MemoryText};
     use std::ops::Range;
 
@@ -720,13 +720,13 @@ mod tables {
             assert!(near(end(layout, 0, "x"), end(layout, 2, "yyyy")));
             let header = layout.laid_line(0).unwrap();
             assert_eq!(header.columns.len(), 3);
-            assert!(header.decorations.iter().any(|decoration| matches!(
-                decoration,
-                Decoration::Fill {
-                    paint: Paint::CodeBackground,
-                    ..
-                }
-            )));
+            // No fill behind the header, as the preview draws it.
+            assert!(
+                !header
+                    .decorations
+                    .iter()
+                    .any(|decoration| matches!(decoration, Decoration::Fill { .. }))
+            );
             let delimiter = layout.laid_line(1).unwrap();
             assert!(delimiter.height < header.height);
             assert_eq!(
