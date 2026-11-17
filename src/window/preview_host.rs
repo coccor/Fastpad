@@ -1447,7 +1447,10 @@ pub(crate) fn open_in_fastdraw(hwnd: HWND) {
     let Some((name, path)) = shown else {
         return;
     };
-    let look = crate::preview::fastdraw::draw(&text, path.as_deref(), false).look;
+    // The look file as `render` reads it, without drawing the diagram on the UI thread.
+    let look = path
+        .as_deref()
+        .and_then(|path| crate::preview::fastdraw::read_look(&text, path));
     let link = fastdraw_render::editor_link(&name, &text, look.as_ref());
     if link.encode_utf16().count() > MAX_EDITOR_LINK_CHARS {
         host_window::push_notice(

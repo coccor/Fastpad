@@ -690,6 +690,35 @@ fn open_in_fastdraw_sends_the_tab_to_the_editor() {
 }
 
 #[test]
+fn open_in_fastdraw_sends_the_look_file_the_diagram_names() {
+    // Break caught: the editor drawing in its own look because the tab's relative look file was
+    // left out of the link.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let scratch = LibraryScratch::new("open-in-fastdraw-look");
+    let text = "look \"x.look\"\na: rect \"A\" at 0,0\n";
+    let path = open_note(&window, &scratch, "flow.fdraw", text);
+    std::fs::write(path.with_file_name("x.look"), "color paper #0e2440\n").unwrap();
+    crate::window::preview_host::take_opened();
+
+    execute_command(window.hwnd, CommandId::OpenInFastDraw);
+
+    let look = fastdraw_render::LookFile {
+        path: "x.look".to_owned(),
+        text: "color paper #0e2440\n".to_owned(),
+    };
+    assert_eq!(
+        crate::window::preview_host::take_opened(),
+        [fastdraw_render::editor_link(
+            "flow.fdraw",
+            text,
+            Some(&look)
+        )]
+    );
+}
+
+#[test]
 fn a_diagram_too_large_for_a_link_is_not_opened() {
     // Break caught: a link longer than the 32,767-character command line ShellExecute passes it
     // on, which would open a cut link or nothing.

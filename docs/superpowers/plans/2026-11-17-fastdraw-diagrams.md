@@ -123,7 +123,7 @@
 
 - [ ] **Step 1: Write failing tests.** `open_in_fastdraw_sends_the_tab_to_the_editor`: open a FastDraw tab `flow.fdraw` with `a: node "A" at 0,0`, run `CommandId::OpenInFastDraw`, assert one opened URL equal to `fastdraw_render::editor_link("flow.fdraw", <text>, None)` and starting `https://fastdraw.dev/edit/#fdraw=`. `the_command_does_nothing_on_other_tabs`: on a `.txt` tab nothing is opened. `the_tab_menu_offers_open_in_fastdraw_only_on_fastdraw_tabs` (menu entries built by a helper `tab_menu_entries(hwnd)` that tests read). Toolbar: `segment_at`-style hit test `button_at` returns the button for a point inside its rect on a FastDraw tab, and the toolbar has no button on an SVG tab.
 - [ ] **Step 2: Run** `cargo test --lib open_in_fastdraw the_tab_menu window::editor_toolbar -- --test-threads=1` — Expected: FAIL.
-- [ ] **Step 3: Implement.** The look passed is `draw(text, path, false).look`. Over 32,000 characters → notice; `shell_open` false → notice. Toolbar: one 24-px button with glyph `\u{E8A7}` left of the track, separated by `TRACK_PADDING * 2`, sharing the hover/press painting and the tooltip tool list (tool index `segments.len()`); a click dispatches `CommandId::OpenInFastDraw`.
+- [ ] **Step 3: Implement.** The look passed is `fastdraw::read_look(text, path)` (the look file as `render` reads it, without drawing). Over 32,000 characters → notice; `shell_open` false → notice. Toolbar: one 24-px button with glyph `\u{E8A7}` left of the track, separated by `TRACK_PADDING * 2`, sharing the hover/press painting and the tooltip tool list (tool index `segments.len()`); a click dispatches `CommandId::OpenInFastDraw`.
 - [ ] **Step 4: Run** the same command — Expected: PASS.
 - [ ] **Step 5: Commit** `feat(fastdraw): Open in FastDraw`.
 
