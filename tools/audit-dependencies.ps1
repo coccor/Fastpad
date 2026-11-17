@@ -13,7 +13,8 @@ $AllowedRoots = @(
     [pscustomobject]@{ Name = "windows-numerics"; Version = "0.3.1" },
     [pscustomobject]@{ Name = "regex"; Version = "1.13.1" },
     [pscustomobject]@{ Name = "resvg"; Version = "0.48.1" },
-    [pscustomobject]@{ Name = "mermaid-rs-renderer"; Version = "0.3.1" }
+    [pscustomobject]@{ Name = "mermaid-rs-renderer"; Version = "0.3.1" },
+    [pscustomobject]@{ Name = "fastdraw-render"; Version = "0.2.2" }
 )
 # The `windows` crate is allowed only as the pinned direct dependency, with exactly these features.
 # Win32/Win32_Graphics/Win32_Graphics_Dxgi/Win32_System are namespace features that cargo metadata
@@ -30,6 +31,8 @@ $AllowedWindowsFeatures = @(
     "Win32_System_Com_StructuredStorage", "Win32_System_Variant"
 )
 $RegistrySource = "registry+https://github.com/rust-lang/crates.io-index"
+# fastdraw-render is not on crates.io; it is the one crate taken from git, pinned to a commit.
+$FastDrawSource = "git+https://github.com/coccor/fastdraw?rev=f0d3905#f0d3905812dedfc51b14b0df59856a209f8f353e"
 
 # Crate-name patterns for HTTP, TLS, sockets, updaters, telemetry, async runtimes, and UI frameworks.
 $RejectedPatterns = @(
@@ -106,7 +109,8 @@ foreach ($node in $metadata.resolve.nodes) {
     if (-not $closure.Contains($node.id)) {
         $failures.Add("$label is outside the allowed dependency closure")
     }
-    if ($package.source -ne $RegistrySource) {
+    $isFastDraw = $package.name -eq "fastdraw-render" -and $package.source -eq $FastDrawSource
+    if ($package.source -ne $RegistrySource -and -not $isFastDraw) {
         $failures.Add("$label does not come from crates.io ($($package.source))")
     }
     if ($package.name -eq "windows") {
