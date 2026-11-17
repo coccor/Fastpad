@@ -173,7 +173,7 @@ struct Entry {
 }
 
 /// Whether `path` is a FastDraw diagram.
-fn is_fdraw(path: &Path) -> bool {
+pub fn is_fdraw(path: &Path) -> bool {
     path.extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("fdraw"))
 }
@@ -195,7 +195,6 @@ enum Job {
     Diagram(DiagramKey, f32),
 }
 
-/// Whether a decode limited to `requested` pixels already satisfies a limit of `max_width`.
 fn job_path(job: &Job) -> &Path {
     match job {
         Job::File(path, _) => path,
@@ -203,6 +202,7 @@ fn job_path(job: &Job) -> &Path {
     }
 }
 
+/// Whether a decode limited to `requested` pixels already satisfies a limit of `max_width`.
 fn covers(requested: u32, max_width: u32) -> bool {
     requested == 0 || (max_width != 0 && requested >= max_width)
 }
@@ -317,6 +317,9 @@ pub struct ImageCache {
     /// Advances on every diagram request and draw.
     clock: u64,
     shared: Arc<Mutex<Shared>>,
+    /// Decodes queued so far, for tests.
+    #[cfg(test)]
+    queued: usize,
     /// `HWND` as an integer so the worker closure is `Send`.
     notify: isize,
     message: u32,
@@ -330,6 +333,8 @@ impl ImageCache {
             dark: false,
             clock: 0,
             shared: Arc::new(Mutex::new(Shared::default())),
+            #[cfg(test)]
+            queued: 0,
             notify: notify as isize,
             message,
         }
@@ -345,6 +350,10 @@ impl ImageCache {
                 .is_some_and(|stamp| !stamp.current(path));
             if !changed && !entry.wants(max_width) {
                 return;
+            }
+            if changed {
+                // Until the new drawing arrives the file counts as handled: no second decode.
+                entry.stamp = None;
             }
             // Keep a ready image (and its size) on screen while the sharper decode runs.
             entry.requested = max_width;
@@ -414,6 +423,10 @@ impl ImageCache {
     }
 
     fn queue(&mut self, job: Job, max_width: u32) {
+        #[cfg(test)]
+        {
+            self.queued += 1;
+        }
         let spawn = {
             let mut shared = self
                 .shared
@@ -440,7 +453,7 @@ impl ImageCache {
                     };
                     let (result, stamp) = match &job {
                         Job::File(path, dark) if is_fdraw(path) => {
-                            let (result, stamp) = fastdraw::decode_stamped(path, *dark, max_width);
+                            let (result, stamp) = fastdraw::decode_file(path, *dark, max_width);
                             (result, Some(stamp))
                         }
                         Job::File(path, _) => (
@@ -847,5 +860,69 @@ b: rect \"B\" at 600,0
         };
         assert_ne!(light, dark);
         let _ = std::fs::remove_file(path);
+    }
+
+    fn bump(path: &Path, seconds: u64) {
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(seconds);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_failed_fdraw_that_is_fixed_decodes_on_the_next_request() {
+        let path = fdraw_file("fixed", b"a: nosuchkind \"A\" at 0,0\n");
+        let mut cache = ImageCache::new(std::ptr::null_mut(), 0);
+        cache.request(&path, 0);
+        wait_for_settled(&mut cache, &path);
+        assert!(cache.is_failed(&path));
+        std::fs::write(&path, "a: rect \"A\" at 0,0\n").unwrap();
+        bump(&path, 10);
+        cache.request(&path, 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while cache.size(&path).is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            cache.drain();
+        }
+        assert!(!cache.is_failed(&path) && cache.size(&path).is_some());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_changed_fdraw_is_queued_once_while_it_decodes() {
+        let path = fdraw_file("once", b"a: rect \"A\" at 0,0\n");
+        let mut cache = ImageCache::new(std::ptr::null_mut(), 0);
+        cache.request(&path, 0);
+        wait_for_settled(&mut cache, &path);
+        assert_eq!(cache.queued, 1);
+        bump(&path, 10);
+        cache.request(&path, 0);
+        cache.request(&path, 0);
+        cache.request(&path, 0);
+        assert_eq!(cache.queued, 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn changing_the_look_file_decodes_the_fdraw_again() {
+        let dir = std::env::temp_dir().join(format!("fastpad-look-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let look = dir.join("x.look");
+        std::fs::write(&look, "color paper #0e2440\n").unwrap();
+        let path = dir.join("d.fdraw");
+        std::fs::write(&path, "look \"x.look\"\na: rect \"A\" at 0,0\n").unwrap();
+        let mut cache = ImageCache::new(std::ptr::null_mut(), 0);
+        cache.request(&path, 0);
+        wait_for_settled(&mut cache, &path);
+        assert!(cache.size(&path).is_some());
+        cache.request(&path, 0);
+        assert_eq!(cache.queued, 1);
+        bump(&look, 10);
+        cache.request(&path, 0);
+        assert_eq!(cache.queued, 2);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

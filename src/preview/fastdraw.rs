@@ -139,18 +139,9 @@ impl Stamp {
 }
 
 /// Draws the `.fdraw` file at `path` as a bitmap no wider than `max_width` (0 = no limit), with
-/// the stamp it was made from.
+/// the stamp it was made from; the stamp comes also when the drawing failed, so a fix to the file
+/// is noticed.
 pub fn decode_file(
-    path: &Path,
-    dark: bool,
-    max_width: u32,
-) -> Result<(DecodedImage, Stamp), String> {
-    let (result, stamp) = decode_stamped(path, dark, max_width);
-    result.map(|image| (image, stamp))
-}
-
-/// `decode_file`, with the stamp also when the drawing failed, so a fix to the file is noticed.
-pub fn decode_stamped(
     path: &Path,
     dark: bool,
     max_width: u32,

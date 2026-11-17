@@ -7,7 +7,7 @@ use crate::platform::{last_error, wide_null};
 use crate::preview::colors::{ColorRole, PreviewColors};
 use crate::preview::dwrite::Graphics;
 use crate::preview::heights::{HeightIndex, estimate_height, line_for_offset, offset_for_line};
-use crate::preview::images::{DiagramState, ImageCache};
+use crate::preview::images::{DiagramState, ImageCache, is_fdraw};
 use crate::preview::incremental::{Edit, PreviewDocument, SourceText, Update};
 use crate::preview::layout::{
     DiagramView, LaidBlock, LayoutContext, PreviewFonts, Target, TargetKind, block_has_target,
@@ -916,7 +916,7 @@ fn ensure_layouts(state: &mut ViewState, indices: &[usize]) -> Result<bool> {
             )?;
             for slot in &laid.images {
                 if let Some(path) = &slot.path
-                    && !images.is_failed(path)
+                    && (!images.is_failed(path) || is_fdraw(path))
                 {
                     requests.push(path.clone());
                 }
