@@ -143,6 +143,16 @@ pub(crate) static LANGUAGES: [LanguageSpec; 24] = [
         styles: props::styles,
     },
     LanguageSpec {
+        language: Language::FastDraw,
+        name: "FastDraw",
+        extensions: &["fdraw"],
+        file_names: &[],
+        lexer: None,
+        keywords: &[],
+        properties: &[],
+        styles: no_styles,
+    },
+    LanguageSpec {
         language: Language::Html,
         name: "HTML",
         extensions: &["html", "htm", "xhtml"],
@@ -227,16 +237,6 @@ pub(crate) static LANGUAGES: [LanguageSpec; 24] = [
         keywords: &[],
         properties: &[],
         styles: props::styles,
-    },
-    LanguageSpec {
-        language: Language::FastDraw,
-        name: "FastDraw",
-        extensions: &["fdraw"],
-        file_names: &[],
-        lexer: None,
-        keywords: &[],
-        properties: &[],
-        styles: no_styles,
     },
     LanguageSpec {
         language: Language::Python,

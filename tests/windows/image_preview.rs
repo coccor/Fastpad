@@ -583,6 +583,42 @@ fn a_fdraw_opens_in_preview_draws_and_keeps_the_last_drawing_on_a_mistake() {
 }
 
 #[test]
+fn a_fdraw_tab_keeps_the_mode_it_opened_in_while_its_text_changes() {
+    // Break caught: the Preview default recomputed from live text, so typing into an empty file
+    // (or giving an untitled tab its first text) swaps the editor for the preview mid-edit.
+    use crate::preview::ViewMode;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let dir = scratch("fdraw-mode");
+    let path = dir.join("empty.fdraw");
+    std::fs::write(&path, "").unwrap();
+    main.open(&path).unwrap();
+    pump_pending();
+    assert!(window::preview_host::active_is_fastdraw(main.hwnd));
+    assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Source);
+    main.set_text(
+        "a: rect \"A\" at 0,0
+",
+    );
+    pump_pending();
+    assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Source);
+    // Emptying a tab that opened in Preview keeps Preview.
+    let drawn = dir.join("drawn.fdraw");
+    std::fs::write(
+        &drawn,
+        "a: rect \"A\" at 0,0
+",
+    )
+    .unwrap();
+    main.open(&drawn).unwrap();
+    pump_pending();
+    assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Preview);
+    main.set_text("");
+    pump_pending();
+    assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Preview);
+}
+
+#[test]
 fn the_image_view_names_itself_and_its_zoom_for_screen_readers() {
     // Break caught: Narrator reading "Markdown preview" or nothing for an image.
     let _scintilla = support::win32::WindowHarness::new().unwrap();

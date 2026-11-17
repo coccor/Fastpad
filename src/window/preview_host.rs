@@ -298,14 +298,23 @@ pub(crate) fn group_mode(hwnd: HWND, id: GroupId) -> ViewMode {
     let Some((document, language, _)) = group_document(hwnd, id) else {
         return ViewMode::Source;
     };
-    let chosen = with_group_host(hwnd, id, |host| host.modes.get(&document).copied()).flatten();
+    let mut chosen = with_group_host(hwnd, id, |host| host.modes.get(&document).copied()).flatten();
+    if chosen.is_none() && language == Language::FastDraw {
+        // Decided once, at the tab's first evaluation, and remembered: typing, saving or emptying
+        // the file never moves the tab between Source and Preview afterwards.
+        let first = if fastdraw_opens_in_preview(hwnd, id, document) {
+            ViewMode::Preview
+        } else {
+            ViewMode::Source
+        };
+        with_group_host(hwnd, id, |host| host.modes.insert(document, first));
+        chosen = Some(first);
+    }
     let default = match language {
         Language::Markdown => unsafe { host_window::app_ptr(hwnd) }.map_or(
             ViewMode::Source,
             |app| unsafe { app.as_ref() }.settings.markdown_view,
         ),
-        // A saved diagram with something drawn opens in its drawing; the rest start as text.
-        Language::FastDraw if fastdraw_opens_in_preview(hwnd, id, document) => ViewMode::Preview,
         _ => ViewMode::Source,
     };
     let mode = chosen.unwrap_or(default);
