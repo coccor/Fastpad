@@ -288,7 +288,7 @@ Source / Split / Preview control as Markdown.
   as "Line 3: ...", with the first error found.
 - **Dark themes:** on a dark FastPad theme a diagram draws in its look's dark counterpart (night, for the
   built-in look).
-- **Look files** are read only by a relative path. A network (`//server`, `\server`), absolute or drive
+- **Look files** are read only by a relative path. A network (`//server`, `\\server`), absolute or drive
   path is refused, and the diagram draws in the built-in look with an error band.
 - **In your notes:** `![alt](diagram.fdraw)` and `<img src="diagram.fdraw">` draw the diagram in Preview
   and Live. It redraws when the diagram or its look file changes and when you switch between dark and
