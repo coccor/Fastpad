@@ -2,6 +2,7 @@
 
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Settings (fastpad.ini)](#settings-fastpadini)
+- [Diagram commands](#diagram-commands)
 - [Command line](#command-line)
 
 ## Keyboard shortcuts
@@ -70,6 +71,14 @@ line in a notification and applies the rest.
 | `file_icons` | `material`, `minimal` or `solid` | `material` |
 
 Hand edits keep your comments and other lines; the palette and Settings rewrite only the lines they change.
+
+## Diagram commands
+
+| Command (palette, tab menu) | What it does |
+|---|---|
+| `FastDraw: Open in FastDraw` | Opens the `.fdraw` diagram in the editor at fastdraw.dev in your browser; the diagram travels after the `#` and no server receives it. Also the toolbar button left of the view control. |
+
+In a diagram's Preview, `Ctrl`+wheel, `+`, `-` and `0` zoom, a double-click fits, and dragging pans.
 
 ## Command line
 

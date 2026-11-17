@@ -63,6 +63,13 @@ $Sources = [ordered]@{
     "licenses\Scintilla.txt" = Join-Path $RepositoryRoot "licenses\Scintilla.txt"
     "licenses\Lexilla.txt"   = Join-Path $RepositoryRoot "licenses\Lexilla.txt"
     "licenses\material-icon-theme.txt" = Join-Path $RepositoryRoot "licenses\material-icon-theme.txt"
+    "licenses\FastDraw.txt" = Join-Path $RepositoryRoot "licenses\FastDraw.txt"
+    "licenses\phosphor-icons.txt" = Join-Path $RepositoryRoot "licenses\phosphor-icons.txt"
+    "licenses\OFL-Geist.txt" = Join-Path $RepositoryRoot "licenses\OFL-Geist.txt"
+    "licenses\OFL-InstrumentSerif.txt" = Join-Path $RepositoryRoot "licenses\OFL-InstrumentSerif.txt"
+    "licenses\OFL-LibreFranklin.txt" = Join-Path $RepositoryRoot "licenses\OFL-LibreFranklin.txt"
+    "licenses\OFL-Newsreader.txt" = Join-Path $RepositoryRoot "licenses\OFL-Newsreader.txt"
+    "licenses\OFL-SketchHand.txt" = Join-Path $RepositoryRoot "licenses\OFL-SketchHand.txt"
     "licenses\rust-crates.txt" = $RustCrateLicenses
 }
 if ((@($Sources.Keys | Sort-Object) -join "|") -ne (@($PackageFiles | Sort-Object) -join "|")) {
