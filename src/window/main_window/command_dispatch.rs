@@ -482,6 +482,7 @@ fn run_command(hwnd: HWND, command: CommandId, recorded: Option<std::path::PathB
         | CommandId::LanguageRust
         | CommandId::LanguageSql
         | CommandId::LanguageSvg
+        | CommandId::LanguageFastDraw
         | CommandId::LanguageToml
         | CommandId::LanguageTypeScript
         | CommandId::LanguageXml
@@ -490,6 +491,7 @@ fn run_command(hwnd: HWND, command: CommandId, recorded: Option<std::path::PathB
                 apply_language(hwnd, language);
             }
         }
+        CommandId::OpenInFastDraw => crate::window::preview_host::open_in_fastdraw(hwnd),
         CommandId::ValidateJson => validate_active_json(hwnd),
         CommandId::FormatJson => format_active_json(hwnd),
         CommandId::NextTab => cycle_tab(hwnd, true),

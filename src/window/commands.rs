@@ -201,6 +201,10 @@ pub enum CommandId {
     MarkdownDeleteTableColumn = 297,
     // File: New notebook… (2026-11-05).
     NewNotebook = 298,
+    // Language: FastDraw (2026-11-17).
+    LanguageFastDraw = 299,
+    // FastDraw: Open in FastDraw (2026-11-17).
+    OpenInFastDraw = 300,
 }
 
 /// The editing-shortcut commands (editing shortcuts spec §3): text commands whose keys work only
@@ -225,7 +229,7 @@ pub const EDITING_COMMANDS: [CommandId; 16] = [
 ];
 
 /// Commands that read or change a tab's text; an image tab has none (image preview spec §5).
-pub const TEXT_COMMANDS: [CommandId; 78] = [
+pub const TEXT_COMMANDS: [CommandId; 79] = [
     CommandId::ToggleReadOnly,
     CommandId::MoveLinesUp,
     CommandId::MoveLinesDown,
@@ -277,6 +281,7 @@ pub const TEXT_COMMANDS: [CommandId; 78] = [
     CommandId::LanguageRust,
     CommandId::LanguageSql,
     CommandId::LanguageSvg,
+    CommandId::LanguageFastDraw,
     CommandId::LanguageToml,
     CommandId::LanguageTypeScript,
     CommandId::LanguageXml,
@@ -510,6 +515,7 @@ impl CommandId {
             Self::LanguageRust => L::Rust,
             Self::LanguageSql => L::Sql,
             Self::LanguageSvg => L::Svg,
+            Self::LanguageFastDraw => L::FastDraw,
             Self::LanguageToml => L::Toml,
             Self::LanguageTypeScript => L::TypeScript,
             Self::LanguageXml => L::Xml,
@@ -541,6 +547,7 @@ impl CommandId {
             L::Rust => Self::LanguageRust,
             L::Sql => Self::LanguageSql,
             L::Svg => Self::LanguageSvg,
+            L::FastDraw => Self::LanguageFastDraw,
             L::Toml => Self::LanguageToml,
             L::TypeScript => Self::LanguageTypeScript,
             L::Xml => Self::LanguageXml,
@@ -580,7 +587,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 188] = [
+        const COMMANDS: [CommandId; 190] = [
             CommandId::MoveLinesUp,
             CommandId::MoveLinesDown,
             CommandId::CopyLinesUp,
@@ -769,6 +776,8 @@ impl TryFrom<u16> for CommandId {
             CommandId::MarkdownAddTableColumn,
             CommandId::MarkdownDeleteTableColumn,
             CommandId::NewNotebook,
+            CommandId::LanguageFastDraw,
+            CommandId::OpenInFastDraw,
         ];
         COMMANDS
             .into_iter()
@@ -1137,7 +1146,9 @@ mod tests {
         assert!(CommandId::ToggleReadOnly.needs_text());
         assert_eq!(CommandId::MarkdownViewLive.scope(), Scope::Global);
         assert!(CommandId::MarkdownViewLive.is_markdown_edit());
-        assert!(CommandId::try_from(299).is_err());
+        assert_eq!(CommandId::try_from(299), Ok(CommandId::LanguageFastDraw));
+        assert_eq!(CommandId::try_from(300), Ok(CommandId::OpenInFastDraw));
+        assert!(CommandId::try_from(301).is_err());
     }
 
     #[test]

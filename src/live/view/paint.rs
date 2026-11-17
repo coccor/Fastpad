@@ -6,6 +6,7 @@
 use super::*;
 use crate::live::layout::Decoration;
 use crate::live::styles::BodyStyle;
+use crate::preview::images::is_fdraw;
 use crate::preview::render::{RectF, color_f, create_hwnd_target_with};
 use windows::Win32::Foundation::D2DERR_RECREATE_TARGET;
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
@@ -174,6 +175,13 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         .filter_map(|line| match &layout.laid_line(line)?.style.block.body {
             BodyStyle::Image { dest, .. } => match pictures.resolve(dest) {
                 ImageInfo::Pending(path) => Some(path),
+                // A `.fdraw` is asked for again whatever its state: a changed file is drawn anew
+                // (the cache looks at its files at most once a second).
+                ImageInfo::Ready { path, .. } if is_fdraw(&path) => Some(path),
+                ImageInfo::Unavailable => {
+                    crate::preview::links::resolve_image_path(dest, pictures.folder.as_deref())
+                        .filter(|path| is_fdraw(path))
+                }
                 _ => None,
             },
             _ => None,

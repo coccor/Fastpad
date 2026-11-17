@@ -49,8 +49,12 @@ pub(super) fn apply_language(hwnd: HWND, language: crate::document::Language) {
             crate::window::preview_host::sync_visibility(hwnd);
         }
         Some(Err(_)) => {
-            // An SVG's preview does not need Lexilla, so the tab stays an SVG in plain text.
-            if language == crate::document::Language::Svg {
+            // An SVG's or a diagram's preview does not need Lexilla, so the tab keeps its language
+            // in plain text.
+            if matches!(
+                language,
+                crate::document::Language::Svg | crate::document::Language::FastDraw
+            ) {
                 set_active_language(hwnd, language);
                 invalidate_status_bar(hwnd);
                 crate::window::preview_host::sync_visibility(hwnd);

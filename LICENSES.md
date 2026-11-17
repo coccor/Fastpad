@@ -17,12 +17,17 @@ text is in `LICENSE`.
 | Artwork | Version | License | Text |
 |---|---|---|---|
 | Material Icon Theme icons (26 file and folder icons, embedded in `FastPad.exe`) | 5.38.1 | MIT License, Copyright (c) 2025 Material Extensions | `licenses/material-icon-theme.txt` |
+| Phosphor Icons (diagram icons, embedded in `FastPad.exe` through `fastdraw-render`) | pinned with `fastdraw-render` | MIT License, Copyright (c) 2023 Phosphor Icons | `licenses/phosphor-icons.txt` |
+| Geist and Geist Mono fonts (diagrams, embedded in `FastPad.exe`) | pinned with `fastdraw-render` | SIL Open Font License 1.1, Copyright 2026 The Geist Project Authors | `licenses/OFL-Geist.txt` |
+| Instrument Serif font (diagrams, embedded in `FastPad.exe`) | pinned with `fastdraw-render` | SIL Open Font License 1.1, Copyright 2022 The Instrument Serif Project Authors | `licenses/OFL-InstrumentSerif.txt` |
+| Libre Franklin font (diagrams, embedded in `FastPad.exe`) | pinned with `fastdraw-render` | SIL Open Font License 1.1, Copyright 2020 The Libre Franklin Project Authors | `licenses/OFL-LibreFranklin.txt` |
+| Newsreader font (diagrams, embedded in `FastPad.exe`) | pinned with `fastdraw-render` | SIL Open Font License 1.1, Copyright 2020 The Newsreader Project Authors | `licenses/OFL-Newsreader.txt` |
+| Sketch Hand font, a modified Virgil (diagrams, embedded in `FastPad.exe`) | pinned with `fastdraw-render` | SIL Open Font License 1.1 | `licenses/OFL-SketchHand.txt` |
 ## Rust crates
 
 FastPad depends directly on windows-sys 0.61.2, serde_json 1.0.151, pulldown-cmark 0.13.4, regex
-1.13.1, windows 0.62.2, windows-numerics 0.3.1, resvg 0.48.1, and mermaid-rs-renderer 0.3.1. The
-complete locked dependency
-closure, with the license expressions reported by `cargo metadata --locked`, is:
+1.13.1, windows 0.62.2, windows-numerics 0.3.1, resvg 0.48.1, mermaid-rs-renderer 0.3.1, and fastdraw-render 0.2.2. The
+complete locked dependency closure, with the license expressions reported by `cargo metadata --locked`, is:
 
 | Crate | Version | License | Role |
 |---|---|---|---|
@@ -125,11 +130,16 @@ closure, with the license expressions reported by `cargo metadata --locked`, is:
 | `ucd-trie` | 0.1.7 | MIT OR Apache-2.0 | `mermaid-rs-renderer` dependency (linked) |
 | `thiserror` | 2.0.21 | MIT OR Apache-2.0 | `mermaid-rs-renderer` dependency (linked) |
 | `thiserror-impl` | 2.0.21 | MIT OR Apache-2.0 | Build-time procedural macro |
+| `fastdraw-render` | 0.2.2 | MIT | `.fdraw` diagrams (linked; git `f0d3905`, not on crates.io) |
+| `indexmap` | 2.14.2 | Apache-2.0 OR MIT | `fastdraw-render` dependency (linked) |
+| `equivalent` | 1.0.3 | Apache-2.0 OR MIT | `indexmap` dependency (linked) |
+| `hashbrown` | 0.17.1 | MIT OR Apache-2.0 | `indexmap` dependency (linked) |
+| `ryu-js` | 1.0.3 | Apache-2.0 OR BSL-1.0 | `fastdraw-render` dependency (linked) |
 
 FastPad uses these crates under the MIT license option where a choice is offered; `unicode-ident`
 additionally carries the Unicode-3.0 license for its Unicode data tables. Without an MIT option,
 `arrayref` is used under BSD-2-Clause, `tiny-skia` and `tiny-skia-path` under BSD-3-Clause, and
-`slotmap` and `zlib-rs` under the Zlib license. Build-time procedural macro and build script crates
+`slotmap` and `zlib-rs` under the Zlib license, and `ryu-js` under Apache-2.0. Build-time procedural macro and build script crates
 are not linked into `FastPad.exe`.
 
 The portable package includes `licenses/rust-crates.txt`, generated during packaging by

@@ -33,9 +33,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, FindWindowExW, GetClientRect, HWND_TOP, IDC_ARROW, IsWindowVisible,
-    LoadCursorW, RegisterClassW, SWP_NOACTIVATE, SWP_SHOWWINDOW, SetWindowPos, WM_ERASEBKGND,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WNDCLASSW, WS_CHILD,
-    WS_CLIPSIBLINGS,
+    LoadCursorW, RegisterClassW, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageW, SetWindowPos,
+    WM_COMMAND, WM_ERASEBKGND, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_PAINT, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS,
 };
 
 const CLASS_NAME: &str = "FastPadEditorToolbar";
@@ -60,6 +60,8 @@ const fn glyph(mode: ViewMode) -> &'static str {
         ViewMode::Preview => "\u{E7B3}",
     }
 }
+/// The "Open in FastDraw" button's glyph, shown left of the view-mode track on FastDraw tabs.
+const OPEN_GLYPH: &str = "\u{E8A7}";
 const SEGMENT_HEIGHT: i32 = 22;
 const TRACK_PADDING: i32 = 2;
 const RIGHT_MARGIN: i32 = 8;
@@ -67,14 +69,23 @@ const LEFT_MARGIN: i32 = 16;
 /// Between the location's parts.
 const SEPARATOR: &str = "  \u{203A}  ";
 
+/// What the pointer can be over or pressing: a view-mode segment or the Open in FastDraw button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Item {
+    Mode(ViewMode),
+    Open,
+}
+
 /// The toolbar's window, once created, and its pointer state; kept on its group.
 #[derive(Debug)]
 pub(crate) struct EditorToolbar {
     pub(crate) hwnd: HWND,
     /// The view modes shown, in order: every mode for Markdown, no Live for SVG, none otherwise.
     segments: &'static [ViewMode],
-    hovered: Option<ViewMode>,
-    pressed: Option<ViewMode>,
+    /// The Open in FastDraw button shows (a FastDraw tab).
+    button: bool,
+    hovered: Option<Item>,
+    pressed: Option<Item>,
     /// Made on the first pointer move over the row; destroyed with the group.
     tooltip: Option<Tooltip>,
     /// The tooltip could not be made, and that is not tried again.
@@ -94,6 +105,7 @@ impl Default for EditorToolbar {
         Self {
             hwnd: std::ptr::null_mut(),
             segments: &[],
+            button: false,
             hovered: None,
             pressed: None,
             tooltip: None,
@@ -119,7 +131,9 @@ pub(crate) fn hwnd(main: HWND) -> Option<HWND> {
 pub(crate) fn segments_for(main: HWND, id: GroupId) -> &'static [ViewMode] {
     match crate::window::preview_host::group_document(main, id).map(|(_, language, _)| language) {
         Some(crate::document::Language::Markdown) => &ViewMode::ALL,
-        Some(crate::document::Language::Svg) => &ViewMode::SVG,
+        Some(crate::document::Language::Svg | crate::document::Language::FastDraw) => {
+            &ViewMode::SVG
+        }
         _ => &[],
     }
 }
@@ -203,6 +217,54 @@ fn track_rect(width: i32, height: i32, count: usize, dpi: u32) -> Rect {
     Rect::new(right - track_width, top, right, top + track_height)
 }
 
+/// The Open in FastDraw button in the toolbar window's client coordinates: one segment wide, left
+/// of the track of `count` segments, `TRACK_PADDING * 2` from it.
+pub(crate) fn button_rect(toolbar: HWND, count: usize) -> Rect {
+    let dpi = unsafe { GetDpiForWindow(toolbar) }.max(96);
+    let mut client = RECT::default();
+    unsafe { GetClientRect(toolbar, &mut client) };
+    button_rect_in(client.right, client.bottom, count, dpi)
+}
+
+/// The Open in FastDraw button in a row `width` × `height` with `count` segments.
+fn button_rect_in(width: i32, height: i32, count: usize, dpi: u32) -> Rect {
+    let track = track_rect(width, height, count, dpi);
+    let padding = scale(TRACK_PADDING, dpi);
+    let right = track.left - 2 * padding;
+    Rect::new(
+        right - scale_text(SEGMENT_WIDTH, dpi),
+        track.top + padding,
+        right,
+        track.bottom - padding,
+    )
+}
+
+/// Where the location text stops in a row `width` × `height`: short of the view control of
+/// `count` segments, and of the Open in FastDraw button when `button` shows.
+fn text_right(width: i32, height: i32, count: usize, dpi: u32, button: bool) -> i32 {
+    let end = if count == 0 {
+        width
+    } else if button {
+        button_rect_in(width, height, count, dpi).left
+    } else {
+        track_rect(width, height, count, dpi).left
+    };
+    end - scale(RIGHT_MARGIN, dpi)
+}
+
+/// Whether the toolbar `toolbar` shows the Open in FastDraw button.
+pub(crate) fn has_button(main: HWND, toolbar: HWND) -> bool {
+    let (_, id) = segments(main, toolbar);
+    id.and_then(|id| with_toolbar(main, id, |state| state.hwnd == toolbar && state.button))
+        .unwrap_or(false)
+}
+
+/// Whether the point is inside the Open in FastDraw button, when it shows.
+pub(crate) fn button_at(main: HWND, toolbar: HWND, x: i32, y: i32) -> bool {
+    has_button(main, toolbar)
+        && button_rect(toolbar, segments(main, toolbar).0.len()).contains(Point::new(x, y))
+}
+
 /// The modes the toolbar `toolbar` shows, and its group.
 fn segments(main: HWND, toolbar: HWND) -> (&'static [ViewMode], Option<GroupId>) {
     let id = crate::window::main_window::group_id_of(main, unsafe {
@@ -217,6 +279,13 @@ fn segments(main: HWND, toolbar: HWND) -> (&'static [ViewMode], Option<GroupId>)
         })
         .unwrap_or(&[]);
     (segments, id)
+}
+
+fn item_at(main: HWND, toolbar: HWND, x: i32, y: i32) -> Option<Item> {
+    if button_at(main, toolbar, x, y) {
+        return Some(Item::Open);
+    }
+    segment_at(main, toolbar, x, y).map(Item::Mode)
 }
 
 fn segment_at(main: HWND, toolbar: HWND, x: i32, y: i32) -> Option<ViewMode> {
@@ -267,13 +336,16 @@ pub(crate) fn layout(main: HWND, group: HWND, id: GroupId, top: i32, width: i32,
         return 0;
     };
     let segments = segments_for(main, id);
+    let button = crate::window::preview_host::group_document(main, id)
+        .is_some_and(|(_, language, _)| language == crate::document::Language::FastDraw);
     // Other segments mean other tooltip rectangles: the tooltip is made again on the next hover.
     let stale = crate::window::main_window::with_group_id(main, id, |state| {
         let control = &mut state.toolbar;
-        if control.segments == segments {
+        if control.segments == segments && control.button == button {
             return None;
         }
         control.segments = segments;
+        control.button = button;
         control.hovered = None;
         control.pressed = None;
         control.tooltip_failed = false;
@@ -343,6 +415,8 @@ fn with_toolbar<R>(
     crate::window::main_window::with_group_id(main, id, |group| action(&mut group.toolbar))
 }
 
+const OPEN_TOOLTIP: &str = "Open in FastDraw (fastdraw.dev)";
+
 /// The first pointer move over the row makes its tooltip and hands it that move, so the first
 /// hover starts the tip's timer like any later one. Nothing before that needs it.
 fn ensure_tooltip(main: HWND, toolbar: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) {
@@ -384,6 +458,19 @@ fn ensure_tooltip(main: HWND, toolbar: HWND, message: u32, wparam: WPARAM, lpara
                     index,
                     rect,
                     &crate::window::preview_host::button_text(main, *mode),
+                );
+            }
+            if has_button(main, toolbar) {
+                let rect = button_rect(toolbar, segments.len());
+                tooltip.set_tool(
+                    segments.len(),
+                    RECT {
+                        left: rect.left,
+                        top: rect.top,
+                        right: rect.right,
+                        bottom: rect.bottom,
+                    },
+                    OPEN_TOOLTIP,
                 );
             }
             tooltip.relay(message, wparam, lparam);
@@ -437,11 +524,15 @@ unsafe extern "system" fn toolbar_proc(
                 dwHoverTime: 0,
             };
             unsafe { TrackMouseEvent(&mut track) };
-            let over = segment_at(main, hwnd, x, y);
+            let over = item_at(main, hwnd, x, y);
             update(main, hwnd, |state| state.hovered = over);
             if let (_, Some(id)) = segments(main, hwnd) {
+                let mode = over.and_then(|item| match item {
+                    Item::Mode(mode) => Some(mode),
+                    Item::Open => None,
+                });
                 crate::window::preview_host::in_group(id, || {
-                    crate::window::preview_host::button_hover(main, over)
+                    crate::window::preview_host::button_hover(main, mode)
                 });
             }
             0
@@ -459,7 +550,7 @@ unsafe extern "system" fn toolbar_proc(
             0
         }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
-            let over = segment_at(main, hwnd, x, y);
+            let over = item_at(main, hwnd, x, y);
             update(main, hwnd, |state| {
                 state.hovered = over;
                 state.pressed = over;
@@ -469,15 +560,25 @@ unsafe extern "system" fn toolbar_proc(
         // A click acts only when released over the segment it was pressed on, on this toolbar's
         // own group, which becomes the active one.
         WM_LBUTTONUP => {
-            let over = segment_at(main, hwnd, x, y);
+            let over = item_at(main, hwnd, x, y);
             let mut pressed = None;
             update(main, hwnd, |state| pressed = state.pressed.take());
-            if let (Some(mode), (_, Some(id))) = (
-                over.filter(|&mode| pressed == Some(mode)),
+            if let (Some(item), (_, Some(id))) = (
+                over.filter(|&item| pressed == Some(item)),
                 segments(main, hwnd),
             ) {
                 crate::window::main_window::activate_group(main, id);
-                crate::window::preview_host::set_group_mode(main, id, mode);
+                match item {
+                    Item::Mode(mode) => crate::window::preview_host::set_group_mode(main, id, mode),
+                    Item::Open => unsafe {
+                        SendMessageW(
+                            main,
+                            WM_COMMAND,
+                            crate::window::commands::CommandId::OpenInFastDraw as usize,
+                            0,
+                        );
+                    },
+                }
             }
             0
         }
@@ -550,9 +651,13 @@ fn draw(main: HWND, toolbar: HWND, dc: HDC) {
         .then(|| track_rect(row.right, row.bottom - line, segments.len(), dpi));
     // The location, cut before it reaches the view control.
     let left = scale(LEFT_MARGIN, dpi);
-    let right = track.map_or(row.right - scale(RIGHT_MARGIN, dpi), |track| {
-        track.left - scale(RIGHT_MARGIN, dpi)
-    });
+    let right = text_right(
+        row.right,
+        row.bottom - line,
+        segments.len(),
+        dpi,
+        has_button(main, toolbar),
+    );
     if let Some((file, folders)) = parts.split_last() {
         let format = DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS;
         let prefix = folders
@@ -602,8 +707,8 @@ fn draw(main: HWND, toolbar: HWND, dc: HDC) {
         for (index, &segment) in segments.iter().enumerate() {
             let rect = segment_rect(toolbar, segments.len(), index);
             let current = segment == mode;
-            let over = hovered == Some(segment);
-            let held = over && pressed == Some(segment);
+            let over = hovered == Some(Item::Mode(segment));
+            let held = over && pressed == Some(Item::Mode(segment));
             unsafe {
                 if palette.high_contrast {
                     if current {
@@ -641,7 +746,46 @@ fn draw(main: HWND, toolbar: HWND, dc: HDC) {
                     _ => palette.muted_foreground,
                 };
                 SetTextColor(dc, color);
-                draw_glyph(dc, segment, rect, dpi);
+                draw_glyph(dc, glyph(segment), rect, dpi);
+            }
+        }
+        if has_button(main, toolbar) {
+            let rect = button_rect(toolbar, segments.len());
+            let over = hovered == Some(Item::Open);
+            let held = over && pressed == Some(Item::Open);
+            unsafe {
+                if palette.high_contrast {
+                    if over {
+                        crate::window::design::round::fill_bordered(
+                            dc,
+                            native(rect),
+                            0,
+                            ground,
+                            palette.editor_foreground,
+                            ground,
+                        );
+                    }
+                } else if held {
+                    fill_rounded(
+                        dc,
+                        native(rect),
+                        radius,
+                        Corners::ALL,
+                        palette.hover_background,
+                        ground,
+                    );
+                }
+                SetTextColor(
+                    dc,
+                    if over && !palette.high_contrast {
+                        palette.hover_foreground
+                    } else if over {
+                        palette.editor_foreground
+                    } else {
+                        palette.muted_foreground
+                    },
+                );
+                draw_glyph(dc, OPEN_GLYPH, rect, dpi);
             }
         }
     }
@@ -684,10 +828,9 @@ unsafe fn ink(dc: HDC, glyph: &str) -> Option<GLYPHMETRICS> {
     (result != GDI_ERROR as u32 && metrics.gmBlackBoxY > 0).then_some(metrics)
 }
 
-/// Draws `mode`'s glyph with its ink centred in `rect` and sized to `GLYPH_INK` tall (narrower if
-/// it would not fit the segment's width), so the four icons read as one size.
-unsafe fn draw_glyph(dc: HDC, mode: ViewMode, rect: Rect, dpi: u32) {
-    let text = glyph(mode);
+/// Draws `text`, one icon glyph, with its ink centred in `rect` and sized to `GLYPH_INK` tall
+/// (narrower if it would not fit the segment's width), so the icons read as one size.
+unsafe fn draw_glyph(dc: HDC, text: &str, rect: Rect, dpi: u32) {
     let nominal = scale_text(GLYPH_SIZE, dpi);
     let probe = icon_font(nominal);
     let previous = unsafe { select_font(dc, probe) };
@@ -739,8 +882,23 @@ unsafe fn draw_glyph(dc: HDC, mode: ViewMode, rect: Rect, dpi: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::location_segments;
+    use super::{RIGHT_MARGIN, button_rect_in, location_segments, text_right, track_rect};
+    use crate::window::design::metrics::scale;
     use std::path::Path;
+
+    #[test]
+    fn the_location_stops_short_of_the_open_button() {
+        // Break caught: the location text running under the Open in FastDraw button.
+        crate::window::design::text_scale::set_factor_for_test(100);
+        for dpi in [96, 144] {
+            let margin = scale(RIGHT_MARGIN, dpi);
+            let button = button_rect_in(800, 40, 3, dpi);
+            assert_eq!(text_right(800, 40, 3, dpi, true), button.left - margin);
+            let track = track_rect(800, 40, 3, dpi);
+            assert_eq!(text_right(800, 40, 3, dpi, false), track.left - margin);
+            assert_eq!(text_right(800, 40, 0, dpi, false), 800 - margin);
+        }
+    }
 
     #[test]
     fn a_note_shows_its_notebook_and_folders() {

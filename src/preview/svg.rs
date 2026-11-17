@@ -7,8 +7,9 @@
 use crate::preview::images::{DecodedImage, MAX_IMAGE_PIXELS};
 use crate::{FastPadError, Result};
 use resvg::usvg::{self, fontdb};
-use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, Once, OnceLock, PoisonError, RwLock};
 
 pub const MAX_SVG_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -65,12 +66,27 @@ pub(crate) fn natural_size(tree: &usvg::Tree) -> (u32, u32) {
 /// Rasterizes `tree` to `width`×`height` premultiplied BGRA pixels, scaling its natural size to
 /// fit exactly.
 pub(crate) fn rasterize(tree: &usvg::Tree, (width, height): (u32, u32)) -> Result<Vec<u8>> {
+    rasterize_region(tree, (width as f32, height as f32), (0, 0), (width, height))
+}
+
+/// Rasterizes the `width`×`height` pixels at `(x, y)` of `tree` drawn at `picture` size, as
+/// premultiplied BGRA: one region of a picture too large to rasterize whole.
+pub(crate) fn rasterize_region(
+    tree: &usvg::Tree,
+    picture: (f32, f32),
+    (x, y): (u32, u32),
+    (width, height): (u32, u32),
+) -> Result<Vec<u8>> {
     let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
         .ok_or(FastPadError::Invariant("SVG raster size is empty"))?;
     let size = tree.size();
-    let transform = resvg::tiny_skia::Transform::from_scale(
-        width as f32 / size.width(),
-        height as f32 / size.height(),
+    let transform = resvg::tiny_skia::Transform::from_row(
+        picture.0 / size.width(),
+        0.0,
+        0.0,
+        picture.1 / size.height(),
+        -(x as f32),
+        -(y as f32),
     );
     resvg::render(tree, transform, &mut pixmap.as_mut());
     // tiny-skia writes premultiplied RGBA.
@@ -86,14 +102,63 @@ fn has_text(source: &str) -> bool {
     source.contains("<text") || source.contains(":text")
 }
 
-/// The installed fonts, scanned once per process and shared by every later SVG with text.
-fn system_fonts() -> Arc<fontdb::Database> {
-    static FONTS: OnceLock<Arc<fontdb::Database>> = OnceLock::new();
-    Arc::clone(FONTS.get_or_init(|| {
+/// The installed fonts, scanned once per process and shared by every later SVG with text, plus
+/// whatever FastDraw added. Adding fonts clones the database and swaps the `Arc`, so a parse that
+/// already holds one keeps a consistent set.
+fn font_database() -> &'static RwLock<Arc<fontdb::Database>> {
+    static FONTS: OnceLock<RwLock<Arc<fontdb::Database>>> = OnceLock::new();
+    FONTS.get_or_init(|| {
         let mut fonts = fontdb::Database::new();
         fonts.load_system_fonts();
-        Arc::new(fonts)
-    }))
+        RwLock::new(Arc::new(fonts))
+    })
+}
+
+fn system_fonts() -> Arc<fontdb::Database> {
+    let guard = font_database()
+        .read()
+        .unwrap_or_else(PoisonError::into_inner);
+    Arc::clone(&guard)
+}
+
+/// Adds the fonts bundled with `fastdraw-render` (once per process).
+pub(crate) fn add_fastdraw_fonts() {
+    static ADDED: Once = Once::new();
+    ADDED.call_once(|| {
+        let mut guard = font_database()
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut fonts = (**guard).clone();
+        for (_, data) in fastdraw_render::fonts() {
+            fonts.load_font_data(data.clone());
+        }
+        *guard = Arc::new(fonts);
+    });
+}
+
+/// Adds the font files a diagram's look names, each path once per process. A file that cannot be
+/// read is skipped.
+pub(crate) fn add_font_files(paths: &[PathBuf]) {
+    static ADDED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    let mut added = ADDED
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let fresh: Vec<&PathBuf> = paths
+        .iter()
+        .filter(|p| added.insert((*p).clone()))
+        .collect();
+    if fresh.is_empty() {
+        return;
+    }
+    let mut guard = font_database()
+        .write()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mut fonts = (**guard).clone();
+    for path in fresh {
+        let _ = fonts.load_font_file(path);
+    }
+    *guard = Arc::new(fonts);
 }
 
 #[cfg(test)]

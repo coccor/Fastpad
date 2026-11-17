@@ -545,6 +545,80 @@ fn an_svg_opens_as_text_and_the_preview_renders_and_follows_edits() {
 }
 
 #[test]
+fn a_fdraw_opens_in_preview_draws_and_keeps_the_last_drawing_on_a_mistake() {
+    // Break caught: a .fdraw tab opening as plain text, the preview not drawing it, or a typing
+    // mistake blanking the last good drawing.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let dir = scratch("fdraw");
+    let path = dir.join("d.fdraw");
+    std::fs::write(&path, "a: rect \"A\" at 0,0\n").unwrap();
+    main.open(&path).unwrap();
+    pump_pending();
+    assert!(window::preview_host::buttons_visible(main.hwnd));
+    assert!(window::preview_host::active_is_fastdraw(main.hwnd));
+    assert_eq!(
+        window::preview_host::mode(main.hwnd),
+        crate::preview::ViewMode::Preview
+    );
+    let view = main
+        .with_app(|app| app.active_group().unwrap().preview.svg_view)
+        .expect("svg view");
+    pump_until("fdraw drawn", Duration::from_secs(5), || {
+        view.stats().phase == image_view::Phase::Ready
+    });
+    let first = view.status().size.expect("drawn size");
+    main.set_text("a: rect \"A\" at 0,0\nb: rect \"B\" at 200,0\n");
+    pump_until("fdraw redrawn wider", Duration::from_secs(5), || {
+        view.status().size.is_some_and(|size| size.0 > first.0)
+    });
+    let wide = view.status().size;
+    main.set_text("a: rect \"A\" at 0,0\nb: rect \"B\" at 200,0\nc: nosuchkind \"C\" at 0,0\n");
+    pump_until("fdraw error band", Duration::from_secs(5), || {
+        view.stats()
+            .band
+            .is_some_and(|band| band.starts_with("Line 3: "))
+    });
+    assert_eq!(view.status().size, wide);
+}
+
+#[test]
+fn a_fdraw_tab_keeps_the_mode_it_opened_in_while_its_text_changes() {
+    // Break caught: the Preview default recomputed from live text, so typing into an empty file
+    // (or giving an untitled tab its first text) swaps the editor for the preview mid-edit.
+    use crate::preview::ViewMode;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let dir = scratch("fdraw-mode");
+    let path = dir.join("empty.fdraw");
+    std::fs::write(&path, "").unwrap();
+    main.open(&path).unwrap();
+    pump_pending();
+    assert!(window::preview_host::active_is_fastdraw(main.hwnd));
+    assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Source);
+    main.set_text(
+        "a: rect \"A\" at 0,0
+",
+    );
+    pump_pending();
+    assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Source);
+    // Emptying a tab that opened in Preview keeps Preview.
+    let drawn = dir.join("drawn.fdraw");
+    std::fs::write(
+        &drawn,
+        "a: rect \"A\" at 0,0
+",
+    )
+    .unwrap();
+    main.open(&drawn).unwrap();
+    pump_pending();
+    assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Preview);
+    main.set_text("");
+    pump_pending();
+    assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Preview);
+}
+
+#[test]
 fn the_image_view_names_itself_and_its_zoom_for_screen_readers() {
     // Break caught: Narrator reading "Markdown preview" or nothing for an image.
     let _scintilla = support::win32::WindowHarness::new().unwrap();

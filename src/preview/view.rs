@@ -7,7 +7,7 @@ use crate::platform::{last_error, wide_null};
 use crate::preview::colors::{ColorRole, PreviewColors};
 use crate::preview::dwrite::Graphics;
 use crate::preview::heights::{HeightIndex, estimate_height, line_for_offset, offset_for_line};
-use crate::preview::images::{DiagramState, ImageCache};
+use crate::preview::images::{DiagramState, ImageCache, is_fdraw};
 use crate::preview::incremental::{Edit, PreviewDocument, SourceText, Update};
 use crate::preview::layout::{
     DiagramView, LaidBlock, LayoutContext, PreviewFonts, Target, TargetKind, block_has_target,
@@ -248,7 +248,11 @@ impl PreviewView {
             clicks: Clicks::default(),
             over_text: false,
             tracking_mouse: false,
-            images: ImageCache::new(hwnd, WM_FASTPAD_PREVIEW_IMAGE),
+            images: {
+                let mut images = ImageCache::new(hwnd, WM_FASTPAD_PREVIEW_IMAGE);
+                images.set_dark(colors.is_dark());
+                images
+            },
             centered: false,
             paused: false,
             live_resize: false,
@@ -342,6 +346,8 @@ impl PreviewView {
     pub fn set_appearance(&self, colors: PreviewColors, fonts: PreviewFonts, dark_scrollbar: bool) {
         self.with(|state| {
             state.colors = colors;
+            // `.fdraw` links are drawn in the look that suits the page.
+            state.images.set_dark(colors.is_dark());
             state.fonts = fonts;
             state.brushes = None;
             relayout(state);
@@ -910,7 +916,7 @@ fn ensure_layouts(state: &mut ViewState, indices: &[usize]) -> Result<bool> {
             )?;
             for slot in &laid.images {
                 if let Some(path) = &slot.path
-                    && !images.is_failed(path)
+                    && (!images.is_failed(path) || is_fdraw(path))
                 {
                     requests.push(path.clone());
                 }

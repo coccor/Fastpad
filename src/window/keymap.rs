@@ -228,6 +228,8 @@ pub(crate) const COMMAND_IDS: &[(CommandId, &str)] = &[
     (CommandId::LanguageRust, "language.rust"),
     (CommandId::LanguageSql, "language.sql"),
     (CommandId::LanguageSvg, "language.svg"),
+    (CommandId::LanguageFastDraw, "language.fastdraw"),
+    (CommandId::OpenInFastDraw, "fastdraw.openInFastDraw"),
     (CommandId::LanguageToml, "language.toml"),
     (CommandId::LanguageTypeScript, "language.typescript"),
     (CommandId::LanguageXml, "language.xml"),

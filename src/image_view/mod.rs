@@ -17,7 +17,7 @@ use crate::preview::colors::PreviewColors;
 use crate::preview::dwrite::Graphics;
 use crate::window::{WM_FASTPAD_IMAGE_DECODED, WM_FASTPAD_IMAGE_STATUS};
 use accessible::AccessibleText;
-use decode::{Decoded, FullImage, ImageError, Source};
+use decode::{Decoded, Delivery, FullImage, ImageError, Rendered, Source, Tile, TileJob};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
@@ -55,7 +55,10 @@ use zoom::Zoom;
 const CLASS_NAME: &str = "FastPadImageView";
 const LOADING_TIMER: usize = 1;
 const SVG_TIMER: usize = 2;
+const TILE_TIMER: usize = 3;
 const LOADING_DELAY_MS: u32 = 150;
+/// A pan that uncovers blurred picture renders a sharp tile this long after it starts.
+const TILE_DELAY_MS: u32 = 40;
 const DEFAULT_MAX_SIDE: u32 = 16_384;
 /// One arrow key, scroll-bar line or wheel notch pans this far, in pixels at 96 DPI.
 const PAN_STEP: f32 = 48.0;
@@ -73,7 +76,7 @@ pub enum Phase {
     Failed,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ImageStats {
     pub phase: Phase,
     pub scale: f32,
@@ -81,6 +84,12 @@ pub struct ImageStats {
     pub decodes: u32,
     pub has_target: bool,
     pub svg_error: bool,
+    /// The text the error band shows, when it shows.
+    pub band: Option<String>,
+    /// The pixel size of the whole-picture bitmap.
+    pub whole: Option<(u32, u32)>,
+    /// The zoom and area of the sharp tile over a deeply zoomed vector picture.
+    pub tile: Option<(f32, decode::TileArea)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -99,6 +108,10 @@ enum Shown {
         stamp: Option<DiskStamp>,
     },
     Svg(Arc<str>),
+    FastDraw {
+        text: Arc<str>,
+        file: Option<PathBuf>,
+    },
 }
 
 struct ViewState {
@@ -114,9 +127,21 @@ struct ViewState {
     shown: Option<Shown>,
     generation: u64,
     image: Option<FullImage>,
+    /// The visible part of a vector picture zoomed past `decode::WHOLE_PIXEL_BUDGET`, rendered
+    /// sharp from the image's tree and drawn over the enlarged whole picture.
+    tile: Option<Tile>,
+    tile_bitmap: Option<ID2D1Bitmap>,
+    /// Numbers the image's tree, so a render from a replaced tree is dropped.
+    tree_id: u64,
+    /// A render from the tree is under way; one at a time, and its landing looks for more work.
+    rendering: bool,
+    /// `TILE_TIMER` is set.
+    tile_timer: bool,
     error: Option<ImageError>,
     /// The last SVG render failed while an earlier image is still shown.
     svg_error: bool,
+    /// The band's text for a diagram error; an SVG error uses the generic text.
+    band: Option<String>,
     loading: bool,
     loading_visible: bool,
     zoom: Zoom,
@@ -169,8 +194,14 @@ impl ImageView {
             shown: None,
             generation: 0,
             image: None,
+            tile: None,
+            tile_bitmap: None,
+            tree_id: 0,
+            rendering: false,
+            tile_timer: false,
             error: None,
             svg_error: false,
+            band: None,
             loading: false,
             loading_visible: false,
             zoom: Zoom::Fit,
@@ -220,11 +251,11 @@ impl ImageView {
             if !same_file {
                 state.zoom = Zoom::Fit;
                 state.offset = (0.0, 0.0);
-                state.image = None;
-                state.bitmap = None;
+                clear_picture(state);
             }
             state.shown = Some(wanted);
             state.svg_error = false;
+            state.band = None;
             start_decode(state, Source::File(path.to_path_buf()));
         });
         finish(self.hwnd);
@@ -243,12 +274,40 @@ impl ImageView {
             if new_document || !matches!(state.shown, Some(Shown::Svg(_))) {
                 state.zoom = Zoom::Fit;
                 state.offset = (0.0, 0.0);
-                state.image = None;
-                state.bitmap = None;
+                clear_picture(state);
             }
-            let width = svg_width(state);
-            state.shown = Some(Shown::Svg(Arc::clone(&text)));
-            start_decode(state, Source::Svg { text, width });
+            state.shown = Some(Shown::Svg(text));
+            start_svg_decode(state);
+        });
+        finish(self.hwnd);
+    }
+
+    /// Draws FastDraw source `text` (from `file`, the base of a relative look path) in the view's
+    /// light or dark look. Edits and new documents behave as for `show_svg`.
+    pub fn show_fastdraw(
+        &self,
+        text: Arc<str>,
+        file: Option<PathBuf>,
+        name: &str,
+        new_document: bool,
+    ) {
+        self.with(|state| {
+            state.name = name.to_owned();
+            if !new_document
+                && matches!(&state.shown, Some(Shown::FastDraw { text: shown, file: shown_file })
+                    if **shown == *text && *shown_file == file)
+            {
+                return;
+            }
+            if new_document || !matches!(state.shown, Some(Shown::FastDraw { .. })) {
+                state.zoom = Zoom::Fit;
+                state.offset = (0.0, 0.0);
+                clear_picture(state);
+                state.svg_error = false;
+                state.band = None;
+            }
+            state.shown = Some(Shown::FastDraw { text, file });
+            start_svg_decode(state);
         });
         finish(self.hwnd);
     }
@@ -267,9 +326,9 @@ impl ImageView {
             }
             state.generation += 1;
             stop_loading(state);
-            state.image = None;
-            state.bitmap = None;
+            clear_picture(state);
             state.svg_error = false;
+            state.band = None;
             state.error = Some(error);
         });
         finish(self.hwnd);
@@ -283,8 +342,10 @@ impl ImageView {
             state.title_format = None;
             state.body_format = None;
             state.drag = None;
+            state.tile_timer = false;
             unsafe {
                 KillTimer(state.hwnd, SVG_TIMER);
+                KillTimer(state.hwnd, TILE_TIMER);
             }
         });
     }
@@ -323,9 +384,15 @@ impl ImageView {
     pub fn set_appearance(&self, colors: PreviewColors, high_contrast: bool) {
         self.with(|state| {
             if state.colors != colors || state.high_contrast != high_contrast {
+                let relook = state.colors.is_dark() != colors.is_dark()
+                    && matches!(state.shown, Some(Shown::FastDraw { .. }));
                 state.colors = colors;
                 state.high_contrast = high_contrast;
                 state.checker = None;
+                // A diagram draws in the look that matches the theme.
+                if relook {
+                    start_svg_decode(state);
+                }
             }
         });
         invalidate(self.hwnd);
@@ -343,6 +410,17 @@ impl ImageView {
             decodes: state.decodes,
             has_target: state.target.is_some(),
             svg_error: state.svg_error,
+            band: state.svg_error.then(|| {
+                state
+                    .band
+                    .clone()
+                    .unwrap_or_else(|| paint::SVG_BAND_TEXT.to_owned())
+            }),
+            whole: state
+                .image
+                .as_ref()
+                .map(|image| (image.width, image.height)),
+            tile: state.tile.as_ref().map(|tile| (tile.scale, tile.area)),
         })
         .unwrap_or_default()
     }
@@ -464,18 +542,112 @@ fn svg_width(state: &ViewState) -> u32 {
     })
 }
 
+/// The size the whole SVG picture renders at for the current zoom: the zoomed size, up to
+/// `decode::WHOLE_PIXEL_BUDGET`.
+fn whole_size(image: &FullImage, state: &ViewState) -> (u32, u32) {
+    decode::svg_render_size(
+        (image.natural_width, image.natural_height),
+        svg_width(state),
+        state.max_side,
+        decode::WHOLE_PIXEL_BUDGET,
+    )
+}
+
 /// Whether the shown SVG bitmap is more than 1% off the size the current zoom renders at, so it
 /// is drawn stretched and should be rendered again.
 fn svg_needs_render(state: &ViewState) -> bool {
     let Some(image) = &state.image else {
         return false;
     };
-    let (wanted, _) = decode::svg_render_size(
-        (image.natural_width, image.natural_height),
-        svg_width(state),
-        state.max_side,
-    );
+    let (wanted, _) = whole_size(image, state);
     (wanted as f32 - image.width as f32).abs() / image.width.max(1) as f32 > 0.01
+}
+
+/// The tile the current zoom and position show sharp, when the vector picture is zoomed past
+/// what renders whole.
+fn tile_job(state: &ViewState) -> Option<TileJob> {
+    let image = state.image.as_ref()?;
+    image.tree.as_ref()?;
+    let natural = (image.natural_width, image.natural_height);
+    if !decode::tiled(natural, svg_width(state), state.max_side) {
+        return None;
+    }
+    let area = decode::tile_area(
+        shown_size(state)?,
+        state.offset,
+        client_size(state.hwnd),
+        decode::TILE_MARGIN,
+        state.max_side,
+    )?;
+    Some((state.scale, area))
+}
+
+/// `tile_job` when the shown tile does not already cover the view at this zoom.
+fn wanted_tile(state: &ViewState) -> Option<TileJob> {
+    let (scale, area) = tile_job(state)?;
+    if let Some(tile) = &state.tile
+        && tile.scale == scale
+    {
+        let visible = decode::tile_area(
+            shown_size(state)?,
+            state.offset,
+            client_size(state.hwnd),
+            0.0,
+            state.max_side,
+        )?;
+        if tile.area.contains(&visible) || tile.area == area {
+            return None;
+        }
+    }
+    Some((scale, area))
+}
+
+/// Renders from the kept tree what the zoom and position want and the view lacks: the whole
+/// picture at another size, a sharp tile, or both. A document decode under way brings its own.
+fn refresh_vector(state: &mut ViewState) {
+    if !shows_vector(state) || state.loading || state.rendering {
+        return;
+    }
+    let Some(image) = &state.image else {
+        return;
+    };
+    let Some(tree) = image.tree.clone() else {
+        if svg_needs_render(state) {
+            start_svg_decode(state);
+        }
+        return;
+    };
+    let natural = (image.natural_width, image.natural_height);
+    let whole = svg_needs_render(state).then(|| whole_size(image, state));
+    let tile = wanted_tile(state);
+    if whole.is_none() && tile.is_none() {
+        return;
+    }
+    state.rendering = true;
+    decode::spawn_render(
+        state.tree_id,
+        tree,
+        natural,
+        whole,
+        tile,
+        state.hwnd,
+        WM_FASTPAD_IMAGE_DECODED,
+    );
+}
+
+/// Asks for a tile shortly when the view shows blurred picture, unless one is already asked for.
+fn schedule_tile(state: &mut ViewState) {
+    if !state.tile_timer && shows_vector(state) && wanted_tile(state).is_some() {
+        state.tile_timer = true;
+        unsafe { SetTimer(state.hwnd, TILE_TIMER, TILE_DELAY_MS, None) };
+    }
+}
+
+fn clear_picture(state: &mut ViewState) {
+    state.image = None;
+    state.bitmap = None;
+    state.tile = None;
+    state.tile_bitmap = None;
 }
 
 fn start_decode(state: &mut ViewState, source: Source) {
@@ -493,6 +665,29 @@ fn start_decode(state: &mut ViewState, source: Source) {
     );
 }
 
+/// Whether the view shows source that is drawn at the zoom (an SVG or a FastDraw diagram).
+fn shows_vector(state: &ViewState) -> bool {
+    matches!(state.shown, Some(Shown::Svg(_) | Shown::FastDraw { .. }))
+}
+
+/// Decodes the shown SVG or diagram again at the size the zoom wants.
+fn start_svg_decode(state: &mut ViewState) {
+    let width = svg_width(state);
+    let tile = tile_job(state);
+    let source = match state.shown.clone() {
+        Some(Shown::Svg(text)) => Source::Svg { text, width, tile },
+        Some(Shown::FastDraw { text, file }) => Source::FastDraw {
+            text,
+            file,
+            dark: state.colors.is_dark(),
+            width,
+            tile,
+        },
+        _ => return,
+    };
+    start_decode(state, source);
+}
+
 fn stop_loading(state: &mut ViewState) {
     unsafe { KillTimer(state.hwnd, LOADING_TIMER) };
     state.loading = false;
@@ -502,6 +697,7 @@ fn stop_loading(state: &mut ViewState) {
 fn drop_device_resources(state: &mut ViewState) {
     state.target = None;
     state.bitmap = None;
+    state.tile_bitmap = None;
     state.checker = None;
 }
 
@@ -511,9 +707,10 @@ fn accept_decoded(state: &mut ViewState, decoded: Decoded) {
     }
     stop_loading(state);
     state.decodes += 1;
-    let svg = matches!(state.shown, Some(Shown::Svg(_)));
+    let svg = shows_vector(state);
     match decoded.result {
         Ok(image) => {
+            let band = image.diagram.as_ref().and_then(|facts| facts.band.clone());
             // A reload whose pixel size changed starts at fit again (spec §6.5); an SVG re-render at
             // another zoom keeps its natural size, so its zoom stays.
             let resized = state.image.as_ref().is_some_and(|old| {
@@ -525,30 +722,53 @@ fn accept_decoded(state: &mut ViewState, decoded: Decoded) {
             }
             state.image = Some(image);
             state.bitmap = None;
+            state.tile = decoded.tile;
+            state.tile_bitmap = None;
+            state.tree_id += 1;
             state.error = None;
-            state.svg_error = false;
+            state.svg_error = band.is_some();
+            state.band = band;
         }
-        Err(_) if svg && state.image.is_some() => state.svg_error = true,
+        Err(error) if svg && state.image.is_some() => {
+            state.svg_error = true;
+            state.band = matches!(error, ImageError::Diagram(_)).then(|| error.message());
+        }
         Err(error) => {
             state.error = Some(error);
-            state.image = None;
-            state.bitmap = None;
+            clear_picture(state);
+            state.svg_error = false;
+            state.band = None;
         }
     }
     recompute(state);
     // An SVG render asked for with the previous document's size (an edit changed its dimensions,
     // or the first render at natural size fits smaller) is drawn stretched: render it again at
-    // the size this zoom wants.
-    if svg && svg_needs_render(state) {
-        unsafe {
-            SetTimer(
-                state.hwnd,
-                SVG_TIMER,
-                crate::preview::PREVIEW_UPDATE_DELAY_MS,
-                None,
-            )
-        };
+    // the size this zoom wants, from the tree just parsed.
+    if svg {
+        refresh_vector(state);
     }
+}
+
+fn accept_rendered(state: &mut ViewState, rendered: Rendered) {
+    state.rendering = false;
+    if rendered.tree_id == state.tree_id {
+        if let Some((width, height, pixels)) = rendered.whole
+            && let Some(image) = &mut state.image
+        {
+            (image.width, image.height, image.pixels) = (width, height, pixels);
+            state.bitmap = None;
+        }
+        if rendered.tile.is_some() {
+            state.tile = rendered.tile;
+            state.tile_bitmap = None;
+        }
+        // Back within the budget, the whole picture is sharp on its own.
+        if tile_job(state).is_none() && !svg_needs_render(state) {
+            state.tile = None;
+            state.tile_bitmap = None;
+        }
+    }
+    refresh_vector(state);
 }
 
 /// Applies the zoom to the current client size: sets `scale` and clamps `offset`.
@@ -566,6 +786,7 @@ fn recompute(state: &mut ViewState) {
         zoom::clamp_axis(state.offset.0, natural.0 * state.scale, width),
         zoom::clamp_axis(state.offset.1, natural.1 * state.scale, height),
     );
+    schedule_tile(state);
 }
 
 fn set_zoom(state: &mut ViewState, zoom: Zoom, anchor: (f32, f32)) {
@@ -579,7 +800,7 @@ fn set_zoom(state: &mut ViewState, zoom: Zoom, anchor: (f32, f32)) {
         state.offset = zoom::zoom_about(state.offset, old, state.scale, anchor);
     }
     recompute(state);
-    if matches!(state.shown, Some(Shown::Svg(_))) {
+    if shows_vector(state) {
         unsafe {
             SetTimer(
                 state.hwnd,
@@ -837,7 +1058,7 @@ unsafe extern "system" fn image_proc(
                     break;
                 }
                 if queued.lParam != 0 {
-                    drop(unsafe { Box::from_raw(queued.lParam as *mut Decoded) });
+                    drop(unsafe { Box::from_raw(queued.lParam as *mut Delivery) });
                 }
             }
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
@@ -870,10 +1091,7 @@ unsafe extern "system" fn image_proc(
             if shrank {
                 with_state(hwnd, |state| match state.shown.clone() {
                     Some(Shown::File { path, .. }) => start_decode(state, Source::File(path)),
-                    Some(Shown::Svg(text)) => {
-                        let width = svg_width(state);
-                        start_decode(state, Source::Svg { text, width });
-                    }
+                    Some(Shown::Svg(_) | Shown::FastDraw { .. }) => start_svg_decode(state),
                     None => {}
                 });
             }
@@ -929,16 +1147,13 @@ unsafe extern "system" fn image_proc(
                     });
                     invalidate(hwnd);
                 }
-                SVG_TIMER => {
+                SVG_TIMER | TILE_TIMER => {
                     with_state(hwnd, |state| {
-                        unsafe { KillTimer(hwnd, SVG_TIMER) };
-                        let Some(Shown::Svg(text)) = state.shown.clone() else {
-                            return;
-                        };
-                        if svg_needs_render(state) {
-                            let width = svg_width(state);
-                            start_decode(state, Source::Svg { text, width });
+                        unsafe { KillTimer(hwnd, wparam) };
+                        if wparam == TILE_TIMER {
+                            state.tile_timer = false;
                         }
+                        refresh_vector(state);
                     });
                 }
                 _ => {}
@@ -947,8 +1162,11 @@ unsafe extern "system" fn image_proc(
         }
         WM_FASTPAD_IMAGE_DECODED => {
             if lparam != 0 {
-                let decoded = unsafe { Box::from_raw(lparam as *mut Decoded) };
-                with_state(hwnd, |state| accept_decoded(state, *decoded));
+                let delivery = unsafe { Box::from_raw(lparam as *mut Delivery) };
+                with_state(hwnd, |state| match *delivery {
+                    Delivery::Decoded(decoded) => accept_decoded(state, decoded),
+                    Delivery::Rendered(rendered) => accept_rendered(state, rendered),
+                });
                 finish(hwnd);
             }
             0
@@ -1101,9 +1319,12 @@ fn focused(hwnd: HWND) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        DestroyWindow, MSG, PM_REMOVE, PeekMessageW, PostQuitMessage, WM_QUIT,
-    };
+    use super::*;
+    use crate::platform::theme::Theme;
+    use crate::preview::colors::preview_colors;
+    use crate::preview::render::TestWindow;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{DispatchMessageW, TranslateMessage};
 
     #[test]
     fn destroying_the_view_keeps_a_posted_quit_for_the_message_loop() {
@@ -1127,5 +1348,180 @@ mod tests {
         };
         assert_ne!(found, 0, "the quit message was swallowed");
         assert_eq!(message.wParam, 7);
+    }
+
+    const GOOD: &str = "a: rect \"A\" at 0,0
+";
+    const REFUSED: &str = "look \"//server/x.look\"
+a: rect \"A\" at 0,0
+";
+    const BROKEN: &str = "a: nosuchkind \"A\" at 0,0
+";
+
+    fn view_in(parent: &TestWindow) -> ImageView {
+        let graphics = Rc::new(Graphics::load().unwrap());
+        let view = ImageView::create(
+            parent.0,
+            graphics,
+            preview_colors(Theme::Light, false),
+            false,
+        )
+        .unwrap();
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::MoveWindow(view.hwnd, 0, 0, 400, 300, 0);
+        }
+        view
+    }
+
+    fn pump_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut msg = MSG::default();
+            while unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
+                unsafe {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            if done() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn settle(view: &ImageView, decodes: u32) {
+        pump_until("a decode", || {
+            let stats = view.stats();
+            stats.decodes >= decodes && stats.phase != Phase::Loading
+        });
+    }
+
+    /// The part of the picture the view shows, in zoomed pixels.
+    fn visible(view: &ImageView) -> decode::TileArea {
+        view.with(|state| {
+            decode::tile_area(
+                shown_size(state).unwrap(),
+                state.offset,
+                client_size(state.hwnd),
+                0.0,
+                state.max_side,
+            )
+            .unwrap()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_deep_zoom_renders_the_view_sharp_from_a_whole_picture_within_the_budget() {
+        // Break caught: 800% rasterizing the whole 1044×752 picture (50 MP, 0.7 s a step in a
+        // release build), or panning there leaving the uncovered part blurred.
+        let parent = TestWindow::new(400, 300);
+        let view = view_in(&parent);
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="1044" height="752">
+            <rect x="10" y="10" width="1024" height="732" fill="#48c" stroke="#000"/></svg>"##;
+        view.show_svg(svg.into(), "big.svg", true);
+        settle(&view, 1);
+        while view.stats().scale < 8.0 {
+            view.zoom_in();
+        }
+        pump_until("a sharp tile at 800%", || {
+            view.stats().tile.is_some_and(|(scale, _)| scale == 8.0)
+        });
+        let stats = view.stats();
+        let (width, height) = stats.whole.unwrap();
+        assert!(u64::from(width) * u64::from(height) <= decode::WHOLE_PIXEL_BUDGET);
+        assert!(width > 1044, "the whole picture renders past 100%: {width}");
+        let (_, area) = stats.tile.unwrap();
+        assert!(area.contains(&visible(&view)), "{area:?}");
+        assert!(u64::from(area.width) * u64::from(area.height) < 2_000_000);
+        // Panning past the tile's margin renders the newly shown part sharp.
+        for _ in 0..30 {
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
+                    view.hwnd,
+                    WM_KEYDOWN,
+                    VK_RIGHT as usize,
+                    0,
+                )
+            };
+        }
+        pump_until("a tile after the pan", || {
+            view.stats()
+                .tile
+                .is_some_and(|(_, area)| area.contains(&visible(&view)))
+        });
+        assert_eq!(
+            view.stats().whole,
+            Some((width, height)),
+            "a pan re-rendered the whole"
+        );
+        assert_eq!(view.stats().decodes, 1, "zoom and pan parsed the SVG again");
+        // Back at 100%, the whole picture is sharp on its own.
+        view.zoom_reset();
+        while view.stats().scale > 1.0 {
+            view.zoom_out();
+        }
+        while view.stats().scale < 1.0 {
+            view.zoom_in();
+        }
+        pump_until("the whole picture at 100%", || {
+            let stats = view.stats();
+            stats.whole == Some((1044, 752)) && stats.tile.is_none()
+        });
+    }
+
+    #[test]
+    fn a_diagram_with_a_refused_look_shows_with_a_band() {
+        // Break caught: the refusal blanking the drawing, or going unreported.
+        let parent = TestWindow::new(400, 300);
+        let view = view_in(&parent);
+        view.show_fastdraw(REFUSED.into(), None, "d.fdraw", true);
+        settle(&view, 1);
+        let stats = view.stats();
+        assert_eq!(stats.phase, Phase::Ready);
+        assert!(stats.svg_error);
+        assert!(
+            stats
+                .band
+                .unwrap()
+                .starts_with("Line 1: FastPad reads look files")
+        );
+        view.show_fastdraw(GOOD.into(), None, "d.fdraw", false);
+        settle(&view, 2);
+        let stats = view.stats();
+        assert!(!stats.svg_error && stats.band.is_none());
+    }
+
+    #[test]
+    fn a_broken_edit_keeps_the_last_drawing_under_a_band() {
+        // Break caught: typing through a half-written line blanking the view.
+        let parent = TestWindow::new(400, 300);
+        let view = view_in(&parent);
+        view.show_fastdraw(GOOD.into(), None, "d.fdraw", true);
+        settle(&view, 1);
+        let size = view.status().size;
+        assert!(size.is_some());
+        view.show_fastdraw(BROKEN.into(), None, "d.fdraw", false);
+        settle(&view, 2);
+        let stats = view.stats();
+        assert_eq!(stats.phase, Phase::Ready);
+        assert!(stats.band.unwrap().starts_with("Line 1: "));
+        assert_eq!(view.status().size, size);
+    }
+
+    #[test]
+    fn a_broken_first_diagram_shows_the_failed_state() {
+        // Break caught: a new document with an error showing another document's picture or nothing.
+        let parent = TestWindow::new(400, 300);
+        let view = view_in(&parent);
+        view.show_fastdraw(GOOD.into(), None, "d.fdraw", true);
+        settle(&view, 1);
+        view.show_fastdraw(BROKEN.into(), None, "e.fdraw", true);
+        settle(&view, 2);
+        let stats = view.stats();
+        assert_eq!(stats.phase, Phase::Failed);
+        assert!(!stats.svg_error && stats.band.is_none());
     }
 }

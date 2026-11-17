@@ -24,6 +24,7 @@ const CHECKER_CELL: f32 = 8.0;
 const TEXT_SIZE: f32 = 15.0;
 const LINE_HEIGHT: f32 = 24.0;
 const SVG_BAR_HEIGHT: f32 = 28.0;
+pub(super) const SVG_BAND_TEXT: &str = "Can't render this SVG";
 
 const BITMAP_PROPERTIES: D2D1_BITMAP_PROPERTIES = D2D1_BITMAP_PROPERTIES {
     pixelFormat: D2D1_PIXEL_FORMAT {
@@ -135,6 +136,49 @@ fn ensure_checker(state: &mut ViewState, target: &ID2D1RenderTarget) -> windows:
     Ok(())
 }
 
+/// Draws the sharp tile of a deeply zoomed vector picture over its enlarged whole picture, placed
+/// by the zoom it was rendered at (a tile from the previous zoom stands in until the next lands).
+fn draw_tile(
+    state: &mut ViewState,
+    target: &ID2D1RenderTarget,
+    dest: RectF,
+) -> windows::core::Result<()> {
+    let Some(tile) = &state.tile else {
+        return Ok(());
+    };
+    let ratio = state.scale / tile.scale;
+    let area = tile.area;
+    let tile_dest = RectF::new(
+        dest.left + area.x as f32 * ratio,
+        dest.top + area.y as f32 * ratio,
+        dest.left + (area.x + area.width) as f32 * ratio,
+        dest.top + (area.y + area.height) as f32 * ratio,
+    );
+    if state.tile_bitmap.is_none() {
+        state.tile_bitmap = Some(unsafe {
+            target.CreateBitmap(
+                D2D_SIZE_U {
+                    width: area.width,
+                    height: area.height,
+                },
+                Some(tile.pixels.as_ptr().cast()),
+                area.width * 4,
+                &BITMAP_PROPERTIES,
+            )?
+        });
+    }
+    // At its own zoom the tile is drawn pixel for pixel; a fractional offset must not blur it.
+    let mode = if tile_dest.width() > area.width as f32 - 0.5 {
+        D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+    } else {
+        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
+    };
+    if let Some(bitmap) = &state.tile_bitmap {
+        unsafe { target.DrawBitmap(bitmap, Some(&tile_dest.to_d2d()), 1.0, mode, None) };
+    }
+    Ok(())
+}
+
 pub(super) fn paint(state: &mut ViewState) -> windows::core::Result<()> {
     let hwnd = state.hwnd;
     let (width, height) = client_size(hwnd);
@@ -149,6 +193,7 @@ pub(super) fn paint(state: &mut ViewState) -> windows::core::Result<()> {
         .map_err(com_error)?;
         state.max_side = unsafe { target.GetMaximumBitmapSize() }.clamp(1, DEFAULT_MAX_SIDE);
         state.bitmap = None;
+        state.tile_bitmap = None;
         state.checker = None;
         state.target = Some(target);
     }
@@ -172,7 +217,13 @@ pub(super) fn paint(state: &mut ViewState) -> windows::core::Result<()> {
         );
         let (bitmap_width, bitmap_height, pixels_ptr) =
             (image.width, image.height, image.pixels.as_ptr());
-        if !state.high_contrast
+        let paper = image.diagram.as_ref().map(|facts| facts.paper);
+        if let Some(paper) = paper
+            && let Some(visible) = dest.intersect(&client)
+        {
+            // A diagram sits on its look's paper, which shows where the drawing is transparent.
+            fill(&target, visible, paper)?;
+        } else if !state.high_contrast
             && let Some(visible) = dest.intersect(&client)
         {
             ensure_checker(state, &target)?;
@@ -201,6 +252,7 @@ pub(super) fn paint(state: &mut ViewState) -> windows::core::Result<()> {
         if let Some(bitmap) = &state.bitmap {
             unsafe { target.DrawBitmap(bitmap, Some(&dest.to_d2d()), 1.0, mode, None) };
         }
+        draw_tile(state, &target, dest)?;
     }
     let line = LINE_HEIGHT * scale;
     let middle = height / 2.0;
@@ -216,7 +268,7 @@ pub(super) fn paint(state: &mut ViewState) -> windows::core::Result<()> {
         };
         draw_text(
             &target,
-            "FastPad can't display this image",
+            error.title(),
             title,
             RectF::new(0.0, middle - line, width, middle),
             state.colors.text,
@@ -251,7 +303,7 @@ pub(super) fn paint(state: &mut ViewState) -> windows::core::Result<()> {
         if let Some(body) = &state.body_format {
             draw_text(
                 &target,
-                "Can't render this SVG",
+                state.band.as_deref().unwrap_or(SVG_BAND_TEXT),
                 body,
                 band,
                 state.colors.text,

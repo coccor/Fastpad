@@ -275,6 +275,33 @@ your session.
 PNG, JPEG, GIF, WebP and more open in an image tab you can zoom and pan. SVGs open as text, with
 their rendered preview beside the source. The notebook lists images next to your notes.
 
+## FastDraw diagrams
+
+A `.fdraw` file is a diagram written as text. It opens as the **FastDraw** language with the same
+Source / Split / Preview control as Markdown.
+
+- **Opens drawn:** a tab with a file and text opens in Preview, an empty or untitled one in Source, and
+  FastPad remembers the choice you make for that tab.
+- **Preview like an SVG:** fit to the window, zoom with `Ctrl`+wheel, `+`, `-` and `0` or a double-click,
+  and drag to pan. The background is the diagram's own paper colour.
+- **Split redraws as you type.** A mistake keeps the last good drawing and puts a band at the top, such
+  as "Line 3: ...", with the first error found.
+- **Dark themes:** on a dark FastPad theme a diagram draws in its look's dark counterpart (night, for the
+  built-in look).
+- **Look files** are read only by a relative path. A network (`//server`, `\\server`), absolute or drive
+  path is refused, and the diagram draws in the built-in look with an error band. A look file whose
+  `dark` line names such a path draws light in the dark theme, with the same band.
+- **In your notes:** `![alt](diagram.fdraw)` and `<img src="diagram.fdraw">` draw the diagram in Preview
+  and Live. It redraws when the diagram or its look file changes and when you switch between dark and
+  light; a broken diagram shows as a broken image.
+- **Open in FastDraw** (*FastDraw: Open in FastDraw* in the command palette, the tab's right-click menu,
+  and the toolbar button left of the view control) opens the diagram in the editor at
+  [fastdraw.dev](https://fastdraw.dev/edit/) in your browser. The diagram travels after the `#` of the
+  link, so no server receives it. A diagram whose link is over 32,000 characters is too large to open by
+  link.
+- Drawing is local and offline, in Rust (the [fastdraw](https://github.com/coccor/fastdraw) renderer),
+  and nothing is fetched. `.fdraw` files over 1 MB are not read.
+
 ## A command palette for everything
 
 <img src="images/command-palette.png" alt="The command palette filtering theme commands" width="800">

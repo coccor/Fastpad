@@ -465,7 +465,12 @@ fn append_popup(root: HMENU, label: &str, popup: HMENU) -> Result<()> {
 
 /// The context menu of a tab, at client coordinates `x`, `y` (split editors plan amendment 12).
 pub(crate) fn show_tab_menu(hwnd: HWND, x: i32, y: i32) -> Option<CommandId> {
-    let entries = [
+    track_popup(hwnd, &tab_menu_entries(hwnd), POINT { x, y })
+}
+
+/// The tab menu's entries: Open in FastDraw is added for a FastDraw tab.
+fn tab_menu_entries(hwnd: HWND) -> Vec<MenuEntry> {
+    let mut entries = vec![
         MenuEntry::command("&Close tab", CommandId::CloseTab),
         MenuEntry::command("Close a&ll tabs", CommandId::CloseAllTabs),
         MenuEntry::Separator,
@@ -473,7 +478,13 @@ pub(crate) fn show_tab_menu(hwnd: HWND, x: i32, y: i32) -> Option<CommandId> {
         MenuEntry::command("Split &down", CommandId::SplitDown),
         MenuEntry::command("Move to &next group", CommandId::MoveTabToNextGroup),
     ];
-    track_popup(hwnd, &entries, POINT { x, y })
+    if crate::window::preview_host::active_is_fastdraw(hwnd) {
+        entries.extend([
+            MenuEntry::Separator,
+            MenuEntry::command("Open in &FastDraw", CommandId::OpenInFastDraw),
+        ]);
+    }
+    entries
 }
 
 /// The context menu of the empty tab-strip space, at client coordinates `x`, `y`.

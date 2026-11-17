@@ -57,6 +57,8 @@ windows-sys = { version = "=0.61.2", features = [
 # Mermaid diagrams in the preview: parsed, laid out and written as SVG in Rust, which resvg draws.
 mermaid-rs-renderer = { version = "=0.3.1", default-features = false }
 resvg = { version = "=0.48.1", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
+# FastDraw (.fdraw) diagrams: drawn to SVG in Rust, which resvg draws. Not on crates.io; pinned by commit.
+fastdraw-render = { git = "https://github.com/coccor/fastdraw", rev = "f0d3905" }
 
 [features]
 # Portable-package builds resolve Scintilla.dll only beside FastPad.exe.

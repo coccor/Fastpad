@@ -298,7 +298,18 @@ pub(crate) fn group_mode(hwnd: HWND, id: GroupId) -> ViewMode {
     let Some((document, language, _)) = group_document(hwnd, id) else {
         return ViewMode::Source;
     };
-    let chosen = with_group_host(hwnd, id, |host| host.modes.get(&document).copied()).flatten();
+    let mut chosen = with_group_host(hwnd, id, |host| host.modes.get(&document).copied()).flatten();
+    if chosen.is_none() && language == Language::FastDraw {
+        // Decided once, at the tab's first evaluation, and remembered: typing, saving or emptying
+        // the file never moves the tab between Source and Preview afterwards.
+        let first = if fastdraw_opens_in_preview(hwnd, id, document) {
+            ViewMode::Preview
+        } else {
+            ViewMode::Source
+        };
+        with_group_host(hwnd, id, |host| host.modes.insert(document, first));
+        chosen = Some(first);
+    }
     let default = match language {
         Language::Markdown => unsafe { host_window::app_ptr(hwnd) }.map_or(
             ViewMode::Source,
@@ -315,6 +326,21 @@ pub(crate) fn group_mode(hwnd: HWND, id: GroupId) -> ViewMode {
     }
 }
 
+/// Whether the FastDraw tab `document` in group `id` has a file and some text.
+fn fastdraw_opens_in_preview(hwnd: HWND, id: GroupId, document: DocumentId) -> bool {
+    let has_path = unsafe { host_window::app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .tabs
+            .document(document)
+            .is_some_and(|document| document.path.is_some())
+    });
+    has_path
+        && host_window::group_editor(hwnd, id)
+            .and_then(|editor| editor.length().ok())
+            .unwrap_or(0)
+            > 0
+}
+
 /// Whether group `id`'s active tab, in `language`, can show `mode`.
 fn available(hwnd: HWND, id: GroupId, language: Language, mode: ViewMode) -> bool {
     match language {
@@ -325,7 +351,7 @@ fn available(hwnd: HWND, id: GroupId, language: Language, mode: ViewMode) -> boo
                     .unwrap_or(0)
                     <= crate::live::LIVE_MAX_BYTES
         }
-        Language::Svg => mode != ViewMode::Live,
+        Language::Svg | Language::FastDraw => mode != ViewMode::Live,
         _ => mode == ViewMode::Source,
     }
 }
@@ -478,12 +504,23 @@ pub(crate) fn group_document(
 }
 
 pub(crate) fn buttons_visible(hwnd: HWND) -> bool {
-    active_document(hwnd)
-        .is_some_and(|(_, language, _)| matches!(language, Language::Markdown | Language::Svg))
+    active_document(hwnd).is_some_and(|(_, language, _)| {
+        matches!(
+            language,
+            Language::Markdown | Language::Svg | Language::FastDraw
+        )
+    })
 }
 
+/// Whether the active tab is shown in the SVG view: an SVG or a FastDraw diagram.
 fn active_is_svg(hwnd: HWND) -> bool {
-    active_document(hwnd).is_some_and(|(_, language, _)| language == Language::Svg)
+    active_document(hwnd)
+        .is_some_and(|(_, language, _)| matches!(language, Language::Svg | Language::FastDraw))
+}
+
+/// Whether the active tab is a FastDraw diagram.
+pub(crate) fn active_is_fastdraw(hwnd: HWND) -> bool {
+    active_document(hwnd).is_some_and(|(_, language, _)| language == Language::FastDraw)
 }
 
 fn svg_view(hwnd: HWND) -> Option<ImageView> {
@@ -540,8 +577,16 @@ fn load_svg(hwnd: HWND) {
     let name = unsafe { host_window::app_ptr(hwnd) }
         .and_then(|app| Some(unsafe { app.as_ref() }.tabs.document(id)?.title()))
         .unwrap_or_default();
-    if let Ok(text) = editor.text() {
-        view.show_svg(std::sync::Arc::from(text), &name, previous != Some(id));
+    let Ok(text) = editor.text() else {
+        return;
+    };
+    let text: std::sync::Arc<str> = std::sync::Arc::from(text);
+    if active_is_fastdraw(hwnd) {
+        let file = unsafe { host_window::app_ptr(hwnd) }
+            .and_then(|app| unsafe { app.as_ref() }.tabs.document(id)?.path.clone());
+        view.show_fastdraw(text, file, &name, previous != Some(id));
+    } else {
+        view.show_svg(text, &name, previous != Some(id));
     }
 }
 
@@ -624,7 +669,7 @@ pub(crate) fn set_mode(hwnd: HWND, next: ViewMode) {
             );
             return;
         }
-        (_, Language::Markdown | Language::Svg) => {}
+        (_, Language::Markdown | Language::Svg | Language::FastDraw) => {}
         _ => {
             host_window::push_notice(hwnd, NOT_MARKDOWN_NOTICE.to_owned());
             return;
@@ -1371,6 +1416,74 @@ pub(crate) fn shell_open(hwnd: HWND, url: &str) -> bool {
     result as isize > 32
 }
 
+/// An editor link longer than this is not opened: ShellExecute passes it on a command line, which
+/// holds at most 32,767 characters.
+const MAX_EDITOR_LINK_CHARS: usize = 32_000;
+
+/// Opens the active FastDraw tab in the editor at fastdraw.dev, the diagram and the look file it
+/// reads travelling in the link. Does nothing on any other tab.
+pub(crate) fn open_in_fastdraw(hwnd: HWND) {
+    if !active_is_fastdraw(hwnd) {
+        return;
+    }
+    let (Some(editor), Some((id, ..))) = (editor(hwnd), active_document(hwnd)) else {
+        return;
+    };
+    let Ok(text) = editor.text() else {
+        return;
+    };
+    let shown = unsafe { host_window::app_ptr(hwnd) }.and_then(|app| {
+        let document = unsafe { app.as_ref() }.tabs.document(id)?;
+        let name = document
+            .path
+            .as_deref()
+            .and_then(|path| path.file_name())
+            .map_or_else(
+                || "diagram.fdraw".to_owned(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+        Some((name, document.path.clone()))
+    });
+    let Some((name, path)) = shown else {
+        return;
+    };
+    // The look file as `render` reads it, without drawing the diagram on the UI thread.
+    let look = path
+        .as_deref()
+        .and_then(|path| crate::preview::fastdraw::read_look(&text, path));
+    let link = fastdraw_render::editor_link(&name, &text, look.as_ref());
+    if link.encode_utf16().count() > MAX_EDITOR_LINK_CHARS {
+        host_window::push_notice(
+            hwnd,
+            "This diagram is too large to open by link.".to_owned(),
+        );
+    } else if !open_link(hwnd, &link) {
+        host_window::push_notice(hwnd, "FastPad could not open fastdraw.dev.".to_owned());
+    }
+}
+
+#[cfg(not(test))]
+fn open_link(hwnd: HWND, url: &str) -> bool {
+    shell_open(hwnd, url)
+}
+
+#[cfg(test)]
+fn open_link(_hwnd: HWND, url: &str) -> bool {
+    OPENED.with(|opened| opened.borrow_mut().push(url.to_owned()));
+    true
+}
+
+#[cfg(test)]
+thread_local! {
+    static OPENED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The URLs `open_in_fastdraw` opened on this thread. Tests never start a browser.
+#[cfg(test)]
+pub(crate) fn take_opened() -> Vec<String> {
+    OPENED.with(|opened| std::mem::take(&mut *opened.borrow_mut()))
+}
+
 /// `WM_FASTPAD_PREVIEW_HOVER`: the link under the pointer in group `id`'s preview changed.
 pub(crate) fn hover_link(hwnd: HWND, id: GroupId, lparam: LPARAM) {
     if lparam == 0 {
@@ -1467,8 +1580,11 @@ pub(crate) fn diagnostic(hwnd: HWND, selector: usize) -> isize {
 /// Lays out group `id`'s content area: its editor and its preview beside or over it.
 pub(crate) fn layout(hwnd: HWND, id: GroupId, area: RECT, dpi: u32) -> ContentRects {
     let language = group_document(hwnd, id).map(|(_, language, _)| language);
-    let previewable = matches!(language, Some(Language::Markdown | Language::Svg));
-    let svg = language == Some(Language::Svg);
+    let previewable = matches!(
+        language,
+        Some(Language::Markdown | Language::Svg | Language::FastDraw)
+    );
+    let svg = matches!(language, Some(Language::Svg | Language::FastDraw));
     let mode = group_mode(hwnd, id);
     let (ratio, slot) = with_group_host(hwnd, id, |host| {
         let slot = if svg {
