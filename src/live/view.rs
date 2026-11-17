@@ -271,7 +271,11 @@ impl LiveView {
             #[cfg(test)]
             painted: PaintedDecorations::default(),
             pictures: Pictures {
-                cache: ImageCache::new(hwnd, crate::window::WM_FASTPAD_LIVE_IMAGE),
+                cache: {
+                    let mut cache = ImageCache::new(hwnd, crate::window::WM_FASTPAD_LIVE_IMAGE);
+                    cache.set_dark(colors.diagram.is_dark());
+                    cache
+                },
                 folder: None,
                 diagram_style,
             },
@@ -355,6 +359,7 @@ impl LiveView {
             if state.pictures.diagram_style != style {
                 // Diagrams are drawn in the colours and font: their lines show the new ones.
                 state.pictures.diagram_style = style;
+                state.pictures.cache.set_dark(colors.diagram.is_dark());
                 state.layout.drop_image_lines();
             }
             let anchor = state.layout.anchor(state.scroll_y);

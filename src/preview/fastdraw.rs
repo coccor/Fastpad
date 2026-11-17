@@ -4,8 +4,10 @@
 
 use crate::preview::images::DecodedImage;
 use fastdraw_render::{Level, Source};
+use std::io::Read;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// What FastPad shows when the renderer panics.
 const PANIC_TEXT: &str = "FastDraw could not draw this diagram";
@@ -109,6 +111,79 @@ pub fn rasterize(drawn: &Drawn, max_width: u32, scale: f32) -> Result<DecodedIma
         natural_height,
         pixels,
     })
+}
+
+/// `.fdraw` files over this size are not read.
+pub const MAX_FDRAW_BYTES: u64 = 1 << 20;
+
+/// What a drawing was made from, to tell when the files have changed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stamp {
+    diagram: Option<SystemTime>,
+    look: Option<(PathBuf, Option<SystemTime>)>,
+}
+
+fn modified(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+impl Stamp {
+    /// True when the diagram at `path` and its look file are as they were (both are stat-ed again).
+    pub fn current(&self, path: &Path) -> bool {
+        self.diagram == modified(path)
+            && self
+                .look
+                .as_ref()
+                .is_none_or(|(look, time)| *time == modified(look))
+    }
+}
+
+/// Draws the `.fdraw` file at `path` as a bitmap no wider than `max_width` (0 = no limit), with
+/// the stamp it was made from.
+pub fn decode_file(
+    path: &Path,
+    dark: bool,
+    max_width: u32,
+) -> Result<(DecodedImage, Stamp), String> {
+    let (result, stamp) = decode_stamped(path, dark, max_width);
+    result.map(|image| (image, stamp))
+}
+
+/// `decode_file`, with the stamp also when the drawing failed, so a fix to the file is noticed.
+pub fn decode_stamped(
+    path: &Path,
+    dark: bool,
+    max_width: u32,
+) -> (Result<DecodedImage, String>, Stamp) {
+    let mut stamp = Stamp {
+        diagram: modified(path),
+        look: None,
+    };
+    let result = read_text(path).and_then(|text| {
+        let drawn = draw(&text, Some(path), dark);
+        if let Some(look) = &drawn.look {
+            let file = path.parent().unwrap_or(Path::new("")).join(&look.path);
+            let time = modified(&file);
+            stamp.look = Some((file, time));
+        }
+        if !drawn.show {
+            return Err(band_text(&drawn.errors).unwrap_or_else(|| PANIC_TEXT.to_owned()));
+        }
+        rasterize(&drawn, max_width, 1.0)
+    });
+    (result, stamp)
+}
+
+fn read_text(path: &Path) -> Result<String, String> {
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut bytes = Vec::new();
+    file.take(MAX_FDRAW_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_FDRAW_BYTES {
+        return Err("this diagram is larger than 1 MB".to_owned());
+    }
+    String::from_utf8(bytes).map_err(|_| "this diagram is not valid UTF-8 text".to_owned())
 }
 
 #[cfg(test)]

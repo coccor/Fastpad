@@ -4,6 +4,7 @@
 //! loss. The same worker renders Mermaid diagrams (`preview::mermaid`), keyed by their source.
 
 use crate::preview::dwrite::hresult_error;
+use crate::preview::fastdraw::{self, Stamp};
 use crate::preview::mermaid::{self, DiagramKey};
 use crate::{FastPadError, Result};
 use std::collections::{HashMap, VecDeque};
@@ -167,6 +168,14 @@ struct Entry {
     scale: f32,
     /// When a diagram was last requested or drawn, for evicting the oldest.
     used: u64,
+    /// What a `.fdraw` was drawn from, to notice when its files change.
+    stamp: Option<Stamp>,
+}
+
+/// Whether `path` is a FastDraw diagram.
+fn is_fdraw(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("fdraw"))
 }
 
 /// A diagram's state, for layout.
@@ -181,11 +190,19 @@ pub enum DiagramState<'a> {
 }
 
 enum Job {
-    File(PathBuf),
+    /// A file, and whether `.fdraw` files are drawn in the dark look.
+    File(PathBuf, bool),
     Diagram(DiagramKey, f32),
 }
 
 /// Whether a decode limited to `requested` pixels already satisfies a limit of `max_width`.
+fn job_path(job: &Job) -> &Path {
+    match job {
+        Job::File(path, _) => path,
+        Job::Diagram(..) => Path::new(""),
+    }
+}
+
 fn covers(requested: u32, max_width: u32) -> bool {
     requested == 0 || (max_width != 0 && requested >= max_width)
 }
@@ -216,6 +233,7 @@ impl Entry {
             requested,
             scale,
             used,
+            stamp: None,
         }
     }
 
@@ -248,6 +266,21 @@ impl Entry {
         self.bitmap.clone()
     }
 
+    /// Takes a finished `.fdraw` drawing: the file may have changed, so the newest result wins,
+    /// failed or not.
+    fn finish_fdraw(
+        &mut self,
+        result: std::result::Result<DecodedImage, String>,
+        stamp: Option<Stamp>,
+    ) {
+        self.state = match result {
+            Ok(image) => EntryState::Ready(image),
+            Err(error) => EntryState::Failed(error),
+        };
+        self.bitmap = None;
+        self.stamp = stamp;
+    }
+
     /// Takes a finished decode. A result no larger than the image already shown is dropped, and a
     /// failed re-decode keeps the smaller image that already works.
     fn finish(&mut self, result: std::result::Result<DecodedImage, String>) {
@@ -263,16 +296,24 @@ impl Entry {
     }
 }
 
+type Done = (
+    Job,
+    std::result::Result<DecodedImage, String>,
+    Option<Stamp>,
+);
+
 #[derive(Default)]
 struct Shared {
     queue: VecDeque<(Job, u32)>,
-    done: Vec<(Job, std::result::Result<DecodedImage, String>)>,
+    done: Vec<Done>,
     worker_running: bool,
 }
 
 pub struct ImageCache {
     entries: HashMap<PathBuf, Entry>,
     diagrams: HashMap<DiagramKey, Entry>,
+    /// Whether `.fdraw` files are drawn in the dark look.
+    dark: bool,
     /// Advances on every diagram request and draw.
     clock: u64,
     shared: Arc<Mutex<Shared>>,
@@ -286,6 +327,7 @@ impl ImageCache {
         Self {
             entries: HashMap::new(),
             diagrams: HashMap::new(),
+            dark: false,
             clock: 0,
             shared: Arc::new(Mutex::new(Shared::default())),
             notify: notify as isize,
@@ -297,7 +339,11 @@ impl ImageCache {
     /// requests are free unless the image must be decoded larger than before.
     pub fn request(&mut self, path: &Path, max_width: u32) {
         if let Some(entry) = self.entries.get_mut(path) {
-            if !entry.wants(max_width) {
+            let changed = entry
+                .stamp
+                .as_ref()
+                .is_some_and(|stamp| !stamp.current(path));
+            if !changed && !entry.wants(max_width) {
                 return;
             }
             // Keep a ready image (and its size) on screen while the sharper decode runs.
@@ -315,7 +361,15 @@ impl ImageCache {
                 return;
             }
         }
-        self.queue(Job::File(path.to_owned()), max_width);
+        self.queue(Job::File(path.to_owned(), self.dark), max_width);
+    }
+
+    /// Sets the look `.fdraw` files are drawn in. A change drops them, so they are drawn again.
+    pub fn set_dark(&mut self, dark: bool) {
+        if self.dark != dark {
+            self.dark = dark;
+            self.entries.retain(|path, _| !is_fdraw(path));
+        }
     }
 
     /// Queues a render of `key` at `scale` device pixels per DIP, at most `max_width` pixels wide
@@ -384,17 +438,22 @@ impl ImageCache {
                     let Some((job, max_width)) = job else {
                         return;
                     };
-                    let result = match &job {
-                        Job::File(path) => {
-                            decode_image(path, max_width).map_err(|error| error.to_string())
+                    let (result, stamp) = match &job {
+                        Job::File(path, dark) if is_fdraw(path) => {
+                            let (result, stamp) = fastdraw::decode_stamped(path, *dark, max_width);
+                            (result, Some(stamp))
                         }
-                        Job::Diagram(key, scale) => mermaid::render(key, max_width, *scale),
+                        Job::File(path, _) => (
+                            decode_image(path, max_width).map_err(|error| error.to_string()),
+                            None,
+                        ),
+                        Job::Diagram(key, scale) => (mermaid::render(key, max_width, *scale), None),
                     };
                     shared
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
                         .done
-                        .push((job, result));
+                        .push((job, result, stamp));
                     unsafe { PostMessageW(notify as HWND, message, 0, 0) };
                 }
             });
@@ -411,13 +470,19 @@ impl ImageCache {
                 .done,
         );
         let changed = !done.is_empty();
-        for (job, result) in done {
+        for (job, result, stamp) in done {
             let entry = match &job {
-                Job::File(path) => self.entries.get_mut(path),
+                // A drawing made in the look the view has since left is stale.
+                Job::File(_, dark) if is_fdraw(job_path(&job)) && *dark != self.dark => None,
+                Job::File(path, _) => self.entries.get_mut(path),
                 Job::Diagram(key, _) => self.diagrams.get_mut(key),
             };
             if let Some(entry) = entry {
-                entry.finish(result);
+                if stamp.is_some() {
+                    entry.finish_fdraw(result, stamp);
+                } else {
+                    entry.finish(result);
+                }
             }
         }
         changed
@@ -638,5 +703,149 @@ mod tests {
             cache.diagram(keys.last().unwrap()),
             DiagramState::Ready(..)
         ));
+    }
+
+    fn fdraw_file(name: &str, text: &[u8]) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("fastpad-{name}-{}.fdraw", std::process::id()));
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    fn wait_for_settled(cache: &mut ImageCache, path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while cache.size(path).is_none()
+            && !cache.is_failed(path)
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            cache.drain();
+        }
+    }
+
+    fn wait_for_size(cache: &mut ImageCache, path: &Path, size: (u32, u32)) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while cache.size(path) != Some(size) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            cache.drain();
+        }
+        assert_eq!(cache.size(path), Some(size));
+    }
+
+    #[test]
+    fn a_fdraw_link_decodes_to_the_drawing() {
+        let text = "a: rect \"A\" at 0,0
+b: rect \"B\" at 300,0
+";
+        let path = fdraw_file("draws", text.as_bytes());
+        let mut cache = ImageCache::new(std::ptr::null_mut(), 0);
+        cache.request(&path, 0);
+        wait_for_settled(&mut cache, &path);
+        let (width, height) = cache.size(&path).expect("decoded");
+        let drawn = crate::preview::fastdraw::draw(text, Some(&path), false);
+        let expected = crate::preview::fastdraw::rasterize(&drawn, 0, 1.0).unwrap();
+        assert!(width.abs_diff(expected.natural_width) <= 1);
+        assert!(height.abs_diff(expected.natural_height) <= 1);
+        assert!(width > height);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_broken_fdraw_is_failed() {
+        let path = fdraw_file(
+            "broken",
+            b"a: nosuchkind \"A\" at 0,0
+",
+        );
+        let mut cache = ImageCache::new(std::ptr::null_mut(), 0);
+        cache.request(&path, 0);
+        wait_for_settled(&mut cache, &path);
+        assert!(cache.is_failed(&path));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_oversized_or_non_utf8_fdraw_is_failed() {
+        let mut big = b"a: rect \"A\" at 0,0
+"
+        .to_vec();
+        big.resize((1 << 20) + 1, b'\n');
+        let oversized = fdraw_file("oversized", &big);
+        let binary = fdraw_file("binary", &[0xff, 0xfe, 0x00]);
+        let mut cache = ImageCache::new(std::ptr::null_mut(), 0);
+        cache.request(&oversized, 0);
+        cache.request(&binary, 0);
+        wait_for_settled(&mut cache, &oversized);
+        wait_for_settled(&mut cache, &binary);
+        assert!(cache.is_failed(&oversized));
+        assert!(cache.is_failed(&binary));
+        let _ = std::fs::remove_file(oversized);
+        let _ = std::fs::remove_file(binary);
+    }
+
+    #[test]
+    fn changing_the_fdraw_decodes_it_again() {
+        let path = fdraw_file(
+            "changes",
+            b"a: rect \"A\" at 0,0
+",
+        );
+        let mut cache = ImageCache::new(std::ptr::null_mut(), 0);
+        cache.request(&path, 0);
+        wait_for_settled(&mut cache, &path);
+        let before = cache.size(&path).expect("decoded");
+        std::fs::write(
+            &path,
+            "a: rect \"A\" at 0,0
+b: rect \"B\" at 600,0
+"
+            .as_bytes(),
+        )
+        .unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        cache.request(&path, 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while cache.size(&path) == Some(before) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            cache.drain();
+        }
+        assert!(cache.size(&path).unwrap().0 > before.0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn switching_darkness_decodes_it_again() {
+        let path = fdraw_file(
+            "darkness",
+            b"a: rect \"A\" at 0,0
+",
+        );
+        let mut cache = ImageCache::new(std::ptr::null_mut(), 0);
+        cache.request(&path, 0);
+        wait_for_settled(&mut cache, &path);
+        let size = cache.size(&path).expect("decoded");
+        let light = match &cache.entries[&path].state {
+            EntryState::Ready(image) => image.pixels.clone(),
+            _ => unreachable!(),
+        };
+        cache.set_dark(true);
+        assert!(cache.size(&path).is_none() && !cache.is_failed(&path));
+        // Setting the same darkness again keeps what is drawn.
+        cache.request(&path, 0);
+        wait_for_size(&mut cache, &path, size);
+        cache.set_dark(true);
+        assert_eq!(cache.size(&path), Some(size));
+        let dark = match &cache.entries[&path].state {
+            EntryState::Ready(image) => image.pixels.clone(),
+            _ => unreachable!(),
+        };
+        assert_ne!(light, dark);
+        let _ = std::fs::remove_file(path);
     }
 }

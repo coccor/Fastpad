@@ -248,7 +248,11 @@ impl PreviewView {
             clicks: Clicks::default(),
             over_text: false,
             tracking_mouse: false,
-            images: ImageCache::new(hwnd, WM_FASTPAD_PREVIEW_IMAGE),
+            images: {
+                let mut images = ImageCache::new(hwnd, WM_FASTPAD_PREVIEW_IMAGE);
+                images.set_dark(colors.is_dark());
+                images
+            },
             centered: false,
             paused: false,
             live_resize: false,
@@ -342,6 +346,8 @@ impl PreviewView {
     pub fn set_appearance(&self, colors: PreviewColors, fonts: PreviewFonts, dark_scrollbar: bool) {
         self.with(|state| {
             state.colors = colors;
+            // `.fdraw` links are drawn in the look that suits the page.
+            state.images.set_dark(colors.is_dark());
             state.fonts = fonts;
             state.brushes = None;
             relayout(state);
