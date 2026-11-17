@@ -61,7 +61,7 @@ const SQL_PROPERTIES: &[(&str, &str)] = &[("fold.comment", "1")];
 const MARKUP_PROPERTIES: &[(&str, &str)] = &[("fold.html", "1"), ("fold.hypertext.comment", "1")];
 
 /// Plain text first, then alphabetical by name: this is the menu and palette order.
-pub(crate) static LANGUAGES: [LanguageSpec; 23] = [
+pub(crate) static LANGUAGES: [LanguageSpec; 24] = [
     LanguageSpec {
         language: Language::PlainText,
         name: "Plain text",
@@ -227,6 +227,16 @@ pub(crate) static LANGUAGES: [LanguageSpec; 23] = [
         keywords: &[],
         properties: &[],
         styles: props::styles,
+    },
+    LanguageSpec {
+        language: Language::FastDraw,
+        name: "FastDraw",
+        extensions: &["fdraw"],
+        file_names: &[],
+        lexer: None,
+        keywords: &[],
+        properties: &[],
+        styles: no_styles,
     },
     LanguageSpec {
         language: Language::Python,
@@ -400,6 +410,7 @@ mod tests {
             ("readme.md", Language::Markdown),
             ("notes.txt", Language::PlainText),
             (r"C:\x\Logo.SVG", Language::Svg),
+            (r"C:\x\Flow.FDRAW", Language::FastDraw),
             ("App.xaml", Language::Xml),
             ("build.CSPROJ", Language::Xml),
             ("index.htm", Language::Html),
@@ -458,6 +469,7 @@ mod tests {
         assert_eq!(default_extension(Language::Json), "json");
         assert_eq!(default_extension(Language::Yaml), "yaml");
         assert_eq!(default_extension(Language::Svg), "svg");
+        assert_eq!(default_extension(Language::FastDraw), "fdraw");
         assert_eq!(default_extension(Language::PlainText), "md");
     }
 

@@ -119,7 +119,9 @@ pub(crate) fn hwnd(main: HWND) -> Option<HWND> {
 pub(crate) fn segments_for(main: HWND, id: GroupId) -> &'static [ViewMode] {
     match crate::window::preview_host::group_document(main, id).map(|(_, language, _)| language) {
         Some(crate::document::Language::Markdown) => &ViewMode::ALL,
-        Some(crate::document::Language::Svg) => &ViewMode::SVG,
+        Some(crate::document::Language::Svg | crate::document::Language::FastDraw) => {
+            &ViewMode::SVG
+        }
         _ => &[],
     }
 }

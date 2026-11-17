@@ -75,7 +75,7 @@ impl Language {
                 block: None,
             },
             Self::Html | Self::Xml | Self::Svg | Self::Markdown => MARKUP,
-            Self::PlainText | Self::Json => CommentSyntax {
+            Self::PlainText | Self::Json | Self::FastDraw => CommentSyntax {
                 line: None,
                 block: None,
             },

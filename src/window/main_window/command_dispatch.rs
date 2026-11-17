@@ -482,6 +482,7 @@ fn run_command(hwnd: HWND, command: CommandId, recorded: Option<std::path::PathB
         | CommandId::LanguageRust
         | CommandId::LanguageSql
         | CommandId::LanguageSvg
+        | CommandId::LanguageFastDraw
         | CommandId::LanguageToml
         | CommandId::LanguageTypeScript
         | CommandId::LanguageXml

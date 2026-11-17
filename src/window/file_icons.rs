@@ -53,7 +53,7 @@ pub(crate) enum NoteKind {
 
 /// The listed extensions whose type is not their language's: `cfg` and `conf` are INI to the
 /// lexer but "config" in the tree, and text, logs, CSV and images have no language of their own.
-const FILE_KINDS: [(&str, NoteKind); 22] = [
+const FILE_KINDS: [(&str, NoteKind); 23] = [
     ("cfg", NoteKind::Config),
     ("conf", NoteKind::Config),
     ("csv", NoteKind::Csv),
@@ -76,6 +76,7 @@ const FILE_KINDS: [(&str, NoteKind); 22] = [
     ("heif", NoteKind::Image),
     ("avif", NoteKind::Image),
     ("svg", NoteKind::Image),
+    ("fdraw", NoteKind::Image),
 ];
 
 /// `path`'s type, from its extension (ignoring case) or else the language FastPad highlights it
@@ -100,7 +101,7 @@ const fn language_kind(language: Language) -> NoteKind {
         Language::Toml => NoteKind::Toml,
         Language::Ini => NoteKind::Ini,
         Language::Xml => NoteKind::Xml,
-        Language::Svg => NoteKind::Image,
+        Language::Svg | Language::FastDraw => NoteKind::Image,
         Language::Html => NoteKind::Html,
         Language::Css => NoteKind::Css,
         Language::JavaScript => NoteKind::JavaScript,

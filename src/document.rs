@@ -51,6 +51,7 @@ pub enum Language {
     Json,
     Markdown,
     Svg,
+    FastDraw,
     Xml,
     Html,
     Css,

@@ -304,6 +304,8 @@ pub(crate) fn group_mode(hwnd: HWND, id: GroupId) -> ViewMode {
             ViewMode::Source,
             |app| unsafe { app.as_ref() }.settings.markdown_view,
         ),
+        // A saved diagram with something drawn opens in its drawing; the rest start as text.
+        Language::FastDraw if fastdraw_opens_in_preview(hwnd, id, document) => ViewMode::Preview,
         _ => ViewMode::Source,
     };
     let mode = chosen.unwrap_or(default);
@@ -313,6 +315,21 @@ pub(crate) fn group_mode(hwnd: HWND, id: GroupId) -> ViewMode {
     } else {
         ViewMode::Source
     }
+}
+
+/// Whether the FastDraw tab `document` in group `id` has a file and some text.
+fn fastdraw_opens_in_preview(hwnd: HWND, id: GroupId, document: DocumentId) -> bool {
+    let has_path = unsafe { host_window::app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .tabs
+            .document(document)
+            .is_some_and(|document| document.path.is_some())
+    });
+    has_path
+        && host_window::group_editor(hwnd, id)
+            .and_then(|editor| editor.length().ok())
+            .unwrap_or(0)
+            > 0
 }
 
 /// Whether group `id`'s active tab, in `language`, can show `mode`.
@@ -325,7 +342,7 @@ fn available(hwnd: HWND, id: GroupId, language: Language, mode: ViewMode) -> boo
                     .unwrap_or(0)
                     <= crate::live::LIVE_MAX_BYTES
         }
-        Language::Svg => mode != ViewMode::Live,
+        Language::Svg | Language::FastDraw => mode != ViewMode::Live,
         _ => mode == ViewMode::Source,
     }
 }
@@ -478,12 +495,23 @@ pub(crate) fn group_document(
 }
 
 pub(crate) fn buttons_visible(hwnd: HWND) -> bool {
-    active_document(hwnd)
-        .is_some_and(|(_, language, _)| matches!(language, Language::Markdown | Language::Svg))
+    active_document(hwnd).is_some_and(|(_, language, _)| {
+        matches!(
+            language,
+            Language::Markdown | Language::Svg | Language::FastDraw
+        )
+    })
 }
 
+/// Whether the active tab is shown in the SVG view: an SVG or a FastDraw diagram.
 fn active_is_svg(hwnd: HWND) -> bool {
-    active_document(hwnd).is_some_and(|(_, language, _)| language == Language::Svg)
+    active_document(hwnd)
+        .is_some_and(|(_, language, _)| matches!(language, Language::Svg | Language::FastDraw))
+}
+
+/// Whether the active tab is a FastDraw diagram.
+pub(crate) fn active_is_fastdraw(hwnd: HWND) -> bool {
+    active_document(hwnd).is_some_and(|(_, language, _)| language == Language::FastDraw)
 }
 
 fn svg_view(hwnd: HWND) -> Option<ImageView> {
@@ -540,8 +568,16 @@ fn load_svg(hwnd: HWND) {
     let name = unsafe { host_window::app_ptr(hwnd) }
         .and_then(|app| Some(unsafe { app.as_ref() }.tabs.document(id)?.title()))
         .unwrap_or_default();
-    if let Ok(text) = editor.text() {
-        view.show_svg(std::sync::Arc::from(text), &name, previous != Some(id));
+    let Ok(text) = editor.text() else {
+        return;
+    };
+    let text: std::sync::Arc<str> = std::sync::Arc::from(text);
+    if active_is_fastdraw(hwnd) {
+        let file = unsafe { host_window::app_ptr(hwnd) }
+            .and_then(|app| unsafe { app.as_ref() }.tabs.document(id)?.path.clone());
+        view.show_fastdraw(text, file, &name, previous != Some(id));
+    } else {
+        view.show_svg(text, &name, previous != Some(id));
     }
 }
 
@@ -624,7 +660,7 @@ pub(crate) fn set_mode(hwnd: HWND, next: ViewMode) {
             );
             return;
         }
-        (_, Language::Markdown | Language::Svg) => {}
+        (_, Language::Markdown | Language::Svg | Language::FastDraw) => {}
         _ => {
             host_window::push_notice(hwnd, NOT_MARKDOWN_NOTICE.to_owned());
             return;
@@ -1467,8 +1503,11 @@ pub(crate) fn diagnostic(hwnd: HWND, selector: usize) -> isize {
 /// Lays out group `id`'s content area: its editor and its preview beside or over it.
 pub(crate) fn layout(hwnd: HWND, id: GroupId, area: RECT, dpi: u32) -> ContentRects {
     let language = group_document(hwnd, id).map(|(_, language, _)| language);
-    let previewable = matches!(language, Some(Language::Markdown | Language::Svg));
-    let svg = language == Some(Language::Svg);
+    let previewable = matches!(
+        language,
+        Some(Language::Markdown | Language::Svg | Language::FastDraw)
+    );
+    let svg = matches!(language, Some(Language::Svg | Language::FastDraw));
     let mode = group_mode(hwnd, id);
     let (ratio, slot) = with_group_host(hwnd, id, |host| {
         let slot = if svg {
