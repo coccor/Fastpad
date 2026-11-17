@@ -2656,7 +2656,10 @@ fn a_table_draws_its_grid_and_lines_up_columns() {
     full_frame(view);
     let painted = view.painted_decorations();
     assert!(painted.lines >= 9, "{painted:?}");
-    assert_eq!(painted.fills, 1, "the header's fill");
+    assert_eq!(
+        painted.fills, 0,
+        "no fill behind the header, as the preview draws it"
+    );
     let (b, _) = view.client_point_of(text.find("bbbbbb").unwrap()).unwrap();
     let (d, _) = view.client_point_of(text.find("| d").unwrap() + 2).unwrap();
     assert!((b - d).abs() <= 1, "second column at {b} and {d}");
