@@ -36,10 +36,9 @@ use std::rc::Rc;
 use windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush;
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_STYLE_ITALIC, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT,
-    DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_HIT_TEST_METRICS,
-    DWRITE_LINE_METRICS, DWRITE_LINE_SPACING_METHOD_UNIFORM, DWRITE_TEXT_ALIGNMENT_TRAILING,
-    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP, IDWriteTextFormat,
-    IDWriteTextLayout,
+    DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_HIT_TEST_METRICS, DWRITE_LINE_METRICS,
+    DWRITE_LINE_SPACING_METHOD_UNIFORM, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS,
+    DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP, IDWriteTextFormat, IDWriteTextLayout,
 };
 use windows::core::{BOOL, PCWSTR};
 
@@ -727,9 +726,16 @@ impl LiveLayout {
             style.clone()
         };
         let em = self.fonts.size;
-        let (indent, starts) = self.indents(&shown.block.containers);
+        let (outer, starts) = self.indents(&shown.block.containers);
+        // A code block's text is padded inside its background, as the preview pads it.
+        let code_pad = if matches!(shown.block.body, BodyStyle::Code { .. }) {
+            em
+        } else {
+            0.0
+        };
+        let indent = outer + code_pad;
         // A deep nest still leaves a few words a row.
-        let text_width = self.text_width(indent);
+        let text_width = self.text_width(indent + code_pad);
         let columns = match table {
             Table::Columns { columns, .. } => columns.to_vec(),
             Table::No | Table::Measure => Vec::new(),
@@ -761,7 +767,7 @@ impl LiveLayout {
             unsafe {
                 layout.SetFontSize(size, whole).map_err(hresult_error)?;
                 layout
-                    .SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, whole)
+                    .SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD, whole)
                     .map_err(hresult_error)?;
                 // The format's uniform spacing would clip a large heading.
                 layout
@@ -894,7 +900,7 @@ impl LiveLayout {
         let mut decorations = Vec::new();
         match &shown.block.body {
             BodyStyle::Code { .. } => decorations.push(Decoration::Fill {
-                rect: RectF::new(indent, 0.0, f32::MAX, height),
+                rect: RectF::new(outer, 0.0, f32::MAX, height),
                 paint: Paint::CodeBackground,
             }),
             BodyStyle::Rule => decorations.push(Decoration::Line {
@@ -959,6 +965,19 @@ impl LiveLayout {
             rows.truncate(1);
             rows[0].height = height;
         }
+        if shown.heading.is_some_and(|level| level <= 2) {
+            // H1 and H2 are underlined, a little below their text, as the preview draws them.
+            let gap = (0.3 * size).round();
+            height += gap + 1.0;
+            if let Some(last) = rows.last_mut() {
+                last.height += gap + 1.0;
+            }
+            decorations.push(Decoration::Line {
+                from: (indent, height - 0.5),
+                to: (f32::MAX, height - 0.5),
+                paint: Paint::Rule,
+            });
+        }
         let grid_start = decorations.len();
         if grid {
             decorations.extend(grid_lines(&shown.block.body, &columns, indent, height));
@@ -979,7 +998,7 @@ impl LiveLayout {
                     ..
                 } => decorations.push(match marker {
                     Marker::Bullet => Decoration::Bullet {
-                        center: (x + em * 0.55, marker_y),
+                        center: (x + em * 1.3, marker_y),
                         radius: em * 0.17,
                         depth: *depth,
                     },
@@ -987,18 +1006,19 @@ impl LiveLayout {
                         rect: RectF::new(
                             x,
                             first.top,
-                            x + container_width(container, em) - em * 0.35,
+                            x + container_width(container, em) - em * 0.5,
                             first.top + first.height,
                         ),
                         text: line.get(range.clone()).unwrap_or_default().to_owned(),
                     },
                     Marker::Task { checked, inner } => {
-                        let side = em * 0.8;
+                        let side = em * 0.875;
+                        let left = x + container_width(container, em) - em * 0.5 - side;
                         Decoration::Checkbox {
                             rect: RectF::new(
-                                x + em * 0.2,
+                                left,
                                 marker_y - side / 2.0,
-                                x + em * 0.2 + side,
+                                left + side,
                                 marker_y + side / 2.0,
                             ),
                             checked: *checked,
@@ -1160,10 +1180,6 @@ fn grid_lines(body: &BodyStyle, columns: &[f32], indent: f32, height: f32) -> Ve
     let mut decorations = Vec::new();
     if let BodyStyle::TableRow { header, .. } = body {
         if *header {
-            decorations.push(Decoration::Fill {
-                rect: RectF::new(indent, 0.0, right, height),
-                paint: Paint::CodeBackground,
-            });
             decorations.push(line((indent, 0.0), (right, 0.0)));
         }
         decorations.push(line((indent, height), (right, height)));
@@ -1178,12 +1194,11 @@ fn grid_lines(body: &BodyStyle, columns: &[f32], indent: f32, height: f32) -> Ve
 }
 
 /// How much a container indents the lines inside it, for text size `em`: a quote's bar and gap,
-/// or a list item's marker box (wider for numbers).
+/// or a list item's marker box; the preview's indents (16 and 32 px for 16 px text).
 fn container_width(container: &Container, em: f32) -> f32 {
     match container {
         Container::Quote => em,
-        Container::Item { ordered: true, .. } => em * 2.0,
-        Container::Item { .. } => em * 1.5,
+        Container::Item { .. } => em * 2.0,
     }
 }
 

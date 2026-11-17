@@ -57,8 +57,9 @@ const CARET_MARGIN: f32 = 8.0;
 /// Space between the line numbers and the text, in DIPs.
 const GUTTER_GAP: f32 = 12.0;
 
-/// The colours the view draws with, as `COLORREF`s: the editor's own, so Live and source look
-/// like one editor.
+/// The colours the view draws with, as `COLORREF`s. The editing chrome (selection, caret, line
+/// numbers, the edited block, revealed markup) is the editor's; rendered Markdown is the
+/// preview's, so Live reads as the preview does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LiveColors {
     pub background: u32,
@@ -67,14 +68,18 @@ pub struct LiveColors {
     pub inactive_selection: u32,
     pub caret: u32,
     pub line_number: u32,
-    /// The Markdown roles, as the source view colours them (`languages/markdown.rs`).
     pub heading: u32,
     pub emphasis: u32,
+    /// Revealed markup: the source view's Markdown marker colour (`languages/markdown.rs`).
     pub marker: u32,
     pub link: u32,
     pub code: u32,
     pub code_background: u32,
+    /// Dimmed text and quote text.
     pub dim: u32,
+    /// Rules and table borders.
+    pub border: u32,
+    pub quote_bar: u32,
     /// Behind the block being edited (the revealed lines): the editor's current-line colour.
     pub active_block: u32,
     /// The preview's colours for the same theme: what Mermaid diagrams are drawn in, so a
@@ -95,6 +100,8 @@ struct Brushes {
     code: ID2D1SolidColorBrush,
     code_background: ID2D1SolidColorBrush,
     dim: ID2D1SolidColorBrush,
+    border: ID2D1SolidColorBrush,
+    quote_bar: ID2D1SolidColorBrush,
     active_block: ID2D1SolidColorBrush,
 }
 
@@ -109,8 +116,10 @@ impl Brushes {
             Paint::Link => &self.link,
             Paint::Code => &self.code,
             Paint::CodeBackground => &self.code_background,
-            // Rules, quote bars and quote text use the comment colour, as dimmed text does.
-            Paint::Dim | Paint::Rule | Paint::QuoteBar | Paint::Quote => &self.dim,
+            // Quote text is muted, as dimmed text is, as the preview draws it.
+            Paint::Dim | Paint::Quote | Paint::MutedHeading => &self.dim,
+            Paint::Rule => &self.border,
+            Paint::QuoteBar => &self.quote_bar,
         }
     }
 }

@@ -95,6 +95,8 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
             code: brush(state.colors.code)?,
             code_background: brush(state.colors.code_background)?,
             dim: brush(state.colors.dim)?,
+            border: brush(state.colors.border)?,
+            quote_bar: brush(state.colors.quote_bar)?,
             active_block: brush(state.colors.active_block)?,
         });
         state.brush_generation += 1;
@@ -248,6 +250,8 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         #[cfg(test)]
         let mut painted = PaintedDecorations::default();
         let right = |x: f32| if x == f32::MAX { text_right } else { x };
+        // Inline code's background reaches a little past its text, as the preview's does.
+        let pad = state.layout.fonts().size / 8.0;
         for (line, (top, bottom)) in visible.clone().zip(spans.iter().copied()) {
             if (bottom - scroll_y) < clip_top || (top - scroll_y) > clip_bottom {
                 continue;
@@ -286,7 +290,12 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
             for &(start, end, paint) in &laid.backgrounds {
                 for area in laid.range_rects(start, end).unwrap_or_default() {
                     target.FillRectangle(
-                        &rect(area.left, top + area.top, area.right, top + area.bottom),
+                        &rect(
+                            area.left - pad,
+                            top + area.top,
+                            area.right + pad,
+                            top + area.bottom,
+                        ),
                         brushes.paint(paint),
                     );
                     #[cfg(test)]
@@ -388,7 +397,7 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
                                         Y: top + area.top - scroll_y,
                                     },
                                     &label,
-                                    &brushes.marker,
+                                    &brushes.text,
                                     D2D1_DRAW_TEXT_OPTIONS_NONE,
                                 );
                             }
@@ -402,8 +411,10 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
                             checked,
                             ..
                         } => {
+                            // As the preview draws it: a border-coloured box, filled with
+                            // the link colour 3 DIPs in when checked.
                             let outline = at(area);
-                            let inset = (area.right - area.left) * 0.22;
+                            let inset = 3.0;
                             target.DrawRectangle(
                                 &D2D_RECT_F {
                                     left: outline.left + 0.5,
@@ -411,7 +422,7 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
                                     right: outline.right - 0.5,
                                     bottom: outline.bottom - 0.5,
                                 },
-                                &brushes.marker,
+                                &brushes.border,
                                 1.0,
                                 None,
                             );

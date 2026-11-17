@@ -380,14 +380,9 @@ impl<'a> Collector<'a> {
             .rev()
             .find(|(_, seed)| matches!(seed, Seed::Item { .. }))
         {
-            *task = Some((checked, range.clone()));
+            *task = Some((checked, range));
         }
-        if checked {
-            let line_end = line_ranges(self.text, range.end..range.end)[0].end;
-            let text_start = (range.end + 1).min(line_end);
-            self.push(text_start..line_end, SpanKind::Strike);
-            self.push(text_start..line_end, SpanKind::Dim);
-        }
+        // A done task's text stays as it is, as the preview shows it: only its box is checked.
     }
 
     fn inline_code(&mut self, range: Range<usize>) {
@@ -1640,8 +1635,8 @@ mod tests {
     }
 
     #[test]
-    fn a_checked_task_is_struck_and_dim() {
-        assert_eq!(kinds("- [x] done"), format!("......{}", "(sd)".repeat(4)));
+    fn a_checked_task_keeps_its_text_as_it_is() {
+        assert_eq!(kinds("- [x] done"), "..........");
         assert_eq!(
             lines("- [x] done")[0].containers,
             vec![item(
