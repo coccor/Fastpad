@@ -1433,7 +1433,15 @@ pub(crate) fn open_in_fastdraw(hwnd: HWND) {
     };
     let shown = unsafe { host_window::app_ptr(hwnd) }.and_then(|app| {
         let document = unsafe { app.as_ref() }.tabs.document(id)?;
-        Some((document.title(), document.path.clone()))
+        let name = document
+            .path
+            .as_deref()
+            .and_then(|path| path.file_name())
+            .map_or_else(
+                || "diagram.fdraw".to_owned(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+        Some((name, document.path.clone()))
     });
     let Some((name, path)) = shown else {
         return;

@@ -752,3 +752,33 @@ fn the_toolbar_has_the_open_button_only_on_fastdraw_tabs() {
     crate::window::main_window::group_layout::layout_editor_and_find_bar(window.hwnd);
     assert!(!has_button(window.hwnd, toolbar));
 }
+
+#[test]
+fn the_link_names_the_file_not_the_tab_title() {
+    // Break caught: the tab title's dirty marker, or an untitled tab's name, leaking into the link.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    open_diagram(&window, "flow.fdraw", DIAGRAM);
+    editor.set_text("a: node \"B\" at 0,0\n").unwrap();
+    assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
+    crate::window::preview_host::take_opened();
+    execute_command(window.hwnd, CommandId::OpenInFastDraw);
+    assert_eq!(
+        crate::window::preview_host::take_opened(),
+        [fastdraw_render::editor_link(
+            "flow.fdraw",
+            "a: node \"B\" at 0,0\n",
+            None
+        )]
+    );
+
+    execute_command(window.hwnd, CommandId::New);
+    execute_command(window.hwnd, CommandId::LanguageFastDraw);
+    editor.set_text(DIAGRAM).unwrap();
+    execute_command(window.hwnd, CommandId::OpenInFastDraw);
+    assert_eq!(
+        crate::window::preview_host::take_opened(),
+        [fastdraw_render::editor_link("diagram.fdraw", DIAGRAM, None)]
+    );
+}

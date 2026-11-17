@@ -806,8 +806,8 @@ unsafe fn ink(dc: HDC, glyph: &str) -> Option<GLYPHMETRICS> {
     (result != GDI_ERROR as u32 && metrics.gmBlackBoxY > 0).then_some(metrics)
 }
 
-/// Draws `text`, one icon glyph, with its ink centred in `rect` and sized to `GLYPH_INK` tall (narrower if
-/// it would not fit the segment's width), so the four icons read as one size.
+/// Draws `text`, one icon glyph, with its ink centred in `rect` and sized to `GLYPH_INK` tall
+/// (narrower if it would not fit the segment's width), so the icons read as one size.
 unsafe fn draw_glyph(dc: HDC, text: &str, rect: Rect, dpi: u32) {
     let nominal = scale_text(GLYPH_SIZE, dpi);
     let probe = icon_font(nominal);
