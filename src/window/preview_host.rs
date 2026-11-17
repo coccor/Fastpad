@@ -1416,6 +1416,62 @@ pub(crate) fn shell_open(hwnd: HWND, url: &str) -> bool {
     result as isize > 32
 }
 
+/// An editor link longer than this is not opened.
+const MAX_EDITOR_LINK_BYTES: usize = 2 * 1024 * 1024;
+
+/// Opens the active FastDraw tab in the editor at fastdraw.dev, the diagram and the look file it
+/// reads travelling in the link. Does nothing on any other tab.
+pub(crate) fn open_in_fastdraw(hwnd: HWND) {
+    if !active_is_fastdraw(hwnd) {
+        return;
+    }
+    let (Some(editor), Some((id, ..))) = (editor(hwnd), active_document(hwnd)) else {
+        return;
+    };
+    let Ok(text) = editor.text() else {
+        return;
+    };
+    let shown = unsafe { host_window::app_ptr(hwnd) }.and_then(|app| {
+        let document = unsafe { app.as_ref() }.tabs.document(id)?;
+        Some((document.title(), document.path.clone()))
+    });
+    let Some((name, path)) = shown else {
+        return;
+    };
+    let look = crate::preview::fastdraw::draw(&text, path.as_deref(), false).look;
+    let link = fastdraw_render::editor_link(&name, &text, look.as_ref());
+    if link.len() > MAX_EDITOR_LINK_BYTES {
+        host_window::push_notice(
+            hwnd,
+            "This diagram is too large to open by link.".to_owned(),
+        );
+    } else if !open_link(hwnd, &link) {
+        host_window::push_notice(hwnd, "FastPad could not open fastdraw.dev.".to_owned());
+    }
+}
+
+#[cfg(not(test))]
+fn open_link(hwnd: HWND, url: &str) -> bool {
+    shell_open(hwnd, url)
+}
+
+#[cfg(test)]
+fn open_link(_hwnd: HWND, url: &str) -> bool {
+    OPENED.with(|opened| opened.borrow_mut().push(url.to_owned()));
+    true
+}
+
+#[cfg(test)]
+thread_local! {
+    static OPENED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The URLs `open_in_fastdraw` opened on this thread. Tests never start a browser.
+#[cfg(test)]
+pub(crate) fn take_opened() -> Vec<String> {
+    OPENED.with(|opened| std::mem::take(&mut *opened.borrow_mut()))
+}
+
 /// `WM_FASTPAD_PREVIEW_HOVER`: the link under the pointer in group `id`'s preview changed.
 pub(crate) fn hover_link(hwnd: HWND, id: GroupId, lparam: LPARAM) {
     if lparam == 0 {

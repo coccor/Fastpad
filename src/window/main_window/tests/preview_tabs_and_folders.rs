@@ -661,3 +661,94 @@ fn session_close_during_a_restore_uses_the_prompt() {
     assert!(!scratch.path().join("session.ini").exists());
     app_mut(window.hwnd).session_restore = None;
 }
+
+const DIAGRAM: &str = "a: node \"A\" at 0,0\n";
+
+fn open_diagram(window: &ProductionWindow, name: &str, text: &str) {
+    let scratch = LibraryScratch::new("open-in-fastdraw");
+    open_note(window, &scratch, name, text);
+}
+
+#[test]
+fn open_in_fastdraw_sends_the_tab_to_the_editor() {
+    // Break caught: the command sending nothing, a stale or empty diagram, or a link that is not
+    // the shared editor link for this tab's name and text.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    open_diagram(&window, "flow.fdraw", DIAGRAM);
+    crate::window::preview_host::take_opened();
+
+    execute_command(window.hwnd, CommandId::OpenInFastDraw);
+
+    let opened = crate::window::preview_host::take_opened();
+    assert_eq!(
+        opened,
+        [fastdraw_render::editor_link("flow.fdraw", DIAGRAM, None)]
+    );
+    assert!(opened[0].starts_with("https://fastdraw.dev/edit/#fdraw="));
+}
+
+#[test]
+fn the_command_does_nothing_on_other_tabs() {
+    // Break caught: Open in FastDraw sending a plain text tab's content to the web.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    open_diagram(&window, "plain.txt", DIAGRAM);
+    crate::window::preview_host::take_opened();
+
+    execute_command(window.hwnd, CommandId::OpenInFastDraw);
+
+    assert!(crate::window::preview_host::take_opened().is_empty());
+}
+
+#[test]
+fn the_tab_menu_offers_open_in_fastdraw_only_on_fastdraw_tabs() {
+    // Break caught: the entry missing on a diagram, or shown on every tab.
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let offered = |hwnd| {
+        answer_next_popup_menu(|_| None);
+        crate::window::menus::show_tab_menu(hwnd, 0, 0);
+        crate::window::menus::last_popup_entries()
+            .iter()
+            .any(|(label, _)| label == "Open in FastDraw")
+    };
+    open_diagram(&window, "flow.fdraw", DIAGRAM);
+    assert!(offered(window.hwnd));
+    execute_command(window.hwnd, CommandId::LanguagePlainText);
+    assert!(!offered(window.hwnd));
+}
+
+#[test]
+fn the_toolbar_has_the_open_button_only_on_fastdraw_tabs() {
+    // Break caught: the button on an SVG tab, missing on a diagram, or a hit test that ignores
+    // the button's rectangle.
+    use crate::window::editor_toolbar::{button_at, button_rect, has_button, hwnd};
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    open_diagram(&window, "flow.fdraw", DIAGRAM);
+    crate::window::main_window::group_layout::layout_editor_and_find_bar(window.hwnd);
+    let toolbar = hwnd(window.hwnd).unwrap();
+    assert!(has_button(window.hwnd, toolbar));
+    let rect = button_rect(toolbar, crate::preview::ViewMode::SVG.len());
+    assert!(button_at(
+        window.hwnd,
+        toolbar,
+        (rect.left + rect.right) / 2,
+        (rect.top + rect.bottom) / 2
+    ));
+    assert!(!button_at(
+        window.hwnd,
+        toolbar,
+        rect.left - 40,
+        rect.top + 2
+    ));
+
+    execute_command(window.hwnd, CommandId::LanguageSvg);
+    crate::window::main_window::group_layout::layout_editor_and_find_bar(window.hwnd);
+    assert!(!has_button(window.hwnd, toolbar));
+}

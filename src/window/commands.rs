@@ -203,6 +203,8 @@ pub enum CommandId {
     NewNotebook = 298,
     // Language: FastDraw (2026-11-17).
     LanguageFastDraw = 299,
+    // FastDraw: Open in FastDraw (2026-11-17).
+    OpenInFastDraw = 300,
 }
 
 /// The editing-shortcut commands (editing shortcuts spec §3): text commands whose keys work only
@@ -585,7 +587,7 @@ impl TryFrom<u16> for CommandId {
     type Error = ();
 
     fn try_from(value: u16) -> Result<Self, Self::Error> {
-        const COMMANDS: [CommandId; 189] = [
+        const COMMANDS: [CommandId; 190] = [
             CommandId::MoveLinesUp,
             CommandId::MoveLinesDown,
             CommandId::CopyLinesUp,
@@ -775,6 +777,7 @@ impl TryFrom<u16> for CommandId {
             CommandId::MarkdownDeleteTableColumn,
             CommandId::NewNotebook,
             CommandId::LanguageFastDraw,
+            CommandId::OpenInFastDraw,
         ];
         COMMANDS
             .into_iter()
@@ -1144,7 +1147,8 @@ mod tests {
         assert_eq!(CommandId::MarkdownViewLive.scope(), Scope::Global);
         assert!(CommandId::MarkdownViewLive.is_markdown_edit());
         assert_eq!(CommandId::try_from(299), Ok(CommandId::LanguageFastDraw));
-        assert!(CommandId::try_from(300).is_err());
+        assert_eq!(CommandId::try_from(300), Ok(CommandId::OpenInFastDraw));
+        assert!(CommandId::try_from(301).is_err());
     }
 
     #[test]
