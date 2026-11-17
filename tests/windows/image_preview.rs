@@ -544,6 +544,11 @@ fn an_svg_opens_as_text_and_the_preview_renders_and_follows_edits() {
     assert_eq!(view.status().size, Some((80, 20)));
 }
 
+/// How long the FastDraw preview gets to draw. FastDraw renders unoptimized in test builds, and a
+/// hosted CI runner once missed a 5-second wait for the first drawing; each wait still ends as soon
+/// as the drawing is ready.
+const FDRAW_DRAW_TIMEOUT: Duration = Duration::from_secs(20);
+
 #[test]
 fn a_fdraw_opens_in_preview_draws_and_keeps_the_last_drawing_on_a_mistake() {
     // Break caught: a .fdraw tab opening as plain text, the preview not drawing it, or a typing
@@ -564,17 +569,17 @@ fn a_fdraw_opens_in_preview_draws_and_keeps_the_last_drawing_on_a_mistake() {
     let view = main
         .with_app(|app| app.active_group().unwrap().preview.svg_view)
         .expect("svg view");
-    pump_until("fdraw drawn", Duration::from_secs(5), || {
+    pump_until("fdraw drawn", FDRAW_DRAW_TIMEOUT, || {
         view.stats().phase == image_view::Phase::Ready
     });
     let first = view.status().size.expect("drawn size");
     main.set_text("a: rect \"A\" at 0,0\nb: rect \"B\" at 200,0\n");
-    pump_until("fdraw redrawn wider", Duration::from_secs(5), || {
+    pump_until("fdraw redrawn wider", FDRAW_DRAW_TIMEOUT, || {
         view.status().size.is_some_and(|size| size.0 > first.0)
     });
     let wide = view.status().size;
     main.set_text("a: rect \"A\" at 0,0\nb: rect \"B\" at 200,0\nc: nosuchkind \"C\" at 0,0\n");
-    pump_until("fdraw error band", Duration::from_secs(5), || {
+    pump_until("fdraw error band", FDRAW_DRAW_TIMEOUT, || {
         view.stats()
             .band
             .is_some_and(|band| band.starts_with("Line 3: "))
