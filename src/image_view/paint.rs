@@ -136,6 +136,49 @@ fn ensure_checker(state: &mut ViewState, target: &ID2D1RenderTarget) -> windows:
     Ok(())
 }
 
+/// Draws the sharp tile of a deeply zoomed vector picture over its enlarged whole picture, placed
+/// by the zoom it was rendered at (a tile from the previous zoom stands in until the next lands).
+fn draw_tile(
+    state: &mut ViewState,
+    target: &ID2D1RenderTarget,
+    dest: RectF,
+) -> windows::core::Result<()> {
+    let Some(tile) = &state.tile else {
+        return Ok(());
+    };
+    let ratio = state.scale / tile.scale;
+    let area = tile.area;
+    let tile_dest = RectF::new(
+        dest.left + area.x as f32 * ratio,
+        dest.top + area.y as f32 * ratio,
+        dest.left + (area.x + area.width) as f32 * ratio,
+        dest.top + (area.y + area.height) as f32 * ratio,
+    );
+    if state.tile_bitmap.is_none() {
+        state.tile_bitmap = Some(unsafe {
+            target.CreateBitmap(
+                D2D_SIZE_U {
+                    width: area.width,
+                    height: area.height,
+                },
+                Some(tile.pixels.as_ptr().cast()),
+                area.width * 4,
+                &BITMAP_PROPERTIES,
+            )?
+        });
+    }
+    // At its own zoom the tile is drawn pixel for pixel; a fractional offset must not blur it.
+    let mode = if tile_dest.width() > area.width as f32 - 0.5 {
+        D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+    } else {
+        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
+    };
+    if let Some(bitmap) = &state.tile_bitmap {
+        unsafe { target.DrawBitmap(bitmap, Some(&tile_dest.to_d2d()), 1.0, mode, None) };
+    }
+    Ok(())
+}
+
 pub(super) fn paint(state: &mut ViewState) -> windows::core::Result<()> {
     let hwnd = state.hwnd;
     let (width, height) = client_size(hwnd);
@@ -150,6 +193,7 @@ pub(super) fn paint(state: &mut ViewState) -> windows::core::Result<()> {
         .map_err(com_error)?;
         state.max_side = unsafe { target.GetMaximumBitmapSize() }.clamp(1, DEFAULT_MAX_SIDE);
         state.bitmap = None;
+        state.tile_bitmap = None;
         state.checker = None;
         state.target = Some(target);
     }
@@ -208,6 +252,7 @@ pub(super) fn paint(state: &mut ViewState) -> windows::core::Result<()> {
         if let Some(bitmap) = &state.bitmap {
             unsafe { target.DrawBitmap(bitmap, Some(&dest.to_d2d()), 1.0, mode, None) };
         }
+        draw_tile(state, &target, dest)?;
     }
     let line = LINE_HEIGHT * scale;
     let middle = height / 2.0;
