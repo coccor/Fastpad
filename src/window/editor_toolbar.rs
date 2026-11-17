@@ -223,7 +223,12 @@ pub(crate) fn button_rect(toolbar: HWND, count: usize) -> Rect {
     let dpi = unsafe { GetDpiForWindow(toolbar) }.max(96);
     let mut client = RECT::default();
     unsafe { GetClientRect(toolbar, &mut client) };
-    let track = track_rect(client.right, client.bottom, count, dpi);
+    button_rect_in(client.right, client.bottom, count, dpi)
+}
+
+/// The Open in FastDraw button in a row `width` × `height` with `count` segments.
+fn button_rect_in(width: i32, height: i32, count: usize, dpi: u32) -> Rect {
+    let track = track_rect(width, height, count, dpi);
     let padding = scale(TRACK_PADDING, dpi);
     let right = track.left - 2 * padding;
     Rect::new(
@@ -232,6 +237,19 @@ pub(crate) fn button_rect(toolbar: HWND, count: usize) -> Rect {
         right,
         track.bottom - padding,
     )
+}
+
+/// Where the location text stops in a row `width` × `height`: short of the view control of
+/// `count` segments, and of the Open in FastDraw button when `button` shows.
+fn text_right(width: i32, height: i32, count: usize, dpi: u32, button: bool) -> i32 {
+    let end = if count == 0 {
+        width
+    } else if button {
+        button_rect_in(width, height, count, dpi).left
+    } else {
+        track_rect(width, height, count, dpi).left
+    };
+    end - scale(RIGHT_MARGIN, dpi)
 }
 
 /// Whether the toolbar `toolbar` shows the Open in FastDraw button.
@@ -633,9 +651,13 @@ fn draw(main: HWND, toolbar: HWND, dc: HDC) {
         .then(|| track_rect(row.right, row.bottom - line, segments.len(), dpi));
     // The location, cut before it reaches the view control.
     let left = scale(LEFT_MARGIN, dpi);
-    let right = track.map_or(row.right - scale(RIGHT_MARGIN, dpi), |track| {
-        track.left - scale(RIGHT_MARGIN, dpi)
-    });
+    let right = text_right(
+        row.right,
+        row.bottom - line,
+        segments.len(),
+        dpi,
+        has_button(main, toolbar),
+    );
     if let Some((file, folders)) = parts.split_last() {
         let format = DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS;
         let prefix = folders
@@ -860,8 +882,23 @@ unsafe fn draw_glyph(dc: HDC, text: &str, rect: Rect, dpi: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::location_segments;
+    use super::{RIGHT_MARGIN, button_rect_in, location_segments, text_right, track_rect};
+    use crate::window::design::metrics::scale;
     use std::path::Path;
+
+    #[test]
+    fn the_location_stops_short_of_the_open_button() {
+        // Break caught: the location text running under the Open in FastDraw button.
+        crate::window::design::text_scale::set_factor_for_test(100);
+        for dpi in [96, 144] {
+            let margin = scale(RIGHT_MARGIN, dpi);
+            let button = button_rect_in(800, 40, 3, dpi);
+            assert_eq!(text_right(800, 40, 3, dpi, true), button.left - margin);
+            let track = track_rect(800, 40, 3, dpi);
+            assert_eq!(text_right(800, 40, 3, dpi, false), track.left - margin);
+            assert_eq!(text_right(800, 40, 0, dpi, false), 800 - margin);
+        }
+    }
 
     #[test]
     fn a_note_shows_its_notebook_and_folders() {
