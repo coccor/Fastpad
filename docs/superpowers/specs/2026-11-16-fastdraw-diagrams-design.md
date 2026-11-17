@@ -73,6 +73,12 @@ and replaces the crate's `look file not found` error on that line with the error
 `FastPad reads look files only by a relative path; "<path>" was not read`. That error does not hide the
 drawing (§4.4). Bundled look names and relative paths are passed through unchanged.
 
+The renderer reads the dark look a look file's `dark` line names by whatever path it gives. So before a
+dark render whose diagram names an allowed relative `.look` file, FastPad reads that file itself
+(relative to the diagram, at most 1 MB) and looks at its `dark` statements. When one names a refused
+path, FastPad renders light (nothing more is read), still shows the drawing, and adds the same error on
+the diagram's look line with that path.
+
 ## 4. `.fdraw` tabs
 
 ### 4.1 Language

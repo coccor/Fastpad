@@ -662,7 +662,7 @@ fn session_close_during_a_restore_uses_the_prompt() {
     app_mut(window.hwnd).session_restore = None;
 }
 
-const DIAGRAM: &str = "a: node \"A\" at 0,0\n";
+const DIAGRAM: &str = "a: rect \"A\" at 0,0\n";
 
 fn open_diagram(window: &ProductionWindow, name: &str, text: &str) {
     let scratch = LibraryScratch::new("open-in-fastdraw");
@@ -821,7 +821,7 @@ fn the_link_names_the_file_not_the_tab_title() {
     let window = ProductionWindow::new(make_app());
     let editor = install_test_editor(&window);
     open_diagram(&window, "flow.fdraw", DIAGRAM);
-    editor.set_text("a: node \"B\" at 0,0\n").unwrap();
+    editor.set_text("a: rect \"B\" at 0,0\n").unwrap();
     assert!(app_mut(window.hwnd).tabs.active().unwrap().dirty);
     crate::window::preview_host::take_opened();
     execute_command(window.hwnd, CommandId::OpenInFastDraw);
@@ -829,7 +829,7 @@ fn the_link_names_the_file_not_the_tab_title() {
         crate::window::preview_host::take_opened(),
         [fastdraw_render::editor_link(
             "flow.fdraw",
-            "a: node \"B\" at 0,0\n",
+            "a: rect \"B\" at 0,0\n",
             None
         )]
     );

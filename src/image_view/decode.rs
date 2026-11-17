@@ -502,7 +502,7 @@ mod tests {
     fn a_fastdraw_diagram_decodes_with_its_paper_and_no_band() {
         // Break caught: a diagram drawn without its paper colour, or a clean one with a band.
         let image = decode_fastdraw(
-            "a: node \"A\" at 0,0
+            "a: rect \"A\" at 0,0
 ",
             None,
             false,
@@ -518,7 +518,7 @@ mod tests {
                 && image.pixels.len() == image.width as usize * image.height as usize * 4
         );
         let dark = decode_fastdraw(
-            "a: node \"A\" at 0,0
+            "a: rect \"A\" at 0,0
 ",
             None,
             true,

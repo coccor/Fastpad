@@ -1206,7 +1206,7 @@ mod tests {
         assert_eq!(message.wParam, 7);
     }
 
-    const GOOD: &str = "a: node \"A\" at 0,0
+    const GOOD: &str = "a: rect \"A\" at 0,0
 ";
     const REFUSED: &str = "look \"//server/x.look\"
 a: rect \"A\" at 0,0
