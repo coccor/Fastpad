@@ -25,8 +25,20 @@ fn launch_takes_typing_into_a_focused_editable_scintilla() {
         .wait_for_main_window(Duration::from_secs(2))
         .unwrap();
     let editor = find_child_by_class(hwnd, "Scintilla").unwrap();
-    let focused = focused_window(hwnd).unwrap();
-    assert!(focused == editor || focused == hwnd);
+    // The main window can be found before startup has moved focus to it, so a single read may
+    // see another of FastPad's windows; wait for focus to settle. (CI failed here intermittently.)
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let focused = loop {
+        let focused = focused_window(hwnd).unwrap();
+        if focused == editor || focused == hwnd || std::time::Instant::now() >= deadline {
+            break focused;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        focused == editor || focused == hwnd,
+        "focus settled on {focused:?}, not the editor ({editor:?}) or the main window ({hwnd:?})"
+    );
     unsafe { PostMessageW(focused, WM_CHAR, usize::from(b'x'), 0) };
     wait_for_text(editor, "x");
     assert_eq!(focused_window(hwnd).unwrap(), editor);
