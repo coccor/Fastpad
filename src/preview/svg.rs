@@ -66,12 +66,27 @@ pub(crate) fn natural_size(tree: &usvg::Tree) -> (u32, u32) {
 /// Rasterizes `tree` to `width`×`height` premultiplied BGRA pixels, scaling its natural size to
 /// fit exactly.
 pub(crate) fn rasterize(tree: &usvg::Tree, (width, height): (u32, u32)) -> Result<Vec<u8>> {
+    rasterize_region(tree, (width as f32, height as f32), (0, 0), (width, height))
+}
+
+/// Rasterizes the `width`×`height` pixels at `(x, y)` of `tree` drawn at `picture` size, as
+/// premultiplied BGRA: one region of a picture too large to rasterize whole.
+pub(crate) fn rasterize_region(
+    tree: &usvg::Tree,
+    picture: (f32, f32),
+    (x, y): (u32, u32),
+    (width, height): (u32, u32),
+) -> Result<Vec<u8>> {
     let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
         .ok_or(FastPadError::Invariant("SVG raster size is empty"))?;
     let size = tree.size();
-    let transform = resvg::tiny_skia::Transform::from_scale(
-        width as f32 / size.width(),
-        height as f32 / size.height(),
+    let transform = resvg::tiny_skia::Transform::from_row(
+        picture.0 / size.width(),
+        0.0,
+        0.0,
+        picture.1 / size.height(),
+        -(x as f32),
+        -(y as f32),
     );
     resvg::render(tree, transform, &mut pixmap.as_mut());
     // tiny-skia writes premultiplied RGBA.
