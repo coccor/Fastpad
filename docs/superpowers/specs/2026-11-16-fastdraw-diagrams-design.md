@@ -1,8 +1,8 @@
 # FastDraw diagrams (`.fdraw`)
 
-**Branch:** `feat/fastdraw-diagrams`. One PR, after the crate in §3 is published.
-**Upstream:** [coccor/fastdraw](https://github.com/coccor/fastdraw). FastPad depends on a Rust crate,
-`fastdraw-render`, that lives in that repository (§3).
+**Branch:** `feat/fastdraw-diagrams`. One PR.
+**Upstream:** [coccor/fastdraw](https://github.com/coccor/fastdraw). FastPad depends on its Rust crate,
+`fastdraw-render` (`crates/fastdraw-render`), pinned by git commit (§3).
 
 ## 1. Goal
 
@@ -22,69 +22,56 @@ editor link the user asks for, and the diagram travels after its `#`, which no s
 | Question | Decision |
 |---|---|
 | How a diagram becomes a picture | `fastdraw-render` (§3) writes the SVG; resvg rasterizes it on the image worker thread, as for `.svg` files and Mermaid. |
-| Who keeps the renderer in step with FastDraw | The fastdraw repository: the crate sits next to the TypeScript renderer, and fastdraw's CI fails when their SVGs differ. FastPad pins an exact version, like `mermaid-rs-renderer`. |
+| Who keeps the renderer in step with FastDraw | The fastdraw repository: the crate sits next to the TypeScript renderer, and fastdraw's CI fails when their outputs differ. FastPad pins a commit. |
 | Fidelity | Full: every bundled look, `.look` files with `icondir` and `fontdir`, sketch, charts, all Phosphor icons, FastDraw's fonts. |
+| Look files named by a network or absolute path | Refused (§3.3): reading one opens an SMB connection, which a downloaded diagram could use to leak Windows credentials. |
 | How notes show diagrams | Image links to `.fdraw` files. Fenced ```` ```fdraw ```` blocks are not part of this version. |
 | Pan and zoom | The existing image view (`src/image_view`), unchanged. |
 | Dark themes | On a dark FastPad theme, a diagram is drawn in its look's dark counterpart, as the embed does on a dark page. |
 | Open in FastDraw | The crate's share link, opened with the shell. |
-| Not in this version | Syntax highlighting for `.fdraw`, ```` ```fdraw ```` blocks, exports, editing diagrams in FastPad, `fastdraw check`'s layout warnings. |
+| Not in this version | Syntax highlighting for `.fdraw`, ```` ```fdraw ```` blocks, exports, editing diagrams in FastPad, `fastdraw check`'s layout warnings, redrawing when a look file changes outside FastPad. |
 
-## 3. What FastPad needs from `fastdraw-render`
+## 3. `fastdraw-render`
 
-This section is the contract. The crate's own design (how it ports FastDraw, its tests, its release
-process) is specified and built in the fastdraw repository; FastPad relies only on what is here.
+### 3.1 Dependency
 
-### 3.1 Properties
-
-- Pure Rust, `#![forbid(unsafe_code)]`, no network, no threads, no global mutable state beyond
-  lazily-initialised read-only data. Builds on the FastPad toolchain (`rust-toolchain.toml`, edition 2024,
-  `x86_64-pc-windows-msvc`).
-- Dependencies limited to small, widely used crates (for example `miniz_oxide`, `indexmap`, `ryu-js`);
-  FastPad's `tools/audit-dependencies.ps1` adds the crate as an allowed root at its pinned version.
-- For every diagram and look in fastdraw's `examples/` and `assets/`, in every bundled look and its dark
-  counterpart, `render` returns the same SVG, character for character, and the same issues as FastDraw's
-  TypeScript `loadScene` + `renderSvg` at the same fastdraw version. fastdraw's CI checks this.
-- Published to crates.io with the same version number as the npm package it matches.
-
-### 3.2 Interface
-
-```rust
-/// A diagram and what it reads from disk. `file` is None for an untitled tab: no look file, icon
-/// folder or font folder is read, and a look line naming a file is an issue.
-pub struct Source<'a> { pub text: &'a str, pub file: Option<&'a Path>, pub dark: bool }
-
-pub struct Drawing {
-    pub svg: String,                  // standalone SVG; text names font families, no @font-face
-    pub paper: [u8; 3],               // the look's paper colour (sRGB)
-    pub bounds: [f64; 4],             // x, y, w, h in diagram units
-    pub issues: Vec<Issue>,           // what `fastdraw check` reports as errors and warnings
-    pub font_files: Vec<PathBuf>,     // TTF/OTF files from the look's fontdir
-    pub look: Option<LookFile>,       // the diagram's own .look file, as read (for the share link)
-}
-pub struct Issue { pub line: u32, pub level: Level, pub message: String }
-pub enum Level { Error, Warning }
-pub struct LookFile { pub path: String, pub text: String } // path as written in the diagram
-
-/// Never fails: unreadable files, refused paths and parse errors are issues, worded as FastDraw words them.
-pub fn render(source: &Source) -> Drawing;
-
-/// `https://fastdraw.dev/edit/#fdraw=<data>`, encoded as fastdraw's `editor/src/embed/share.ts` encodes it.
-pub fn editor_link(name: &str, text: &str, look: Option<&LookFile>) -> String;
-
-/// FastDraw's bundled fonts, (file name, TTF bytes). Inflated on first call.
-pub fn fonts() -> &'static [(&'static str, Vec<u8>)];
-
-pub const VERSION: &str; // the fastdraw version this crate matches
+```toml
+fastdraw-render = { git = "https://github.com/coccor/fastdraw", rev = "f0d3905" }
 ```
 
-- With `dark`, the crate does what the embed's `draw` does: the look's `dark` line, else `night` for a
-  diagram in the built-in look; a dark look that is a file is read relative to the look file.
-- The extended icon set is loaded when a diagram names an icon outside the built-in set, as
-  `loadExtendedIcons` does; the caller does not see this.
-- Disk reads follow FastDraw's `node.ts`: only `*.look` files are read as looks; `icondir` and `fontdir`
-  must resolve inside the look file's folder; its file count and size limits apply. Diagram and look files
-  over 1 MB are not read.
+The crate is not on crates.io (the fastdraw repository keeps `publish = false`). Crate version 0.2.2,
+`rust-version` 1.88. `tools/audit-dependencies.ps1` allows it as a root, and its dependencies
+(`miniz_oxide`, `indexmap`, `ryu-js`, `regex`, `libm`, with `adler2`, `aho-corasick`, `memchr`,
+`regex-automata`, `regex-syntax`, `hashbrown`, `equivalent`) as it allows other transitive crates.
+Moving to a newer FastDraw means moving `rev`.
+
+### 3.2 Interface FastPad uses
+
+```rust
+pub struct Source<'a> { pub text: &'a str, pub file: Option<&'a Path>, pub dark: bool }
+pub struct Drawing { pub svg: String, pub paper: [u8; 3], pub bounds: [f64; 4],
+                     pub issues: Vec<Issue>, pub font_files: Vec<PathBuf>, pub look: Option<LookFile> }
+pub struct Issue { pub line: u32, pub level: Level, pub message: String }
+pub enum Level { Error, Warning }
+pub struct LookFile { pub path: String, pub text: String }
+pub fn render(source: &Source) -> Drawing;          // never fails; problems are issues
+pub fn look_path(text: &str) -> Option<String>;     // the diagram's look line, as written
+pub fn editor_link(name: &str, text: &str, look: Option<&LookFile>) -> String;
+pub fn fonts() -> &'static [(&'static str, Vec<u8>)];
+pub const VERSION: &str;
+```
+
+Issues are FastDraw's `loadScene` errors and warnings, with the user's line numbers, also in dark mode.
+With `file: None` nothing is read from disk: the diagram draws in the built-in look and a look line that
+names a file gives the error `look file not found: <path>` on that line.
+
+### 3.3 FastPad's look-path rule
+
+Before `render`, FastPad checks `look_path(text)`. A path that is absolute, starts with `\\` or `//`, or
+has a drive prefix (`C:x` included) is refused: FastPad renders with `file: None`, so nothing is read,
+and replaces the crate's `look file not found` error on that line with the error
+`FastPad reads look files only by a relative path; "<path>" was not read`. That error does not hide the
+drawing (§4.4). Bundled look names and relative paths are passed through unchanged.
 
 ## 4. `.fdraw` tabs
 
@@ -96,81 +83,87 @@ lexer, plain text in Scintilla). The file icon is the image kind, like SVG.
 ### 4.2 View modes
 
 FastDraw tabs get `ViewMode::SVG` (Source, Split, Preview) wherever SVG tabs do: `preview_host.rs`
-(`buttons_visible`, the per-language mode check, `zoom_svg`, `load_svg`) and
-`editor_toolbar.rs::segments_for`. A new `.fdraw` tab opens in **Preview**; an empty or untitled one in
-**Source**. The mode is remembered per tab, as for SVG.
+(`buttons_visible`, `available`, `zoom_svg`, the SVG view's loading) and `editor_toolbar.rs::segments_for`.
+A FastDraw tab with a file and some text opens in **Preview**; an empty or untitled one in **Source**.
+The choice is remembered per tab, as for SVG.
 
 ### 4.3 Drawing
 
 The preview is the SVG tab's image view with a new decode source,
 `decode::Source::FastDraw { text: Arc<str>, file: Option<PathBuf>, dark: bool, width: u32 }`. On the
-decode thread it calls `fastdraw_render::render`, registers fonts (§4.5), then the existing SVG
+decode thread FastPad applies §3.3, calls `render`, registers fonts (§4.5), then uses the existing SVG
 parse-and-rasterize path. Fit, zoom steps, Ctrl+wheel, drag to pan, `+` / `-` / `0` and double-click work
 as for SVG tabs.
 
 - The text drawn is the editor's text, so Split shows unsaved edits. Redraws use the preview's existing
-  120 ms debounce, and a redraw keeps the zoom and pan.
-- Saving or changing the diagram's look file outside FastPad redraws the tab.
-- The view's background is the drawing's paper colour.
+  debounce, and a redraw keeps the zoom and pan. The look file is read again on every redraw.
+- The view's background is the drawing's paper colour, without the checkerboard.
+- `render` runs inside `catch_unwind`; a panic is shown as the error "FastDraw could not draw this
+  diagram".
 
 ### 4.4 Diagrams with errors
 
-When `render` returns an `Error` issue, the view keeps the last good drawing, if there is one, and shows a
-bar along its bottom: `Line 4: there is no shape called "dbb"`, plus " (and 2 more)" when there are more.
-With no good drawing yet, the view shows the same text centred. Warnings are not shown.
+The SVG view already keeps the last good picture and shows a band "Can't render this SVG" along its top
+when an edit breaks the SVG. FastDraw tabs use that band with their own text:
+
+- When `render` returns `Error` issues other than the §3.3 refusal, the drawing is not shown. The band
+  reads `Line 4: there is no shape called "dbb"`, plus ` (and 2 more)` when there are more errors, over the
+  last good drawing. With no good drawing yet, the view shows the failed state titled "FastPad can't draw
+  this diagram" with the same text.
+- When the only error is the §3.3 refusal, the drawing is shown (in the built-in look) with the band
+  giving that error.
+- Warnings are not shown.
 
 ### 4.5 Fonts
 
-`src/preview/svg.rs` owns the shared font database. The first FastDraw drawing adds `fastdraw_render::
-fonts()` to it once. A drawing's `font_files` are added the first time each path is seen. Text in a family
-with no font falls back as resvg does today.
+`src/preview/svg.rs` owns the shared font database. The first FastDraw drawing adds
+`fastdraw_render::fonts()` to it once. A drawing's `font_files` are added the first time each path is
+seen. Other SVGs and Mermaid diagrams do not pay for the FastDraw fonts until a FastDraw diagram is drawn.
 
 ### 4.6 Open in FastDraw
 
-- A button on a FastDraw tab's editor toolbar after the view-mode control, tooltip
-  "Open in FastDraw (fastdraw.dev)", and a command **FastDraw: Open in FastDraw** in the palette.
+- A command **FastDraw: Open in FastDraw**, available on FastDraw tabs: in the palette, in the tab's
+  right-click menu, and as a button on the editor toolbar to the left of the view-mode control (an
+  "open in new window" glyph from the toolbar's icon font, tooltip "Open in FastDraw (fastdraw.dev)").
 - It opens `editor_link(name, text, look)` with the tab's file name (`diagram.fdraw` when untitled), the
-  editor's text and the last drawing's `look`, through a shared `platform::shell::open_url` that
-  `about.rs`'s private `open_url` moves into.
-- A link longer than 2 MB is not opened; a notice says the diagram is too large to open by link.
+  editor's text, and the look file as `render` read it (none when refused), through the existing
+  `preview_host::shell_open`. A failure gives the notice "FastPad could not open fastdraw.dev.", as
+  `about.rs` does for its links.
+- A link longer than 2 MB is not opened; a notice says "This diagram is too large to open by link."
 
 ## 5. Diagrams in Markdown notes
 
 - An image whose target is a local path ending in `.fdraw` (any case), resolved as other image paths are,
-  draws as a diagram, in both `![]()` and `<img src>`. Web addresses stay as they are: nothing is fetched.
-- `preview::images::decode_image` routes such paths to a new `preview::fastdraw::decode(path, dark,
-  max_width)`: read the file, `render` with its path, register fonts, rasterize at the requested width.
-- The image cache stamps `.fdraw` entries with the modification times of the diagram and its look file and
-  with `dark`; a request whose stamp differs decodes again.
-- A diagram that cannot be read or has errors shows as a broken image does today, with the alt text; its
-  tooltip is the first error with its line number.
-- Ctrl+Click (or a click in the Preview) on the diagram opens the `.fdraw` file in a tab, as a link to a
-  local file does.
+  draws as a diagram, in `![]()` and `<img src>`, in the Preview and Live views. Web addresses stay as
+  they are: nothing is fetched.
+- `preview::images::decode_image` routes such paths to `preview::fastdraw::decode_file(path, dark,
+  max_width)`: read the file (at most 1 MB), apply §3.3, `render` with its path, register fonts,
+  rasterize at the requested width with the SVG path.
+- `ImageCache` learns the preview's darkness (`set_dark`); a change forgets its `.fdraw` entries.
+- A `.fdraw` entry remembers the modification times of the diagram and of the look file it read. When a
+  request finds either changed, it decodes again. Requests happen when the note is laid out (opening it,
+  editing it, resizing the pane).
+- A diagram that cannot be read or has errors shows as a broken image does today, with its alt text.
 
 ## 6. Testing (FastPad side)
 
-The renderer's correctness is tested in the fastdraw repository (§3.1). FastPad tests its use of it:
+The renderer's accuracy is tested in the fastdraw repository. FastPad tests its use of it:
 
-- `.fdraw` maps to `Language::FastDraw` and gets Source / Split / Preview, opening in Preview.
-- Typing in Split redraws from the editor text; a diagram with an error keeps the last drawing and shows
-  the bar with the line number; an untitled diagram draws.
-- On a dark theme, a diagram with no look line draws with `night`'s paper colour.
-- The FastDraw fonts are in the font database after the first drawing, and a diagram's text renders with
-  glyphs (the rasterized text area is not blank).
-- `![x](d.fdraw)` decodes to an image with the drawing's proportions; a broken diagram is a broken image
-  whose tooltip names the line; changing `d.fdraw` on disk decodes it again.
-- Open in FastDraw passes the expected link to `open_url` (recorded in tests, as `reveal_in_explorer` is).
+- §3.3: `//server/x.look`, `\\server\x.look`, `C:/x.look`, `C:x.look` and `/x.look` are refused, the
+  drawing is still produced and the issue reads as §3.3 says; `./x.look`, `x.look` and `night` pass.
+- Error text: one error, three errors (` (and 2 more)`), and a refusal plus a real error.
+- Fonts: after the first FastDraw drawing, a diagram's text rasterizes with ink in its label area.
+- `.fdraw` maps to `Language::FastDraw`, gets Source / Split / Preview and opens in Preview; typing in
+  Split redraws; a typing mistake keeps the last drawing and shows the band with the line number.
+- On a dark theme a diagram with no look line draws on `night`'s paper colour.
+- Open in FastDraw passes the expected link to the shell (recorded in tests).
+- `![x](d.fdraw)` decodes to an image with the drawing's proportions; a broken diagram is a failed image;
+  changing `d.fdraw` and requesting again decodes it again; changing darkness decodes it again.
 
 ## 7. Docs and licences
 
 - `docs/features.md` gains a **FastDraw diagrams** section: `.fdraw` tabs, view modes, pan and zoom, image
-  links in notes, dark themes, and Open in FastDraw (noting that the diagram travels after the `#`).
-  `docs/reference.md` lists the command.
+  links in notes, dark themes, look files only by relative path, and Open in FastDraw (the diagram travels
+  after the `#`). `docs/reference.md` lists the command.
 - `LICENSES.md` and `licenses/` gain FastDraw (MIT), Phosphor Icons (MIT) and the fonts the crate ships
-  (SIL Open Font License 1.1), via `tools/rust-crate-licenses.ps1` where it covers them.
-
-## 8. Order of work
-
-1. In the fastdraw repository: the `fastdraw-render` crate, its parity test in CI, and a crates.io release.
-2. In FastPad: §4–§7 against that release. Until it is published, FastPad's branch can use a `path` or
-   `git` dependency at a fixed commit, replaced by the exact version before merging.
+  (SIL Open Font License 1.1).
