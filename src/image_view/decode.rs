@@ -29,6 +29,8 @@ pub enum ImageError {
     Damaged,
     Missing,
     SvgTooLarge,
+    /// A FastDraw diagram that cannot be drawn: `Line n: message`.
+    Diagram(String),
     Read(String),
 }
 
@@ -40,7 +42,15 @@ impl ImageError {
             Self::Damaged => "The file is damaged or not an image.".to_owned(),
             Self::Missing => "The file no longer exists.".to_owned(),
             Self::SvgTooLarge => "The SVG is larger than 8 MB.".to_owned(),
-            Self::Read(text) => text.clone(),
+            Self::Diagram(text) | Self::Read(text) => text.clone(),
+        }
+    }
+
+    /// The heading of the failed state.
+    pub fn title(&self) -> &'static str {
+        match self {
+            Self::Diagram(_) => "FastPad can't draw this diagram",
+            _ => "FastPad can't display this image",
         }
     }
 }
@@ -54,11 +64,31 @@ pub struct FullImage {
     pub natural_height: u32,
     pub format: &'static str,
     pub pixels: Vec<u8>,
+    /// Set for a FastDraw diagram.
+    pub diagram: Option<DiagramFacts>,
+}
+
+/// What the view needs to know about a drawn diagram.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiagramFacts {
+    /// The look's paper colour, `0x00RRGGBB`, painted behind the picture instead of a checkerboard.
+    pub paper: u32,
+    /// The error the band shows over a drawing that is still shown (a refused look file).
+    pub band: Option<String>,
 }
 
 pub enum Source {
     File(PathBuf),
-    Svg { text: Arc<str>, width: u32 },
+    Svg {
+        text: Arc<str>,
+        width: u32,
+    },
+    FastDraw {
+        text: Arc<str>,
+        file: Option<PathBuf>,
+        dark: bool,
+        width: u32,
+    },
 }
 
 pub struct Decoded {
@@ -74,6 +104,12 @@ pub fn spawn(generation: u64, source: Source, max_side: u32, notify: HWND, messa
         let result = match &source {
             Source::File(path) => decode_file(path, max_side),
             Source::Svg { text, width } => decode_svg_source(text, *width, max_side),
+            Source::FastDraw {
+                text,
+                file,
+                dark,
+                width,
+            } => decode_fastdraw(text, file.as_deref(), *dark, *width, max_side),
         };
         let boxed = Box::into_raw(Box::new(Decoded { generation, result }));
         if unsafe { PostMessageW(notify as HWND, message, 0, boxed as isize) } == 0 {
@@ -268,6 +304,7 @@ pub fn decode_file(path: &Path, max_side: u32) -> Result<FullImage, ImageError> 
             natural_height,
             format,
             pixels,
+            diagram: None,
         })
     }
 }
@@ -328,6 +365,37 @@ pub fn decode_svg_source(
     target_width: u32,
     max_side: u32,
 ) -> Result<FullImage, ImageError> {
+    rasterize_svg(text, "SVG", target_width, max_side)
+}
+
+/// Draws a FastDraw diagram and rasterizes it like an SVG. Errors that hide the drawing fail the
+/// decode; a refused look file leaves the drawing with its error for the band.
+pub fn decode_fastdraw(
+    text: &str,
+    file: Option<&Path>,
+    dark: bool,
+    target_width: u32,
+    max_side: u32,
+) -> Result<FullImage, ImageError> {
+    let drawn = crate::preview::fastdraw::draw(text, file, dark);
+    let band = crate::preview::fastdraw::band_text(&drawn.errors);
+    if !drawn.show {
+        return Err(ImageError::Diagram(band.unwrap_or_default()));
+    }
+    let mut image = rasterize_svg(&drawn.svg, "FastDraw", target_width, max_side)?;
+    image.diagram = Some(DiagramFacts {
+        paper: drawn.paper,
+        band,
+    });
+    Ok(image)
+}
+
+fn rasterize_svg(
+    text: &str,
+    format: &'static str,
+    target_width: u32,
+    max_side: u32,
+) -> Result<FullImage, ImageError> {
     if text.len() as u64 > MAX_SVG_BYTES {
         return Err(ImageError::SvgTooLarge);
     }
@@ -340,8 +408,9 @@ pub fn decode_svg_source(
         height,
         natural_width,
         natural_height,
-        format: "SVG",
+        format,
         pixels,
+        diagram: None,
     })
 }
 
@@ -426,6 +495,77 @@ mod tests {
         assert_eq!(
             decode_file(&std::env::temp_dir().join("fastpad-missing.png"), 0).err(),
             Some(ImageError::Missing)
+        );
+    }
+
+    #[test]
+    fn a_fastdraw_diagram_decodes_with_its_paper_and_no_band() {
+        // Break caught: a diagram drawn without its paper colour, or a clean one with a band.
+        let image = decode_fastdraw(
+            "a: node \"A\" at 0,0
+",
+            None,
+            false,
+            0,
+            16_384,
+        )
+        .unwrap();
+        let facts = image.diagram.expect("diagram facts");
+        assert_eq!(facts.band, None);
+        assert_eq!(image.format, "FastDraw");
+        assert!(
+            image.width > 0
+                && image.pixels.len() == image.width as usize * image.height as usize * 4
+        );
+        let dark = decode_fastdraw(
+            "a: node \"A\" at 0,0
+",
+            None,
+            true,
+            0,
+            16_384,
+        )
+        .unwrap();
+        assert_ne!(dark.diagram.unwrap().paper, facts.paper);
+    }
+
+    #[test]
+    fn a_refused_look_still_draws_with_its_error_for_the_band() {
+        // Break caught: a diagram naming an absolute look path blanking, or its refusal unreported.
+        let text = "look \"//server/x.look\"
+a: rect \"A\" at 0,0
+";
+        let image = decode_fastdraw(text, None, false, 0, 16_384).unwrap();
+        assert_eq!(
+            image.diagram.unwrap().band.as_deref(),
+            Some(
+                "Line 1: FastPad reads look files only by a relative path; \"//server/x.look\" was not read"
+            )
+        );
+    }
+
+    #[test]
+    fn a_broken_diagram_fails_with_its_line_and_the_diagram_title() {
+        // Break caught: a broken diagram shown as "damaged image", or without its line number.
+        let error = decode_fastdraw(
+            "a: nosuchkind \"A\" at 0,0
+",
+            None,
+            false,
+            0,
+            16_384,
+        )
+        .err()
+        .expect("an error");
+        let ImageError::Diagram(text) = &error else {
+            panic!("{error:?}");
+        };
+        assert!(text.starts_with("Line 1: "), "{text}");
+        assert_eq!(error.message(), *text);
+        assert_eq!(error.title(), "FastPad can't draw this diagram");
+        assert_eq!(
+            ImageError::Damaged.title(),
+            "FastPad can't display this image"
         );
     }
 }

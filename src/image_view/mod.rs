@@ -73,7 +73,7 @@ pub enum Phase {
     Failed,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ImageStats {
     pub phase: Phase,
     pub scale: f32,
@@ -81,6 +81,8 @@ pub struct ImageStats {
     pub decodes: u32,
     pub has_target: bool,
     pub svg_error: bool,
+    /// The text the error band shows, when it shows.
+    pub band: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -99,6 +101,10 @@ enum Shown {
         stamp: Option<DiskStamp>,
     },
     Svg(Arc<str>),
+    FastDraw {
+        text: Arc<str>,
+        file: Option<PathBuf>,
+    },
 }
 
 struct ViewState {
@@ -117,6 +123,8 @@ struct ViewState {
     error: Option<ImageError>,
     /// The last SVG render failed while an earlier image is still shown.
     svg_error: bool,
+    /// The band's text for a diagram error; an SVG error uses the generic text.
+    band: Option<String>,
     loading: bool,
     loading_visible: bool,
     zoom: Zoom,
@@ -171,6 +179,7 @@ impl ImageView {
             image: None,
             error: None,
             svg_error: false,
+            band: None,
             loading: false,
             loading_visible: false,
             zoom: Zoom::Fit,
@@ -225,6 +234,7 @@ impl ImageView {
             }
             state.shown = Some(wanted);
             state.svg_error = false;
+            state.band = None;
             start_decode(state, Source::File(path.to_path_buf()));
         });
         finish(self.hwnd);
@@ -246,9 +256,39 @@ impl ImageView {
                 state.image = None;
                 state.bitmap = None;
             }
-            let width = svg_width(state);
-            state.shown = Some(Shown::Svg(Arc::clone(&text)));
-            start_decode(state, Source::Svg { text, width });
+            state.shown = Some(Shown::Svg(text));
+            start_svg_decode(state);
+        });
+        finish(self.hwnd);
+    }
+
+    /// Draws FastDraw source `text` (from `file`, the base of a relative look path) in the view's
+    /// light or dark look. Edits and new documents behave as for `show_svg`.
+    pub fn show_fastdraw(
+        &self,
+        text: Arc<str>,
+        file: Option<PathBuf>,
+        name: &str,
+        new_document: bool,
+    ) {
+        self.with(|state| {
+            state.name = name.to_owned();
+            if !new_document
+                && matches!(&state.shown, Some(Shown::FastDraw { text: shown, file: shown_file })
+                    if **shown == *text && *shown_file == file)
+            {
+                return;
+            }
+            if new_document || !matches!(state.shown, Some(Shown::FastDraw { .. })) {
+                state.zoom = Zoom::Fit;
+                state.offset = (0.0, 0.0);
+                state.image = None;
+                state.bitmap = None;
+                state.svg_error = false;
+                state.band = None;
+            }
+            state.shown = Some(Shown::FastDraw { text, file });
+            start_svg_decode(state);
         });
         finish(self.hwnd);
     }
@@ -270,6 +310,7 @@ impl ImageView {
             state.image = None;
             state.bitmap = None;
             state.svg_error = false;
+            state.band = None;
             state.error = Some(error);
         });
         finish(self.hwnd);
@@ -323,9 +364,15 @@ impl ImageView {
     pub fn set_appearance(&self, colors: PreviewColors, high_contrast: bool) {
         self.with(|state| {
             if state.colors != colors || state.high_contrast != high_contrast {
+                let relook = state.colors.is_dark() != colors.is_dark()
+                    && matches!(state.shown, Some(Shown::FastDraw { .. }));
                 state.colors = colors;
                 state.high_contrast = high_contrast;
                 state.checker = None;
+                // A diagram draws in the look that matches the theme.
+                if relook {
+                    start_svg_decode(state);
+                }
             }
         });
         invalidate(self.hwnd);
@@ -343,6 +390,12 @@ impl ImageView {
             decodes: state.decodes,
             has_target: state.target.is_some(),
             svg_error: state.svg_error,
+            band: state.svg_error.then(|| {
+                state
+                    .band
+                    .clone()
+                    .unwrap_or_else(|| paint::SVG_BAND_TEXT.to_owned())
+            }),
         })
         .unwrap_or_default()
     }
@@ -493,6 +546,27 @@ fn start_decode(state: &mut ViewState, source: Source) {
     );
 }
 
+/// Whether the view shows source that is drawn at the zoom (an SVG or a FastDraw diagram).
+fn shows_vector(state: &ViewState) -> bool {
+    matches!(state.shown, Some(Shown::Svg(_) | Shown::FastDraw { .. }))
+}
+
+/// Decodes the shown SVG or diagram again at the size the zoom wants.
+fn start_svg_decode(state: &mut ViewState) {
+    let width = svg_width(state);
+    let source = match state.shown.clone() {
+        Some(Shown::Svg(text)) => Source::Svg { text, width },
+        Some(Shown::FastDraw { text, file }) => Source::FastDraw {
+            text,
+            file,
+            dark: state.colors.is_dark(),
+            width,
+        },
+        _ => return,
+    };
+    start_decode(state, source);
+}
+
 fn stop_loading(state: &mut ViewState) {
     unsafe { KillTimer(state.hwnd, LOADING_TIMER) };
     state.loading = false;
@@ -511,9 +585,10 @@ fn accept_decoded(state: &mut ViewState, decoded: Decoded) {
     }
     stop_loading(state);
     state.decodes += 1;
-    let svg = matches!(state.shown, Some(Shown::Svg(_)));
+    let svg = shows_vector(state);
     match decoded.result {
         Ok(image) => {
+            let band = image.diagram.as_ref().and_then(|facts| facts.band.clone());
             // A reload whose pixel size changed starts at fit again (spec §6.5); an SVG re-render at
             // another zoom keeps its natural size, so its zoom stays.
             let resized = state.image.as_ref().is_some_and(|old| {
@@ -526,13 +601,19 @@ fn accept_decoded(state: &mut ViewState, decoded: Decoded) {
             state.image = Some(image);
             state.bitmap = None;
             state.error = None;
-            state.svg_error = false;
+            state.svg_error = band.is_some();
+            state.band = band;
         }
-        Err(_) if svg && state.image.is_some() => state.svg_error = true,
+        Err(error) if svg && state.image.is_some() => {
+            state.svg_error = true;
+            state.band = matches!(error, ImageError::Diagram(_)).then(|| error.message());
+        }
         Err(error) => {
             state.error = Some(error);
             state.image = None;
             state.bitmap = None;
+            state.svg_error = false;
+            state.band = None;
         }
     }
     recompute(state);
@@ -579,7 +660,7 @@ fn set_zoom(state: &mut ViewState, zoom: Zoom, anchor: (f32, f32)) {
         state.offset = zoom::zoom_about(state.offset, old, state.scale, anchor);
     }
     recompute(state);
-    if matches!(state.shown, Some(Shown::Svg(_))) {
+    if shows_vector(state) {
         unsafe {
             SetTimer(
                 state.hwnd,
@@ -870,10 +951,7 @@ unsafe extern "system" fn image_proc(
             if shrank {
                 with_state(hwnd, |state| match state.shown.clone() {
                     Some(Shown::File { path, .. }) => start_decode(state, Source::File(path)),
-                    Some(Shown::Svg(text)) => {
-                        let width = svg_width(state);
-                        start_decode(state, Source::Svg { text, width });
-                    }
+                    Some(Shown::Svg(_) | Shown::FastDraw { .. }) => start_svg_decode(state),
                     None => {}
                 });
             }
@@ -932,12 +1010,8 @@ unsafe extern "system" fn image_proc(
                 SVG_TIMER => {
                     with_state(hwnd, |state| {
                         unsafe { KillTimer(hwnd, SVG_TIMER) };
-                        let Some(Shown::Svg(text)) = state.shown.clone() else {
-                            return;
-                        };
-                        if svg_needs_render(state) {
-                            let width = svg_width(state);
-                            start_decode(state, Source::Svg { text, width });
+                        if shows_vector(state) && svg_needs_render(state) {
+                            start_svg_decode(state);
                         }
                     });
                 }
@@ -1101,9 +1175,12 @@ fn focused(hwnd: HWND) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        DestroyWindow, MSG, PM_REMOVE, PeekMessageW, PostQuitMessage, WM_QUIT,
-    };
+    use super::*;
+    use crate::platform::theme::Theme;
+    use crate::preview::colors::preview_colors;
+    use crate::preview::render::TestWindow;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{DispatchMessageW, TranslateMessage};
 
     #[test]
     fn destroying_the_view_keeps_a_posted_quit_for_the_message_loop() {
@@ -1127,5 +1204,106 @@ mod tests {
         };
         assert_ne!(found, 0, "the quit message was swallowed");
         assert_eq!(message.wParam, 7);
+    }
+
+    const GOOD: &str = "a: node \"A\" at 0,0
+";
+    const REFUSED: &str = "look \"//server/x.look\"
+a: rect \"A\" at 0,0
+";
+    const BROKEN: &str = "a: nosuchkind \"A\" at 0,0
+";
+
+    fn view_in(parent: &TestWindow) -> ImageView {
+        let graphics = Rc::new(Graphics::load().unwrap());
+        let view = ImageView::create(
+            parent.0,
+            graphics,
+            preview_colors(Theme::Light, false),
+            false,
+        )
+        .unwrap();
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::MoveWindow(view.hwnd, 0, 0, 400, 300, 0);
+        }
+        view
+    }
+
+    fn pump_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut msg = MSG::default();
+            while unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
+                unsafe {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            if done() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn settle(view: &ImageView, decodes: u32) {
+        pump_until("a decode", || {
+            let stats = view.stats();
+            stats.decodes >= decodes && stats.phase != Phase::Loading
+        });
+    }
+
+    #[test]
+    fn a_diagram_with_a_refused_look_shows_with_a_band() {
+        // Break caught: the refusal blanking the drawing, or going unreported.
+        let parent = TestWindow::new(400, 300);
+        let view = view_in(&parent);
+        view.show_fastdraw(REFUSED.into(), None, "d.fdraw", true);
+        settle(&view, 1);
+        let stats = view.stats();
+        assert_eq!(stats.phase, Phase::Ready);
+        assert!(stats.svg_error);
+        assert!(
+            stats
+                .band
+                .unwrap()
+                .starts_with("Line 1: FastPad reads look files")
+        );
+        view.show_fastdraw(GOOD.into(), None, "d.fdraw", false);
+        settle(&view, 2);
+        let stats = view.stats();
+        assert!(!stats.svg_error && stats.band.is_none());
+    }
+
+    #[test]
+    fn a_broken_edit_keeps_the_last_drawing_under_a_band() {
+        // Break caught: typing through a half-written line blanking the view.
+        let parent = TestWindow::new(400, 300);
+        let view = view_in(&parent);
+        view.show_fastdraw(GOOD.into(), None, "d.fdraw", true);
+        settle(&view, 1);
+        let size = view.status().size;
+        assert!(size.is_some());
+        view.show_fastdraw(BROKEN.into(), None, "d.fdraw", false);
+        settle(&view, 2);
+        let stats = view.stats();
+        assert_eq!(stats.phase, Phase::Ready);
+        assert!(stats.band.unwrap().starts_with("Line 1: "));
+        assert_eq!(view.status().size, size);
+    }
+
+    #[test]
+    fn a_broken_first_diagram_shows_the_failed_state() {
+        // Break caught: a new document with an error showing another document's picture or nothing.
+        let parent = TestWindow::new(400, 300);
+        let view = view_in(&parent);
+        view.show_fastdraw(GOOD.into(), None, "d.fdraw", true);
+        settle(&view, 1);
+        view.show_fastdraw(BROKEN.into(), None, "e.fdraw", true);
+        settle(&view, 2);
+        let stats = view.stats();
+        assert_eq!(stats.phase, Phase::Failed);
+        assert!(!stats.svg_error && stats.band.is_none());
     }
 }
