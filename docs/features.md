@@ -275,6 +275,12 @@ your session.
 PNG, JPEG, GIF, WebP and more open in an image tab you can zoom and pan. SVGs open as text, with
 their rendered preview beside the source. The notebook lists images next to your notes.
 
+- **Click to zoom:** over a picture the pointer is a magnifying glass. Click to zoom in there; hold
+  `Ctrl` and the glass shows a minus, and a click zooms out. Drag to pan a picture larger than the view.
+- **Pick a zoom level:** click the zoom in the status bar for a list of levels, from Fit to 1600%.
+- **Zoom follows what you see:** in an SVG, diagram or Markdown Preview, the zoom keys, `Ctrl`+wheel
+  and the status bar act on the preview, and in Split on whichever side has the focus.
+
 ## FastDraw diagrams
 
 A `.fdraw` file is a diagram written as text. It opens as the **FastDraw** language with the same
@@ -282,8 +288,8 @@ Source / Split / Preview control as Markdown.
 
 - **Opens drawn:** a tab with a file and text opens in Preview, an empty or untitled one in Source, and
   FastPad remembers the choice you make for that tab.
-- **Preview like an SVG:** fit to the window, zoom with `Ctrl`+wheel, `+`, `-` and `0` or a double-click,
-  and drag to pan. The background is the diagram's own paper colour.
+- **Preview like an SVG:** fit to the window, zoom with `Ctrl`+wheel, `+`, `-` and `0` or a click
+  (`Ctrl`+click zooms out), and drag to pan. The background is the diagram's own paper colour.
 - **Split redraws as you type.** A mistake keeps the last good drawing and puts a band at the top, such
   as "Line 3: ...", with the first error found.
 - **Dark themes:** on a dark FastPad theme a diagram draws in its look's dark counterpart (night, for the

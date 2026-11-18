@@ -382,6 +382,8 @@ pub(crate) enum PickerKind {
     Language,
     /// Save with encoding: a click on the status bar's encoding. The pick saves the tab in it.
     Encoding,
+    /// The zoom level of whatever the active tab zooms, from a click on the status bar's zoom.
+    Zoom,
 }
 
 /// The most rows quick open lists (spec §3.3).
@@ -1295,6 +1297,7 @@ impl CommandPalette {
             ),
             PickerKind::Language => Some(LANGUAGE_PLACEHOLDER),
             PickerKind::Encoding => Some(ENCODING_PLACEHOLDER),
+            PickerKind::Zoom => Some(crate::window::zoom_host::ZOOM_PLACEHOLDER),
             PickerKind::RecentFolder
             | PickerKind::MoveToNotebook
             | PickerKind::MoveToFolder

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, IsWindowVisible, MSG, PM_QS_INPUT, PM_REMOVE, PeekMessageW, SendMessageW,
-    TranslateMessage, WM_COMMAND, WM_LBUTTONDBLCLK, WM_PAINT,
+    TranslateMessage, WM_COMMAND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_PAINT,
 };
 
 struct TestMain {
@@ -237,8 +237,62 @@ fn a_small_image_shows_at_100_percent_and_zoom_commands_step_and_reset() {
     assert_eq!(view.stats().scale, 0.67);
     main.command(CommandId::ZoomReset);
     assert_eq!(view.stats().scale, 1.0);
-    unsafe { SendMessageW(view.hwnd(), WM_LBUTTONDBLCLK, 0, 0) };
-    assert_eq!(view.stats().scale, 1.0); // fit is already 100% for a small image
+}
+
+/// A click at client (10, 10) on `view`, with Ctrl held when `ctrl`.
+fn click(view: image_view::ImageView, ctrl: bool) {
+    const MK_CONTROL: usize = 0x0008;
+    let keys = if ctrl { MK_CONTROL } else { 0 };
+    let at = (10 << 16) | 10;
+    unsafe {
+        SendMessageW(view.hwnd(), WM_LBUTTONDOWN, keys | 1, at);
+        SendMessageW(view.hwnd(), WM_LBUTTONUP, keys, at);
+    }
+}
+
+#[test]
+fn a_click_zooms_the_image_in_and_a_ctrl_click_zooms_it_out() {
+    // Break caught: the magnifier pointer doing nothing when clicked, Ctrl+click zooming in, or
+    // a click that only focuses the view.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let dir = scratch("click-zoom");
+    let path = dir.join("small.bmp");
+    write_bmp(&path, 64, 32);
+    main.open(&path).unwrap();
+    let view = main.image_view();
+    assert_eq!(main.wait_ready().scale, 1.0);
+    click(view, false);
+    assert_eq!(view.stats().scale, 1.5);
+    click(view, true);
+    click(view, true);
+    assert_eq!(view.stats().scale, 0.67);
+}
+
+#[test]
+fn the_zoom_picker_lists_fit_and_the_steps_and_sets_the_picked_level() {
+    // Break caught: a picked level applied to the hidden editor, or the rows off by one from the
+    // levels they name.
+    use crate::window::command_palette::{PickerChoice, PickerKind};
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let dir = scratch("zoom-picker");
+    let path = dir.join("small.bmp");
+    write_bmp(&path, 64, 32);
+    main.open(&path).unwrap();
+    let view = main.image_view();
+    main.wait_ready();
+    window::zoom_host::open_picker(main.hwnd);
+    // Row 0 is Fit; the steps follow it.
+    let row = 1 + image_view::zoom::STEPS
+        .iter()
+        .position(|step| *step == 4.0)
+        .unwrap();
+    window::library_host::picked(main.hwnd, PickerKind::Zoom, PickerChoice::Item(row));
+    assert_eq!(view.stats().scale, 4.0);
+    window::zoom_host::open_picker(main.hwnd);
+    window::library_host::picked(main.hwnd, PickerKind::Zoom, PickerChoice::Item(0));
+    assert_eq!(view.zoom(), image_view::zoom::Zoom::Fit);
 }
 
 #[test]
@@ -542,6 +596,39 @@ fn an_svg_opens_as_text_and_the_preview_renders_and_follows_edits() {
         view.stats().svg_error
     });
     assert_eq!(view.status().size, Some((80, 20)));
+}
+
+#[test]
+fn zoom_in_an_svg_preview_zooms_the_picture_and_the_status_bar_shows_it() {
+    // Break caught: Ctrl+plus in an SVG's Preview zooming the hidden editor, and the status bar
+    // showing the editor's 100% while the picture is zoomed.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let dir = scratch("svg-zoom");
+    let path = dir.join("logo.svg");
+    std::fs::write(
+        &path,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="40" height="20"/></svg>"#,
+    )
+    .unwrap();
+    main.open(&path).unwrap();
+    pump_pending();
+    main.command(CommandId::MarkdownViewPreview);
+    let view = main
+        .with_app(|app| app.active_group().unwrap().preview.svg_view)
+        .expect("svg view");
+    pump_until("svg rendered", Duration::from_secs(5), || {
+        view.stats().phase == image_view::Phase::Ready
+    });
+    // Focus elsewhere must not send the zoom back to the hidden editor.
+    unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(main.hwnd) };
+    main.command(CommandId::ZoomIn);
+    assert_eq!(view.stats().scale, 1.5);
+    assert_eq!(
+        main.with_app(|app| app.editor().unwrap().zoom().unwrap()),
+        0
+    );
+    assert_eq!(window::zoom_host::percent(main.hwnd), 150);
 }
 
 /// How long the FastDraw preview gets to draw. FastDraw renders unoptimized in test builds, and a

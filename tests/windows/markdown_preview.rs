@@ -211,6 +211,41 @@ fn the_split_preview_and_source_segments_show_their_modes() {
 }
 
 #[test]
+fn zoom_in_a_markdown_preview_zooms_the_preview_and_split_follows_the_focus() {
+    // Break caught: the Markdown preview never zooming, Ctrl+plus in Preview zooming the hidden
+    // editor, or Split zooming the preview while the editor has the focus.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    main.make_markdown("# Title\n\ntext\n");
+    main.command(CommandId::MarkdownViewPreview);
+    pump_pending();
+    main.command(CommandId::ZoomIn);
+    assert_eq!(main.with_app(|app| app.preview_zoom), 110);
+    assert_eq!(
+        main.with_app(|app| app.editor().unwrap().zoom().unwrap()),
+        0
+    );
+    assert_eq!(window::zoom_host::percent(main.hwnd), 110);
+    main.command(CommandId::MarkdownViewSplit);
+    pump_pending();
+    unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(main.editor) };
+    main.command(CommandId::ZoomIn);
+    assert_eq!(main.with_app(|app| app.preview_zoom), 110);
+    assert_eq!(
+        main.with_app(|app| app.editor().unwrap().zoom().unwrap()),
+        1
+    );
+    let preview = main.view().expect("preview").hwnd();
+    unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(preview) };
+    main.command(CommandId::ZoomReset);
+    assert_eq!(main.with_app(|app| app.preview_zoom), 100);
+    assert_eq!(
+        main.with_app(|app| app.editor().unwrap().zoom().unwrap()),
+        1
+    );
+}
+
+#[test]
 fn ctrl_shift_v_cycles_source_split_preview_live() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();

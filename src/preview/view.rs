@@ -71,6 +71,8 @@ const CLASS_NAME: &str = "FastPadPreview";
 pub const ACTIVATE_DISCLOSURE: usize = 1;
 /// `MK_SHIFT` from WinUser.h; its windows-sys home needs a feature FastPad does not enable.
 const MK_SHIFT: u32 = 0x0004;
+/// `MK_CONTROL` from WinUser.h, for the same reason.
+const MK_CONTROL: u32 = 0x0008;
 const MK_LBUTTON: u32 = 0x0001;
 const PADDING: f32 = 16.0;
 const MAX_CENTERED_WIDTH: f32 = 980.0;

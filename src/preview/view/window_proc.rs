@@ -91,6 +91,18 @@ pub(super) unsafe extern "system" fn preview_proc(
             invalidate(hwnd);
             0
         }
+        WM_MOUSEWHEEL if (wparam & 0xFFFF) as u32 & MK_CONTROL != 0 => {
+            let delta = ((wparam >> 16) & 0xFFFF) as u16 as i16;
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                    crate::platform::win32::root_window(hwnd),
+                    crate::window::WM_FASTPAD_PREVIEW_ZOOM,
+                    usize::from(delta > 0),
+                    0,
+                )
+            };
+            0
+        }
         WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
             let delta = ((wparam >> 16) & 0xFFFF) as u16 as i16 as f32;
             let keys = (wparam & 0xFFFF) as u32;

@@ -411,7 +411,7 @@ fn apply_chrome_colors_to(editor: &Editor, palette: Palette, highlight_current_l
 }
 
 /// Every group's editor, the active group's first.
-pub(super) fn all_editors(hwnd: HWND) -> Vec<Editor> {
+pub(crate) fn all_editors(hwnd: HWND) -> Vec<Editor> {
     unsafe { app_ptr(hwnd) }
         .map(|app| {
             let app = unsafe { app.as_ref() };

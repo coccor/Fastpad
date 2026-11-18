@@ -78,7 +78,9 @@ Hand edits keep your comments and other lines; the palette and Settings rewrite 
 |---|---|
 | `FastDraw: Open in FastDraw` | Opens the `.fdraw` diagram in the editor at fastdraw.dev in your browser; the diagram travels after the `#` and no server receives it. Also the toolbar button left of the view control. |
 
-In a diagram's Preview, `Ctrl`+wheel, `+`, `-` and `0` zoom, a double-click fits, and dragging pans.
+In a diagram's Preview, `Ctrl`+wheel, `+`, `-` and `0` zoom, a click zooms in and `Ctrl`+click out,
+and dragging pans. Clicking the zoom in the status bar lists the zoom levels of whatever the tab zooms:
+the editor, an image, or a preview that is showing (in Split, the side with the focus).
 
 ## Command line
 

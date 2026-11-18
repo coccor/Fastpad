@@ -6,6 +6,7 @@
 //! `ReleaseCapture`, `NotifyWinEvent`) run only after the state borrow ends, in `finish`.
 
 pub mod accessible;
+mod cursor;
 pub mod decode;
 mod paint;
 pub mod zoom;
@@ -34,21 +35,22 @@ use windows_sys::Win32::UI::Accessibility::NotifyWinEvent;
 use windows_sys::Win32::UI::Controls::SetScrollInfo;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, ReleaseCapture, SetCapture, SetFocus, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT,
-    VK_PRIOR, VK_RIGHT, VK_UP,
+    GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_DOWN, VK_END,
+    VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, CS_DBLCLKS, CreateWindowExW, DLGC_WANTARROWS, DefWindowProcW, DestroyWindow,
-    EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_VALUECHANGE, GWLP_USERDATA, GetClientRect, GetScrollInfo,
-    GetWindowLongPtrW, HTCLIENT, IDC_ARROW, IDC_SIZEALL, KillTimer, LoadCursorW, MSG, OBJID_CLIENT,
-    PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SB_BOTTOM, SB_HORZ,
-    SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN, SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP,
-    SB_VERT, SCROLLINFO, SIF_PAGE, SIF_POS, SIF_RANGE, SIF_TRACKPOS, SetCursor, SetTimer,
-    SetWindowLongPtrW, WM_CAPTURECHANGED, WM_DPICHANGED_AFTERPARENT, WM_ERASEBKGND, WM_GETDLGCODE,
-    WM_GETOBJECT, WM_HSCROLL, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_QUIT,
-    WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS,
-    WS_HSCROLL, WS_TABSTOP, WS_VSCROLL,
+    EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_VALUECHANGE, GWLP_USERDATA, GetClientRect, GetCursorPos,
+    GetScrollInfo, GetSystemMetrics, GetWindowLongPtrW, HCURSOR, HTCLIENT, IDC_ARROW, IDC_SIZEALL,
+    KillTimer, LoadCursorW, MSG, OBJID_CLIENT, PM_REMOVE, PeekMessageW, PostMessageW,
+    PostQuitMessage, RegisterClassW, SB_BOTTOM, SB_HORZ, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN,
+    SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO, SIF_PAGE, SIF_POS,
+    SIF_RANGE, SIF_TRACKPOS, SM_CXDRAG, SM_CYDRAG, SetCursor, SetTimer, SetWindowLongPtrW,
+    WM_CAPTURECHANGED, WM_DPICHANGED_AFTERPARENT, WM_ERASEBKGND, WM_GETDLGCODE, WM_GETOBJECT,
+    WM_HSCROLL, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_QUIT, WM_SETCURSOR,
+    WM_SETFOCUS, WM_SIZE, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS, WS_HSCROLL,
+    WS_TABSTOP, WS_VSCROLL, WindowFromPoint,
 };
 use zoom::Zoom;
 
@@ -149,6 +151,11 @@ struct ViewState {
     offset: (f32, f32),
     /// Pointer position and offset when a drag started.
     drag: Option<((i32, i32), (f32, f32))>,
+    /// Where the left button went down, until it comes up: released without moving past the drag
+    /// distance, the press is a click that zooms.
+    press: Option<(i32, i32)>,
+    /// The press moved past the drag distance, so it pans instead of zooming.
+    moved: bool,
     max_side: u32,
     decodes: u32,
     paint_retried: bool,
@@ -208,6 +215,8 @@ impl ImageView {
             scale: 1.0,
             offset: (0.0, 0.0),
             drag: None,
+            press: None,
+            moved: false,
             max_side: DEFAULT_MAX_SIDE,
             decodes: 0,
             paint_retried: false,
@@ -342,6 +351,7 @@ impl ImageView {
             state.title_format = None;
             state.body_format = None;
             state.drag = None;
+            state.press = None;
             state.tile_timer = false;
             unsafe {
                 KillTimer(state.hwnd, SVG_TIMER);
@@ -367,17 +377,25 @@ impl ImageView {
         finish(self.hwnd);
     }
 
+    /// The zoom asked for: fit, or a fixed scale.
+    pub fn zoom(&self) -> Zoom {
+        self.with(|state| state.zoom).unwrap_or(Zoom::Fit)
+    }
+
+    /// Zooms to `zoom` about the middle of the view, as a level picked from a list.
+    pub fn set_zoom(&self, zoom: Zoom) {
+        self.with(|state| {
+            let (width, height) = client_size(state.hwnd);
+            set_zoom(state, zoom, (width / 2.0, height / 2.0));
+        });
+        finish(self.hwnd);
+    }
+
     pub fn zoom_reset(&self) {
         self.with(|state| {
             let (width, height) = client_size(state.hwnd);
             set_zoom(state, Zoom::Fit, (width / 2.0, height / 2.0));
         });
-        finish(self.hwnd);
-    }
-
-    /// Double-click: fit ↔ 100%, keeping the image point under `anchor` still.
-    pub fn toggle_actual_size(&self, anchor: (f32, f32)) {
-        self.with(|state| toggle_actual_size(state, anchor));
         finish(self.hwnd);
     }
 
@@ -824,14 +842,6 @@ fn recompute_scale_only(state: &mut ViewState) {
     };
 }
 
-fn toggle_actual_size(state: &mut ViewState, anchor: (f32, f32)) {
-    let zoom = match state.zoom {
-        Zoom::Fit => Zoom::Scale(1.0),
-        Zoom::Scale(_) => Zoom::Fit,
-    };
-    set_zoom(state, zoom, anchor);
-}
-
 /// The image's displayed size in client pixels, or `None` with nothing to show.
 fn shown_size(state: &ViewState) -> Option<(f32, f32)> {
     state.image.as_ref().map(|image| {
@@ -1197,68 +1207,96 @@ unsafe extern "system" fn image_proc(
             finish(hwnd);
             0
         }
-        WM_LBUTTONDOWN => {
+        // A click zooms in about the pointer and Ctrl+click zooms out; a press that moves past the
+        // drag distance pans a picture larger than the view instead. The second press of a
+        // double-click is another click.
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
             unsafe { SetFocus(hwnd) };
             let point = point_from(lparam);
-            let dragging = with_state(hwnd, |state| {
-                let dragging = draggable(state);
-                if dragging {
-                    state.drag = Some((point, state.offset));
-                }
-                dragging
-            })
-            .unwrap_or(false);
-            if dragging {
-                unsafe { SetCapture(hwnd) };
-            }
+            with_state(hwnd, |state| {
+                state.press = Some(point);
+                state.moved = false;
+                state.drag = draggable(state).then_some((point, state.offset));
+            });
+            unsafe { SetCapture(hwnd) };
             0
         }
         WM_MOUSEMOVE => {
             let (x, y) = point_from(lparam);
-            let moved = with_state(hwnd, |state| {
-                let Some(((start_x, start_y), start)) = state.drag else {
-                    return false;
+            let slop = drag_slop();
+            let (panned, started) = with_state(hwnd, |state| {
+                let Some((press_x, press_y)) = state.press else {
+                    return (false, false);
+                };
+                let started =
+                    !state.moved && ((x - press_x).abs() > slop.0 || (y - press_y).abs() > slop.1);
+                state.moved |= started;
+                let Some(((start_x, start_y), start)) = state.drag.filter(|_| state.moved) else {
+                    return (false, started);
                 };
                 state.offset = (
                     start.0 + (x - start_x) as f32,
                     start.1 + (y - start_y) as f32,
                 );
                 recompute(state);
-                true
+                (true, started)
             })
-            .unwrap_or(false);
-            if moved {
+            .unwrap_or((false, false));
+            if started {
+                set_pointer(hwnd);
+            }
+            if panned {
                 finish(hwnd);
             }
             0
         }
         WM_LBUTTONUP => {
-            let dragging = with_state(hwnd, |state| state.drag.take().is_some()).unwrap_or(false);
-            if dragging {
-                unsafe { ReleaseCapture() };
+            let (x, y) = point_from(lparam);
+            let clicked = with_state(hwnd, |state| {
+                let clicked = state.press.take().is_some() && !state.moved;
+                state.drag = None;
+                state.moved = false;
+                clicked
+            })
+            .unwrap_or(false);
+            unsafe { ReleaseCapture() };
+            if clicked {
+                let out = (wparam as u32) & MK_CONTROL != 0;
+                with_state(hwnd, |state| {
+                    let new = if out {
+                        zoom::step_out(state.scale)
+                    } else {
+                        zoom::step_in(state.scale)
+                    };
+                    set_zoom(state, Zoom::Scale(new), (x as f32, y as f32));
+                });
+                finish(hwnd);
             }
+            set_pointer(hwnd);
             0
         }
         WM_CAPTURECHANGED => {
-            with_state(hwnd, |state| state.drag = None);
-            0
-        }
-        WM_LBUTTONDBLCLK => {
-            let (x, y) = point_from(lparam);
             with_state(hwnd, |state| {
-                toggle_actual_size(state, (x as f32, y as f32))
+                state.drag = None;
+                state.press = None;
+                state.moved = false;
             });
-            finish(hwnd);
             0
         }
         WM_SETCURSOR if (lparam & 0xFFFF) as u32 == HTCLIENT => {
-            let cursor = if with_state(hwnd, |state| draggable(state)).unwrap_or(false) {
-                IDC_SIZEALL
-            } else {
-                IDC_ARROW
-            };
-            unsafe { SetCursor(LoadCursorW(std::ptr::null_mut(), cursor)) };
+            unsafe { SetCursor(pointer(hwnd)) };
             1
+        }
+        // Ctrl turns the magnifier's plus into a minus while the pointer is over the picture.
+        WM_KEYDOWN | WM_KEYUP if wparam as u16 == VK_CONTROL => {
+            if pointer_over(hwnd) {
+                set_pointer(hwnd);
+            }
+            if message == WM_KEYDOWN {
+                unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+            } else {
+                0
+            }
         }
         WM_KEYDOWN => {
             let line = PAN_STEP * dpi_scale(hwnd);
@@ -1310,6 +1348,43 @@ unsafe extern "system" fn image_proc(
         }
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
     }
+}
+
+/// The pointer over the view: the move arrows while a press pans, the magnifier over a picture
+/// (a minus while Ctrl is down), else the arrow.
+fn pointer(hwnd: HWND) -> HCURSOR {
+    let (panning, ready) = with_state(hwnd, |state| {
+        (
+            state.moved && state.drag.is_some(),
+            phase(state) == Phase::Ready,
+        )
+    })
+    .unwrap_or((false, false));
+    let stock = |id| unsafe { LoadCursorW(std::ptr::null_mut(), id) };
+    if panning {
+        return stock(IDC_SIZEALL);
+    }
+    if !ready {
+        return stock(IDC_ARROW);
+    }
+    let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL)) } < 0;
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    cursor::magnifier(dpi, !ctrl).unwrap_or_else(|| stock(IDC_ARROW))
+}
+
+fn set_pointer(hwnd: HWND) {
+    unsafe { SetCursor(pointer(hwnd)) };
+}
+
+/// Whether the mouse pointer is over the view itself.
+fn pointer_over(hwnd: HWND) -> bool {
+    let mut point = POINT { x: 0, y: 0 };
+    (unsafe { GetCursorPos(&mut point) }) != 0 && unsafe { WindowFromPoint(point) } == hwnd
+}
+
+/// How far a press moves before it pans instead of clicking.
+fn drag_slop() -> (i32, i32) {
+    unsafe { (GetSystemMetrics(SM_CXDRAG), GetSystemMetrics(SM_CYDRAG)) }
 }
 
 /// Whether `hwnd` holds the keyboard focus, for the focus ring.

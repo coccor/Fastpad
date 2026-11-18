@@ -311,6 +311,7 @@ pub(super) fn current_status_bar(hwnd: HWND) -> Option<crate::window::status::St
             &image,
         ));
     }
+    let zoom_percent = crate::window::zoom_host::percent(hwnd);
     let app = unsafe { app_ptr(hwnd) }?;
     let app = unsafe { app.as_ref() };
     app.status.as_ref()?;
@@ -321,10 +322,7 @@ pub(super) fn current_status_bar(hwnd: HWND) -> Option<crate::window::status::St
             language: document.language,
             encoding: document.encoding,
             read_only: document.read_only,
-            zoom_percent: crate::window::status::editor_zoom_percent(
-                app.settings.font_size,
-                editor.zoom().unwrap_or(0),
-            ),
+            zoom_percent,
         })
     });
     let mut bar = crate::window::status::status_bar_text(&app.notifications, active);
@@ -400,35 +398,59 @@ pub(super) fn notice_contains(hwnd: HWND, y: i32) -> bool {
     current_status_text(hwnd).is_some() && status_bar_rect(hwnd).is_some_and(|rect| y >= rect.top)
 }
 
-/// The language or encoding shown in the bottom bar at client point (`x`, `y`), which a click
-/// changes. `None` off the bar, for an image tab, and while no tab is open.
+/// The zoom, language or encoding shown in the bottom bar at client point (`x`, `y`), which a
+/// click changes. An image tab offers only its zoom. `None` off the bar and while no tab is open.
 pub(super) fn status_detail_at(
     hwnd: HWND,
     x: i32,
     y: i32,
 ) -> Option<crate::window::status::StatusTarget> {
+    use crate::window::status::{DETAILS_SEPARATOR, StatusTarget};
     if !status_bar_rect(hwnd).is_some_and(|rect| y >= rect.top && y < rect.bottom) {
         return None;
     }
+    let fonts = title_chrome(hwnd).1;
     if crate::window::image_host::active_is_image(hwnd) {
-        return None;
+        // The image's zoom ends its details.
+        let zoom = format!(
+            "{}%",
+            crate::window::image_host::status(hwnd)?.zoom_percent?
+        );
+        return crate::window::titlebar::status_detail_at(
+            hwnd,
+            fonts,
+            x,
+            &[(StatusTarget::Zoom, &zoom, &zoom)],
+        );
     }
+    let bar = current_status_bar(hwnd)?;
     let (language, encoding) = {
         let app = unsafe { app_ptr(hwnd) }?;
         let document = unsafe { app.as_ref() }.tabs.active()?;
-        (document.language, document.encoding)
+        (
+            crate::window::status::language_name(document.language),
+            crate::window::status::encoding_name(document.encoding),
+        )
     };
-    let fonts = title_chrome(hwnd).1;
+    let zoom = bar
+        .right
+        .split(DETAILS_SEPARATOR)
+        .next()
+        .unwrap_or_default();
+    let tail = format!("{language}{DETAILS_SEPARATOR}{encoding}");
     crate::window::titlebar::status_detail_at(
         hwnd,
         fonts,
         x,
-        crate::window::status::language_name(language),
-        crate::window::status::encoding_name(encoding),
+        &[
+            (StatusTarget::Zoom, &bar.right, zoom),
+            (StatusTarget::Language, &tail, language),
+            (StatusTarget::Encoding, encoding, encoding),
+        ],
     )
 }
 
-/// Shows the hand over the bar's language and encoding, which open a picker when clicked.
+/// Shows the hand over the bar's zoom, language and encoding, which open a picker when clicked.
 pub(super) fn set_status_detail_cursor(hwnd: HWND) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetCursorPos, IDC_HAND, LoadCursorW, SetCursor,
