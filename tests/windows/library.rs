@@ -522,6 +522,9 @@ fn a_new_note_is_named_inline_and_saved_into_the_opened_folder() {
         FastPadProcess::spawn_with_local_app_data([data.folder()], &data.root).unwrap();
     let hwnd = process.wait_for_main_window(WAIT).unwrap();
     let editor = find_child_by_class(hwnd, "Scintilla").unwrap();
+    // Save names the note into the folder only once the folder's state has loaded; sent sooner it
+    // finds no state (CI failed here intermittently).
+    wait_for_library(&data);
     send_text(editor, "Grocery list").unwrap();
     command(hwnd, CommandId::Save);
     wait_until("the name box to take focus", || {
