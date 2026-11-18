@@ -2,8 +2,9 @@
 //! the parsed tree becomes Direct2D geometry once, and every paint replays it under the view's zoom
 //! and pan. Zooming never renders pixels ahead of time, so there is no blurred picture waiting to
 //! sharpen. A pattern's tile is drawn again, sharp, whenever the zoom changes its size on screen.
-//! A tree using what this does not draw (`drawable` says no: filters, masks, embedded images,
-//! blend modes, nested clips) keeps the resvg raster path.
+//! Embedded SVG images (FastDraw's icons) are drawn as part of the tree. A tree using what this
+//! does not draw (`drawable` says no: filters, masks, embedded raster images, blend modes, nested
+//! clips) keeps the resvg raster path.
 
 use resvg::tiny_skia::{PathSegment, Point, Transform};
 use resvg::usvg;
@@ -50,7 +51,11 @@ fn node_drawable(node: &usvg::Node) -> bool {
                     .is_none_or(|stroke| paint_drawable(stroke.paint()))
         }
         usvg::Node::Text(text) => group_drawable(text.flattened()),
-        usvg::Node::Image(_) => false,
+        // An embedded SVG (FastDraw's icons) is a tree like any other; a raster image is not.
+        usvg::Node::Image(image) => match image.kind() {
+            usvg::ImageKind::SVG(tree) => !image.is_visible() || group_drawable(tree.root()),
+            _ => false,
+        },
     }
 }
 
@@ -336,7 +341,14 @@ impl Builder<'_> {
                 usvg::Node::Group(group) => self.group(group, transform)?,
                 usvg::Node::Path(path) => self.path(path, transform)?,
                 usvg::Node::Text(text) => self.group(text.flattened(), transform)?,
-                usvg::Node::Image(_) => {}
+                // As resvg: the embedded tree drawn where the image's group placed it.
+                usvg::Node::Image(image) => {
+                    if let usvg::ImageKind::SVG(tree) = image.kind()
+                        && image.is_visible()
+                    {
+                        self.group_children(tree.root(), transform)?;
+                    }
+                }
             }
         }
         Ok(())
@@ -857,8 +869,10 @@ mod tests {
 
     #[test]
     fn filters_masks_blend_modes_and_images_stay_on_resvg() {
-        // Break caught: a blurred or masked SVG drawn by Direct2D without its effect.
+        // Break caught: a blurred or masked SVG, or a photo inside one, drawn by Direct2D
+        // without its effect or its picture.
         for body in [
+            r#"<image width="2" height="2" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="/>"#,
             r#"<filter id="f"><feGaussianBlur stdDeviation="2"/></filter><rect width="10" height="10" filter="url(#f)"/>"#,
             r#"<mask id="m"><rect width="5" height="5" fill="white"/></mask><rect width="10" height="10" mask="url(#m)"/>"#,
             r#"<rect width="10" height="10" style="mix-blend-mode:multiply"/>"#,
@@ -878,7 +892,18 @@ mod tests {
     }
 
     /// `tree` drawn by Direct2D at `size`, as premultiplied BGRA: offscreen, on a WIC bitmap.
-    fn gpu_pixels(tree: &usvg::Tree, (width, height): (u32, u32)) -> Vec<u8> {
+    fn gpu_pixels(tree: &usvg::Tree, size: (u32, u32)) -> Vec<u8> {
+        gpu_region(tree, (size.0 as f32, size.1 as f32), (0, 0), size)
+    }
+
+    /// The `size` pixels at `origin` of `tree` drawn `picture` pixels large, as
+    /// `svg::rasterize_region` takes them.
+    fn gpu_region(
+        tree: &usvg::Tree,
+        picture: (f32, f32),
+        origin: (u32, u32),
+        (width, height): (u32, u32),
+    ) -> Vec<u8> {
         use windows::Win32::Graphics::Direct2D::Common::{
             D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
         };
@@ -919,7 +944,7 @@ mod tests {
             target.BeginDraw();
             target.Clear(Some(&D2D1_COLOR_F::default()));
             scene
-                .draw(&target, (0.0, 0.0), (width as f32, height as f32))
+                .draw(&target, (-(origin.0 as f32), -(origin.1 as f32)), picture)
                 .unwrap();
             target.EndDraw(None, None).unwrap();
             let mut pixels = vec![0; (width * height * 4) as usize];
@@ -955,6 +980,163 @@ mod tests {
         .unwrap();
     }
 
+    /// How far Direct2D's pixels are from resvg's: the mean of each pixel's largest channel
+    /// difference, and the share of pixels off by more than 64 of 255.
+    fn difference(gpu: &[u8], cpu: &[u8]) -> (f64, f64) {
+        let differences = gpu
+            .chunks(4)
+            .zip(cpu.chunks(4))
+            .map(|(a, b)| a.iter().zip(b).map(|(x, y)| x.abs_diff(*y)).max().unwrap())
+            .collect::<Vec<_>>();
+        let count = differences.len().max(1) as f64;
+        (
+            differences.iter().map(|&d| f64::from(d)).sum::<f64>() / count,
+            differences.iter().filter(|&&d| d > 64).count() as f64 / count,
+        )
+    }
+
+    /// Direct2D | resvg | their difference (red), side by side, as a PNG in `FASTPAD_VECTOR_PNGS`.
+    fn save_comparison(name: &str, gpu: &[u8], cpu: &[u8], (width, height): (u32, u32)) {
+        let mut row = Vec::with_capacity((width * height * 12) as usize);
+        for y in 0..height as usize {
+            let line = |pixels: &[u8]| {
+                pixels[y * width as usize * 4..(y + 1) * width as usize * 4].to_vec()
+            };
+            row.extend(line(gpu));
+            row.extend(line(cpu));
+            for x in 0..width as usize {
+                let at = (y * width as usize + x) * 4;
+                let d = (0..4)
+                    .map(|c| gpu[at + c].abs_diff(cpu[at + c]))
+                    .max()
+                    .unwrap();
+                let d = (u32::from(d) * 4).min(255) as u8;
+                row.extend([0, 0, d, 255]);
+            }
+        }
+        save(name, &row, (width * 3, height));
+    }
+
+    /// Every `.svg` and `.fdraw` under the folders in `FASTPAD_VECTOR_CORPUS` (separated by `;`),
+    /// drawn by Direct2D and by resvg, whole and as a 400% crop of the middle, and compared;
+    /// diagrams in their light and dark looks. Prints what stays on resvg and why, and every
+    /// picture that differs, saving those comparisons when `FASTPAD_VECTOR_PNGS` is set.
+    /// `cargo test --release --lib vector_corpus -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn vector_corpus() {
+        let Some(folders) = std::env::var_os("FASTPAD_VECTOR_CORPUS") else {
+            return;
+        };
+        let mut files = Vec::new();
+        for folder in folders.to_string_lossy().split(';') {
+            let mut pending = vec![std::path::PathBuf::from(folder)];
+            while let Some(folder) = pending.pop() {
+                for entry in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+                    let path = entry.path();
+                    let skipped = path.file_name().is_some_and(|name| {
+                        matches!(
+                            name.to_str(),
+                            Some("target" | "node_modules" | ".git" | ".worktrees")
+                        )
+                    });
+                    if path.is_dir() && !skipped {
+                        pending.push(path);
+                    } else if matches!(
+                        path.extension().and_then(|e| e.to_str()),
+                        Some("svg" | "fdraw")
+                    ) {
+                        files.push(path);
+                    }
+                }
+            }
+        }
+        files.sort();
+        let (mut gpu_count, mut raster, mut unreadable, mut failures) =
+            (0, Vec::new(), 0, Vec::new());
+        for path in &files {
+            let Ok(text) = std::fs::read_to_string(path) else {
+                unreadable += 1;
+                continue;
+            };
+            let diagram = path.extension().is_some_and(|e| e == "fdraw");
+            let variants: Vec<(String, String)> = if diagram {
+                [false, true]
+                    .into_iter()
+                    .filter_map(|dark| {
+                        let drawn = crate::preview::fastdraw::draw(&text, Some(path), dark);
+                        drawn
+                            .show
+                            .then(|| (if dark { "dark" } else { "light" }.to_owned(), drawn.svg))
+                    })
+                    .collect()
+            } else {
+                vec![(String::new(), text)]
+            };
+            for (variant, source) in variants {
+                let label = format!("{} {variant}", path.display());
+                let Ok(tree) = crate::preview::svg::parse(&source) else {
+                    unreadable += 1;
+                    continue;
+                };
+                if !drawable(&tree) {
+                    raster.push(label);
+                    continue;
+                }
+                gpu_count += 1;
+                let natural = crate::preview::svg::natural_size(&tree);
+                // The whole picture, at most 800 pixels a side.
+                let fit = (800.0 / natural.0.max(natural.1) as f32).min(4.0);
+                let whole = (
+                    ((natural.0 as f32 * fit).round() as u32).max(1),
+                    ((natural.1 as f32 * fit).round() as u32).max(1),
+                );
+                let picture = (whole.0 as f32, whole.1 as f32);
+                let checks = [
+                    ("whole", picture, (0, 0), whole),
+                    (
+                        "400%",
+                        (picture.0 * 4.0, picture.1 * 4.0),
+                        (
+                            whole.0 * 2 - whole.0.min(400) / 2,
+                            whole.1 * 2 - whole.1.min(400) / 2,
+                        ),
+                        (whole.0.min(400), whole.1.min(400)),
+                    ),
+                ];
+                for (check, picture, origin, size) in checks {
+                    let gpu = gpu_region(&tree, picture, origin, size);
+                    let cpu = crate::preview::svg::rasterize_region(&tree, picture, origin, size)
+                        .unwrap();
+                    let (mean, far) = difference(&gpu, &cpu);
+                    let differs = mean >= 3.0 || far >= 0.02;
+                    if differs || std::env::var_os("FASTPAD_VECTOR_SAVE_ALL").is_some() {
+                        let name = format!(
+                            "{}-{variant}-{check}",
+                            path.file_stem().unwrap().to_string_lossy()
+                        )
+                        .replace('%', "pct");
+                        save_comparison(&name, &gpu, &cpu, size);
+                    }
+                    if differs {
+                        failures.push(format!("{label} {check}: mean {mean:.2}, far {far:.4}"));
+                    }
+                }
+            }
+        }
+        println!(
+            "CORPUS {} files: {gpu_count} pictures drawn by Direct2D, {} left to resvg, {unreadable} not drawable at all",
+            files.len(),
+            raster.len()
+        );
+        for label in &raster {
+            println!("RESVG {label}");
+        }
+        for failure in &failures {
+            println!("DIFFERS {failure}");
+        }
+        assert!(failures.is_empty(), "{} pictures differ", failures.len());
+    }
     #[test]
     fn direct2d_draws_what_resvg_draws() {
         // Break caught: a transform, gradient, stroke style, clip or opacity translated wrong, so
@@ -999,6 +1181,14 @@ mod tests {
                 <pattern id="checks" width="0.25" height="0.5" patternTransform="rotate(20)"><rect width="10" height="10" fill="#c33"/></pattern></defs>
                 <rect width="200" height="120" fill="#fafaf7"/><rect width="200" height="120" fill="url(#dots)"/>
                 <rect x="110" y="20" width="80" height="80" fill="url(#checks)" fill-opacity="0.7" stroke="#000"/></svg>"##,
+            ),
+            (
+                "embedded-svg",
+                // FastDraw places its icons as SVG images inside the diagram.
+                r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="120">
+                <rect width="200" height="120" fill="#eef"/>
+                <image x="20" y="20" width="80" height="80" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cdefs%3E%3ClinearGradient id='a' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%2332d4f5'/%3E%3Cstop offset='1' stop-color='%23198ab3'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect x='1' y='3' width='16' height='12' rx='2' fill='url(%23a)'/%3E%3Ccircle cx='9' cy='9' r='3' fill='%23fff'/%3E%3C/svg%3E"/>
+                <image x="120" y="30" width="60" height="30" preserveAspectRatio="xMidYMid meet" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'%3E%3Ccircle cx='5' cy='5' r='5' fill='%23e5484d'/%3E%3C/svg%3E"/></svg>"##,
             ),
         ];
         // A real FastDraw diagram: its look paints the paper with a dot pattern.
