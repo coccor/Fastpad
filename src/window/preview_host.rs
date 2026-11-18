@@ -310,13 +310,14 @@ pub(crate) fn group_mode(hwnd: HWND, id: GroupId) -> ViewMode {
         with_group_host(hwnd, id, |host| host.modes.insert(document, first));
         chosen = Some(first);
     }
-    let default = match language {
-        Language::Markdown => unsafe { host_window::app_ptr(hwnd) }.map_or(
-            ViewMode::Source,
-            |app| unsafe { app.as_ref() }.settings.markdown_view,
-        ),
-        _ => ViewMode::Source,
-    };
+    let default = unsafe { host_window::app_ptr(hwnd) }.map_or(ViewMode::Source, |app| {
+        let settings = &unsafe { app.as_ref() }.settings;
+        match language {
+            Language::Markdown => settings.markdown_view,
+            Language::Svg => settings.svg_view,
+            _ => ViewMode::Source,
+        }
+    });
     let mode = chosen.unwrap_or(default);
     // The default skips a file over the Live limit silently; a choice was checked when made.
     if available(hwnd, id, language, mode) {
@@ -399,24 +400,24 @@ pub(crate) fn carry_mode(hwnd: HWND, from: GroupId, document: DocumentId, to: Gr
     });
 }
 
-/// Records `default` as the mode of every open Markdown tab that has not chosen one, so a new
-/// `markdown_view` setting changes only the tabs opened after it: the ones already open keep
-/// showing what they show. Nothing needs syncing.
-pub(crate) fn keep_open_markdown_modes(hwnd: HWND, default: ViewMode) {
+/// Records `default` as the mode of every open `language` tab that has not chosen one, so a new
+/// `markdown_view` or `svg_view` setting changes only the tabs opened after it: the ones already
+/// open keep showing what they show. Nothing needs syncing.
+pub(crate) fn keep_open_modes(hwnd: HWND, language: Language, default: ViewMode) {
     let Some(mut app) = (unsafe { host_window::app_ptr(hwnd) }) else {
         return;
     };
     let app = unsafe { app.as_mut() };
     for id in app.tabs.group_ids() {
-        let markdown = app
+        let matching = app
             .tabs
             .group_documents(id)
             .into_iter()
-            .filter(|document| document.language == Language::Markdown)
+            .filter(|document| document.language == language)
             .map(|document| document.id)
             .collect::<Vec<_>>();
         if let Some(group) = app.group_mut(id) {
-            for document in markdown {
+            for document in matching {
                 group.preview.modes.entry(document).or_insert(default);
             }
         }

@@ -53,10 +53,29 @@ pub(super) fn set_markdown_view(hwnd: HWND, mode: crate::preview::ViewMode) {
     else {
         return;
     };
-    crate::window::preview_host::keep_open_markdown_modes(hwnd, previous);
+    crate::window::preview_host::keep_open_modes(
+        hwnd,
+        crate::document::Language::Markdown,
+        previous,
+    );
     change_setting(hwnd, |settings| {
         settings.markdown_view = mode;
         Some(("markdown_view", mode.token().to_owned()))
+    });
+}
+
+/// Sets the view SVG tabs open in. As with Markdown, the tabs already open keep what they show.
+pub(super) fn set_svg_view(hwnd: HWND, mode: crate::preview::ViewMode) {
+    let Some(previous) = (unsafe { app_ptr(hwnd) })
+        .map(|app| unsafe { app.as_ref() }.settings.svg_view)
+        .filter(|&previous| previous != mode)
+    else {
+        return;
+    };
+    crate::window::preview_host::keep_open_modes(hwnd, crate::document::Language::Svg, previous);
+    change_setting(hwnd, |settings| {
+        settings.svg_view = mode;
+        Some(("svg_view", mode.token().to_owned()))
     });
 }
 
@@ -71,6 +90,7 @@ pub(crate) fn apply_settings_action(
         SettingsAction::SetTheme(theme) => set_theme(hwnd, theme),
         SettingsAction::SetFileIcons(set) => set_file_icons(hwnd, set),
         SettingsAction::SetMarkdownView(mode) => set_markdown_view(hwnd, mode),
+        SettingsAction::SetSvgView(mode) => set_svg_view(hwnd, mode),
         SettingsAction::SetFontFace(face) => change_setting(hwnd, |settings| {
             (settings.font_face != face).then(|| {
                 settings.font_face.clone_from(&face);
@@ -236,11 +256,12 @@ pub(crate) fn change_setting(
         .is_some_and(|app| unsafe { app.as_ref() }.settings.theme != previous_theme);
     // The sidebar's view, width and icon set change only the sidebar, which their callers redo,
     // the Settings dialog's size only that dialog, and the window's placement only the next
-    // start, and the Markdown view only the tabs opened next; the editor and the Markdown
-    // preview are not restyled for them.
+    // start, and the Markdown and SVG views only the tabs opened next; the editor and the
+    // Markdown preview are not restyled for them.
     let sidebar_only = matches!(
         key,
         "markdown_view"
+            | "svg_view"
             | "sidebar_view"
             | "sidebar_width"
             | "file_icons"

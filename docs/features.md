@@ -14,7 +14,8 @@ typing. Both panes scroll together.
   source with the preview beside it; drag the divider to resize it) or **Preview** (full width).
   Pick one in the toolbar under the tabs (which also shows where the file lives) or View → Markdown
   view, or press `Ctrl+Shift+V` to cycle through them. Each tab keeps its own view, and Escape leaves Preview.
-  SVG files get Source, Split and Preview.
+  SVG files get Source, Split and Preview. **Markdown view** and **SVG view** in Settings (or
+  `markdown_view=` and `svg_view=`) pick the view each kind of tab opens in.
 - Select and copy text in the preview as in a browser: drag (it scrolls at the edges),
   double-click a word, triple-click a paragraph, Shift+click to extend, `Ctrl+A` for everything.
   `Ctrl+C` or right-click → Copy puts plain text on the clipboard, without Markdown markers,

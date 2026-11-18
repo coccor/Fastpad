@@ -60,6 +60,7 @@ line in a notification and applies the rest.
 | `capture_hotkey` | A key like `Ctrl+Alt+N`; empty turns it off | `Ctrl+Alt+N` |
 | `capture_source` | `true`/`false`: note the window you were in when you pressed the capture hotkey | `false` |
 | `markdown_view` | `source`, `live`, `split`, `preview`: the view Markdown tabs open in (also **Settings > Markdown view**) | `source` |
+| `svg_view` | `source`, `split`, `preview`: the view SVG tabs open in (also **Settings > SVG view**) | `source` |
 | `theme` | `system`, `light`, `dark`, `catppuccin`, `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha`, `paper-lamp`, `paper`, `lamp` | `system` |
 | `recovery_interval_seconds` | Seconds between recovery snapshots | `30` |
 | `restore_session` | `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` | `true` |

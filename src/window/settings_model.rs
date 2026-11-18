@@ -43,6 +43,7 @@ pub(crate) enum Row {
     PreviewFontSize,
     PreviewLineHeight,
     MarkdownView,
+    SvgView,
     TabWidth,
     InsertSpaces,
     WordWrap,
@@ -56,7 +57,7 @@ pub(crate) enum Row {
 }
 
 impl Row {
-    pub(crate) const ALL: [Self; 18] = [
+    pub(crate) const ALL: [Self; 19] = [
         Self::Theme,
         Self::FileIcons,
         Self::Font,
@@ -65,6 +66,7 @@ impl Row {
         Self::PreviewFontSize,
         Self::PreviewLineHeight,
         Self::MarkdownView,
+        Self::SvgView,
         Self::TabWidth,
         Self::InsertSpaces,
         Self::WordWrap,
@@ -87,6 +89,7 @@ impl Row {
             Self::PreviewFontSize => "Preview font size",
             Self::PreviewLineHeight => "Preview line height",
             Self::MarkdownView => "Markdown view",
+            Self::SvgView => "SVG view",
             Self::TabWidth => "Tab width",
             Self::InsertSpaces => "Indent with spaces",
             Self::WordWrap => "Word wrap",
@@ -113,7 +116,9 @@ impl Row {
     pub(crate) const fn control(self) -> Control {
         match self {
             Self::Theme | Self::Font | Self::PreviewFont => Control::Dropdown,
-            Self::FileIcons | Self::MarkdownView | Self::TabWidth => Control::Segmented,
+            Self::FileIcons | Self::MarkdownView | Self::SvgView | Self::TabWidth => {
+                Control::Segmented
+            }
             Self::FontSize | Self::PreviewFontSize | Self::PreviewLineHeight => Control::Stepper,
             _ => Control::Check,
         }
@@ -195,6 +200,9 @@ pub(crate) const FILE_ICON_CHOICES: [(FileIconSet, &str); 3] = [
 /// The Markdown view row's segments: the view Markdown tabs open in (`markdown_view=`).
 pub(crate) const MARKDOWN_VIEW_CHOICES: [ViewMode; 4] = ViewMode::ALL;
 
+/// The SVG view row's segments: the view SVG tabs open in (`svg_view=`).
+pub(crate) const SVG_VIEW_CHOICES: [ViewMode; 3] = ViewMode::SVG;
+
 pub(crate) const TAB_WIDTH_CHOICES: [u8; 3] = [2, 4, 8];
 
 /// The font size the stepper and the palette's font-size commands keep within.
@@ -211,6 +219,8 @@ pub(crate) enum SettingsAction {
     SetFileIcons(FileIconSet),
     /// The view Markdown tabs open in. Tabs already open keep what they show.
     SetMarkdownView(ViewMode),
+    /// The view SVG tabs open in. Tabs already open keep what they show.
+    SetSvgView(ViewMode),
     SetFontFace(String),
     SetPreviewFont(String),
     SetFontSize(u16),
@@ -274,6 +284,13 @@ impl SettingsView {
                     selected: self.settings.markdown_view == mode,
                 })
                 .collect(),
+            Row::SvgView => SVG_VIEW_CHOICES
+                .iter()
+                .map(|&mode| Segment {
+                    label: mode.label().to_owned(),
+                    selected: self.settings.svg_view == mode,
+                })
+                .collect(),
             Row::TabWidth => {
                 let width = self.settings.tab_width;
                 let mut segments = TAB_WIDTH_CHOICES
@@ -311,6 +328,9 @@ impl SettingsView {
             Row::MarkdownView => MARKDOWN_VIEW_CHOICES
                 .get(index)
                 .map(|&mode| SettingsAction::SetMarkdownView(mode)),
+            Row::SvgView => SVG_VIEW_CHOICES
+                .get(index)
+                .map(|&mode| SettingsAction::SetSvgView(mode)),
             Row::TabWidth => TAB_WIDTH_CHOICES
                 .get(index)
                 .map(|&width| SettingsAction::SetTabWidth(width)),
@@ -768,8 +788,8 @@ mod tests {
         }
         let sections = Row::ALL.map(Row::section);
         assert_eq!(&sections[..2], [Section::Appearance; 2]);
-        assert_eq!(&sections[2..15], [Section::Editor; 13]);
-        assert_eq!(&sections[15..], [Section::NotesAndSession; 3]);
+        assert_eq!(&sections[2..16], [Section::Editor; 14]);
+        assert_eq!(&sections[16..], [Section::NotesAndSession; 3]);
         for (index, section) in Section::ALL.into_iter().enumerate() {
             assert_eq!(section as usize, index);
         }
@@ -954,6 +974,29 @@ mod tests {
             Some(SettingsAction::SetMarkdownView(ViewMode::Live))
         );
         assert_eq!(view.segment_action(Row::MarkdownView, 4), None);
+    }
+
+    #[test]
+    fn the_svg_view_row_offers_three_modes_without_live_and_selects_the_setting() {
+        // Break caught: an SVG row offering Live, or showing `markdown_view` instead of `svg_view`.
+        let mut view = view();
+        assert_eq!(
+            view.segments(Row::SvgView)
+                .iter()
+                .map(|s| s.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Source", "Split", "Preview"]
+        );
+        assert_eq!(view.selected_segment(Row::SvgView), Some(0));
+        view.settings.markdown_view = ViewMode::Split;
+        assert_eq!(view.selected_segment(Row::SvgView), Some(0));
+        view.settings.svg_view = ViewMode::Preview;
+        assert_eq!(view.selected_segment(Row::SvgView), Some(2));
+        assert_eq!(
+            view.segment_action(Row::SvgView, 1),
+            Some(SettingsAction::SetSvgView(ViewMode::Split))
+        );
+        assert_eq!(view.segment_action(Row::SvgView, 3), None);
     }
 
     #[test]
