@@ -138,6 +138,72 @@ zune-jpeg = { opt-level = "s" }
 [profile.dev.package."*"]
 debug = "line-tables-only"
 
+# The SVG, diagram and image stack runs 10-20x slower unoptimized: a debug build would take
+# seconds to draw an SVG that a release build draws in 0.1 s. Optimized here, they compile once.
+[profile.dev.package.resvg]
+opt-level = 3
+debug = "line-tables-only"
+
+[profile.dev.package.usvg]
+opt-level = 3
+debug = "line-tables-only"
+
+[profile.dev.package.tiny-skia]
+opt-level = 3
+debug = "line-tables-only"
+
+[profile.dev.package.tiny-skia-path]
+opt-level = 3
+debug = "line-tables-only"
+
+[profile.dev.package.svgtypes]
+opt-level = 3
+debug = "line-tables-only"
+
+[profile.dev.package.roxmltree]
+opt-level = 3
+debug = "line-tables-only"
+
+[profile.dev.package.harfrust]
+opt-level = 3
+debug = "line-tables-only"
+
+[profile.dev.package.ttf-parser]
+opt-level = 3
+debug = "line-tables-only"
+
+[profile.dev.package.fontdb]
+opt-level = 3
+debug = "line-tables-only"
+
+[profile.dev.package.fastdraw-render]
+opt-level = 3
+debug = "line-tables-only"
+
+[profile.dev.package.mermaid-rs-renderer]
+opt-level = 3
+debug = "line-tables-only"
+
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+debug = "line-tables-only"
+
+[profile.dev.package.png]
+opt-level = 3
+debug = "line-tables-only"
+
+[profile.dev.package.fdeflate]
+opt-level = 3
+debug = "line-tables-only"
+
+[profile.dev.package.image-webp]
+opt-level = 3
+debug = "line-tables-only"
+
+[profile.dev.package.gif]
+opt-level = 3
+debug = "line-tables-only"
+
 [profile.release-size]
 inherits = "release"
 opt-level = "z"
