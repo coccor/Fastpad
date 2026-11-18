@@ -1,91 +1,99 @@
 //! The magnifying-glass pointers over a picture: a click zooms in (a plus in the lens), Ctrl+click
-//! zooms out (a minus). Drawn in code at the cursor size for the view's DPI as black strokes with
-//! a white outline and a white lens, so they read on any picture. Windows has no stock magnifier.
+//! zooms out (a minus). Windows has no stock magnifier, so it is drawn here, anti-aliased with
+//! tiny-skia, at the cursor size for the view's DPI and about the size of the arrow: black strokes
+//! with a soft white halo and a pale lens, so it reads on any picture.
 
+use resvg::tiny_skia::{Color, FillRule, LineCap, Paint, PathBuilder, Pixmap, Stroke, Transform};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::Graphics::Gdi::{
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS,
+    DeleteObject,
+};
 use windows_sys::Win32::UI::HiDpi::GetSystemMetricsForDpi;
-use windows_sys::Win32::UI::WindowsAndMessaging::{CreateCursor, HCURSOR, SM_CXCURSOR};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    CreateIconIndirect, HCURSOR, ICONINFO, SM_CXCURSOR,
+};
 
-/// What one cursor pixel shows.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Pixel {
-    Clear,
-    Black,
-    White,
-}
-
-/// The drawing is laid out on a 32-pixel grid and scaled to the cursor size.
+/// The drawing is laid out on the 32-pixel cursor cell of 96 DPI and scaled to the cursor size.
 const GRID: f32 = 32.0;
-const LENS: (f32, f32) = (12.0, 12.0);
-const LENS_INNER: f32 = 7.0;
-const LENS_OUTER: f32 = 9.5;
-const OUTLINE: f32 = 1.25;
-const HANDLE_FROM: (f32, f32) = (18.5, 18.5);
-const HANDLE_TO: (f32, f32) = (27.5, 27.5);
-const HANDLE_HALF_WIDTH: f32 = 1.9;
-const SIGN_HALF_LENGTH: f32 = 4.0;
-const SIGN_HALF_WIDTH: f32 = 1.0;
+const LENS: (f32, f32) = (8.5, 8.5);
+const LENS_RADIUS: f32 = 5.5;
+const RING_WIDTH: f32 = 1.6;
+const HANDLE_FROM: (f32, f32) = (12.6, 12.6);
+const HANDLE_TO: (f32, f32) = (18.0, 18.0);
+const HANDLE_WIDTH: f32 = 2.6;
+const SIGN_HALF_LENGTH: f32 = 2.6;
+const SIGN_WIDTH: f32 = 1.4;
+/// How far the white halo reaches past every black stroke.
+const HALO: f32 = 1.1;
 
-/// The magnifier's pixels at `size` × `size`, row by row: a plus in the lens when `plus`, else a
-/// minus.
-pub(crate) fn magnifier_pixels(size: u32, plus: bool) -> Vec<Pixel> {
+/// The magnifier at `size` × `size` as straight-alpha BGRA rows, top row first: a plus in the lens
+/// when `plus`, else a minus. `None` only if tiny-skia cannot make the canvas.
+pub(crate) fn magnifier_bgra(size: u32, plus: bool) -> Option<Vec<u8>> {
+    let mut pixmap = Pixmap::new(size, size)?;
     let scale = size as f32 / GRID;
-    let mut pixels = Vec::with_capacity((size * size) as usize);
-    for row in 0..size {
-        for column in 0..size {
-            let x = (column as f32 + 0.5) / scale;
-            let y = (row as f32 + 0.5) / scale;
-            pixels.push(pixel_at(x, y, plus));
-        }
+    let transform = Transform::from_scale(scale, scale);
+    let black = paint(Color::from_rgba8(0, 0, 0, 255));
+    let halo = paint(Color::from_rgba8(255, 255, 255, 235));
+    let lens = paint(Color::from_rgba8(255, 255, 255, 190));
+
+    let circle = PathBuilder::from_circle(LENS.0, LENS.1, LENS_RADIUS)?;
+    let handle = line(HANDLE_FROM, HANDLE_TO)?;
+    let mut sign = PathBuilder::new();
+    sign.move_to(LENS.0 - SIGN_HALF_LENGTH, LENS.1);
+    sign.line_to(LENS.0 + SIGN_HALF_LENGTH, LENS.1);
+    if plus {
+        sign.move_to(LENS.0, LENS.1 - SIGN_HALF_LENGTH);
+        sign.line_to(LENS.0, LENS.1 + SIGN_HALF_LENGTH);
     }
-    pixels
+    let sign = sign.finish()?;
+
+    // The halo under everything, then the pale lens, then the black strokes.
+    let halo_width = |width: f32| stroke(width + 2.0 * HALO, LineCap::Round);
+    pixmap.stroke_path(&circle, &halo, &halo_width(RING_WIDTH), transform, None);
+    pixmap.stroke_path(&handle, &halo, &halo_width(HANDLE_WIDTH), transform, None);
+    pixmap.fill_path(&circle, &lens, FillRule::Winding, transform, None);
+    pixmap.stroke_path(&sign, &halo, &halo_width(SIGN_WIDTH), transform, None);
+    let ring = stroke(RING_WIDTH, LineCap::Round);
+    pixmap.stroke_path(&circle, &black, &ring, transform, None);
+    let grip = stroke(HANDLE_WIDTH, LineCap::Round);
+    pixmap.stroke_path(&handle, &black, &grip, transform, None);
+    let bars = stroke(SIGN_WIDTH, LineCap::Butt);
+    pixmap.stroke_path(&sign, &black, &bars, transform, None);
+
+    Some(
+        pixmap
+            .pixels()
+            .iter()
+            .flat_map(|pixel| {
+                let color = pixel.demultiply();
+                [color.blue(), color.green(), color.red(), color.alpha()]
+            })
+            .collect(),
+    )
 }
 
-fn pixel_at(x: f32, y: f32, plus: bool) -> Pixel {
-    let lens = (x - LENS.0).hypot(y - LENS.1);
-    let handle = distance_to_segment((x, y), HANDLE_FROM, HANDLE_TO);
-    let (dx, dy) = ((x - LENS.0).abs(), (y - LENS.1).abs());
-    let across = dx <= SIGN_HALF_LENGTH && dy <= SIGN_HALF_WIDTH;
-    let down = plus && dy <= SIGN_HALF_LENGTH && dx <= SIGN_HALF_WIDTH;
-    let ring = (LENS_INNER..=LENS_OUTER).contains(&lens);
-    if ring || handle <= HANDLE_HALF_WIDTH || across || down {
-        Pixel::Black
-    } else if lens <= LENS_OUTER + OUTLINE || handle <= HANDLE_HALF_WIDTH + OUTLINE {
-        Pixel::White
-    } else {
-        Pixel::Clear
+fn paint(color: Color) -> Paint<'static> {
+    let mut paint = Paint::default();
+    paint.set_color(color);
+    paint.anti_alias = true;
+    paint
+}
+
+fn stroke(width: f32, line_cap: LineCap) -> Stroke {
+    Stroke {
+        width,
+        line_cap,
+        ..Stroke::default()
     }
 }
 
-fn distance_to_segment(point: (f32, f32), from: (f32, f32), to: (f32, f32)) -> f32 {
-    let (vx, vy) = (to.0 - from.0, to.1 - from.1);
-    let along =
-        (((point.0 - from.0) * vx + (point.1 - from.1) * vy) / (vx * vx + vy * vy)).clamp(0.0, 1.0);
-    (point.0 - (from.0 + vx * along)).hypot(point.1 - (from.1 + vy * along))
-}
-
-/// The AND and XOR planes `CreateCursor` takes: rows of bits, most significant first, each row
-/// padded to a 16-bit boundary. AND 1 keeps the screen; XOR 1 over AND 0 is white.
-pub(crate) fn cursor_planes(pixels: &[Pixel], size: u32) -> (Vec<u8>, Vec<u8>) {
-    let stride = size.div_ceil(16) as usize * 2;
-    let mut and = vec![0xFF_u8; stride * size as usize];
-    let mut xor = vec![0_u8; stride * size as usize];
-    for (index, pixel) in pixels.iter().enumerate() {
-        let (row, column) = (index / size as usize, index % size as usize);
-        let byte = row * stride + column / 8;
-        let bit = 0x80 >> (column % 8);
-        match pixel {
-            Pixel::Clear => {}
-            Pixel::Black => and[byte] &= !bit,
-            Pixel::White => {
-                and[byte] &= !bit;
-                xor[byte] |= bit;
-            }
-        }
-    }
-    (and, xor)
+fn line(from: (f32, f32), to: (f32, f32)) -> Option<resvg::tiny_skia::Path> {
+    let mut path = PathBuilder::new();
+    path.move_to(from.0, from.1);
+    path.line_to(to.0, to.1);
+    path.finish()
 }
 
 thread_local! {
@@ -100,66 +108,118 @@ pub(crate) fn magnifier(dpi: u32, plus: bool) -> Option<HCURSOR> {
     if let Some(cursor) = CURSORS.with(|cursors| cursors.borrow().get(&(size, plus)).copied()) {
         return Some(cursor as HCURSOR);
     }
-    let (and, xor) = cursor_planes(&magnifier_pixels(size, plus), size);
-    let hotspot = (LENS.0 * size as f32 / GRID).round() as i32;
-    let cursor = unsafe {
-        CreateCursor(
-            GetModuleHandleW(std::ptr::null()),
-            hotspot,
-            hotspot,
-            size as i32,
-            size as i32,
-            and.as_ptr().cast(),
-            xor.as_ptr().cast(),
-        )
-    };
-    if cursor.is_null() {
-        return None;
-    }
+    let pixels = magnifier_bgra(size, plus)?;
+    let hotspot = (LENS.0 * size as f32 / GRID).round() as u32;
+    let cursor = create_cursor(&pixels, size, hotspot)?;
     CURSORS.with(|cursors| cursors.borrow_mut().insert((size, plus), cursor as usize));
     Some(cursor)
 }
 
+/// A 32-bit alpha cursor from straight-alpha BGRA rows.
+fn create_cursor(pixels: &[u8], size: u32, hotspot: u32) -> Option<HCURSOR> {
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: size as i32,
+            // Negative: rows run top to bottom, as `pixels` does.
+            biHeight: -(size as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits = std::ptr::null_mut();
+    let color = unsafe {
+        CreateDIBSection(
+            std::ptr::null_mut(),
+            &info,
+            DIB_RGB_COLORS,
+            &mut bits,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if color.is_null() {
+        return None;
+    }
+    if bits.is_null() {
+        unsafe { DeleteObject(color) };
+        return None;
+    }
+    // SAFETY: the section holds `size * size` 32-bit pixels, exactly `pixels.len()` bytes.
+    unsafe { std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits.cast::<u8>(), pixels.len()) };
+    // The alpha channel decides what shows; the mask must still exist, all zero.
+    let mask_bits = vec![0_u8; size.div_ceil(16) as usize * 2 * size as usize];
+    let mask = unsafe { CreateBitmap(size as i32, size as i32, 1, 1, mask_bits.as_ptr().cast()) };
+    let cursor = if mask.is_null() {
+        std::ptr::null_mut()
+    } else {
+        let info = ICONINFO {
+            fIcon: 0,
+            xHotspot: hotspot,
+            yHotspot: hotspot,
+            hbmMask: mask,
+            hbmColor: color,
+        };
+        unsafe { CreateIconIndirect(&info) }
+    };
+    // The cursor keeps its own copies of both bitmaps.
+    unsafe {
+        DeleteObject(color);
+        if !mask.is_null() {
+            DeleteObject(mask);
+        }
+    }
+    (!cursor.is_null()).then_some(cursor)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Pixel, cursor_planes, magnifier_pixels};
+    use super::magnifier_bgra;
 
-    fn at(pixels: &[Pixel], size: u32, x: u32, y: u32) -> Pixel {
-        pixels[(y * size + x) as usize]
+    /// The (blue, green, red, alpha) of pixel (`x`, `y`).
+    fn at(pixels: &[u8], size: u32, x: u32, y: u32) -> (u8, u8, u8, u8) {
+        let index = ((y * size + x) * 4) as usize;
+        (
+            pixels[index],
+            pixels[index + 1],
+            pixels[index + 2],
+            pixels[index + 3],
+        )
     }
 
     #[test]
     fn the_plus_has_a_vertical_bar_and_the_minus_does_not() {
         // Break caught: Ctrl showing the same pointer as a plain hover.
-        let plus = magnifier_pixels(32, true);
-        let minus = magnifier_pixels(32, false);
-        assert_eq!(at(&plus, 32, 12, 9), Pixel::Black);
-        assert_eq!(at(&minus, 32, 12, 9), Pixel::White);
-        assert_eq!(at(&plus, 32, 9, 12), Pixel::Black);
-        assert_eq!(at(&minus, 32, 9, 12), Pixel::Black);
+        let plus = magnifier_bgra(32, true).unwrap();
+        let minus = magnifier_bgra(32, false).unwrap();
+        assert_eq!(at(&plus, 32, 8, 6), (0, 0, 0, 255));
+        assert!(at(&minus, 32, 8, 6).0 > 200);
+        assert_eq!(at(&minus, 32, 6, 8), (0, 0, 0, 255));
     }
 
     #[test]
-    fn the_corners_stay_clear_and_the_handle_reaches_the_bottom_right() {
-        // Break caught: an opaque square cursor hiding the picture, or the handle missing.
-        let pixels = magnifier_pixels(48, true);
-        assert_eq!(at(&pixels, 48, 0, 47), Pixel::Clear);
-        assert_eq!(at(&pixels, 48, 47, 0), Pixel::Clear);
-        assert_eq!(at(&pixels, 48, 38, 38), Pixel::Black);
+    fn the_glass_stays_about_the_size_of_the_arrow() {
+        // Break caught: a pointer filling the whole cursor cell, as the first version did.
+        for size in [32, 48] {
+            let pixels = magnifier_bgra(size, true).unwrap();
+            let reach = (0..size)
+                .flat_map(|y| (0..size).map(move |x| (x, y)))
+                .filter(|&(x, y)| at(&pixels, size, x, y).3 > 0)
+                .map(|(x, y)| x.max(y))
+                .max()
+                .unwrap();
+            assert!(reach * 32 <= 21 * size, "reach {reach} at {size}");
+        }
     }
 
     #[test]
-    fn the_planes_pad_rows_and_mark_white_in_xor_only_over_a_cleared_and() {
-        // Break caught: rows packed without padding (a sheared cursor) or white drawn inverted.
-        let pixels = [Pixel::White, Pixel::Black, Pixel::Clear, Pixel::Clear]
-            .into_iter()
-            .cycle()
-            .take(24 * 24)
-            .collect::<Vec<_>>();
-        let (and, xor) = cursor_planes(&pixels, 24);
-        assert_eq!(and.len(), 4 * 24);
-        assert_eq!(and[0], 0b0011_0011);
-        assert_eq!(xor[0], 0b1000_1000);
-        assert_eq!(and[3], 0xFF);
+    fn the_handle_is_black_and_edges_are_anti_aliased() {
+        // Break caught: a missing handle, or hard two-tone edges with no partial alpha.
+        let pixels = magnifier_bgra(32, true).unwrap();
+        assert_eq!(at(&pixels, 32, 15, 15), (0, 0, 0, 255));
+        assert!(pixels.chunks(4).any(|pixel| pixel[3] > 0 && pixel[3] < 255));
     }
 }
