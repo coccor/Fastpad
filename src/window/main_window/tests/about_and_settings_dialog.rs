@@ -328,6 +328,9 @@ fn the_settings_dialog_changes_settings_from_the_keyboard() {
         key(VK_UP); // 1.6 -> 1.7
         key(VK_TAB); // Markdown view
         key(VK_RIGHT); // Source → Split
+        key(VK_TAB); // SVG view
+        key(VK_RIGHT); // Source → Split
+        key(VK_RIGHT); // Split → Preview
         key(VK_TAB); // Tab width
         key(VK_RIGHT); // 4 → 8
         key(VK_TAB); // Indent with spaces
@@ -343,13 +346,15 @@ fn the_settings_dialog_changes_settings_from_the_keyboard() {
     assert_eq!(settings.preview_font_size, 15);
     assert_eq!(settings.preview_line_height, 17);
     assert_eq!(settings.markdown_view, crate::preview::ViewMode::Split);
+    assert_eq!(settings.svg_view, crate::preview::ViewMode::Preview);
     assert_eq!(settings.tab_width, 8);
     assert!(settings.insert_spaces);
     super::super::save_settings_to(None);
     assert_eq!(
         std::fs::read_to_string(&ini).unwrap(),
         "# kept\r\nfile_icons=minimal\r\nfont_size=16\r\npreview_font_size=15\r\n\
-         preview_line_height=1.7\r\nmarkdown_view=split\r\ntab_width=8\r\ninsert_spaces=true\r\n"
+         preview_line_height=1.7\r\nmarkdown_view=split\r\nsvg_view=preview\r\ntab_width=8\r\n\
+         insert_spaces=true\r\n"
     );
 }
 
@@ -428,8 +433,8 @@ fn the_dialog_keeps_the_focus_after_a_change_that_moves_it() {
     crate::window::settings_dialog::take_focus_checks();
     crate::window::settings_dialog::answer_next(|dialog| unsafe {
         let key = |vk: u16| PostMessageW(dialog, WM_KEYDOWN, usize::from(vk), 0);
-        // Theme → … → Notes mode is the 16th row: fifteen Tabs.
-        for _ in 0..15 {
+        // Theme → … → Notes mode is the 17th row: sixteen Tabs.
+        for _ in 0..16 {
             key(VK_TAB);
         }
         key(VK_SPACE); // notes mode off
@@ -461,8 +466,8 @@ fn edit_fastpad_ini_closes_the_dialog_and_opens_the_file_in_a_tab() {
     let window = ProductionWindow::new(make_app());
     let _editor = install_test_editor(&window);
     crate::window::settings_dialog::answer_next(|dialog| unsafe {
-        // 17 enabled rows (no notebook, so autosave is skipped): 17 Tabs reach the link.
-        for _ in 0..17 {
+        // 18 enabled rows (no notebook, so autosave is skipped): 18 Tabs reach the link.
+        for _ in 0..18 {
             PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_TAB), 0);
         }
         PostMessageW(dialog, WM_KEYDOWN, usize::from(VK_RETURN), 0);

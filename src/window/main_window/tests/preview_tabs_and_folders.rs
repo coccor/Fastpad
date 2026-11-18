@@ -815,6 +815,34 @@ fn the_toolbar_has_the_open_button_only_on_fastdraw_tabs() {
 }
 
 #[test]
+fn an_svg_tab_opens_in_the_svg_view_setting_and_keeps_it_when_the_setting_changes() {
+    // Break caught: SVG tabs ignoring `svg_view`, taking `markdown_view` instead, or an open
+    // tab jumping to a new default when the setting changes.
+    use crate::preview::ViewMode;
+    use crate::window::settings_model::SettingsAction;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    {
+        let settings = &mut app_mut(window.hwnd).settings;
+        settings.markdown_view = ViewMode::Preview;
+        settings.svg_view = ViewMode::Split;
+    }
+    execute_command(window.hwnd, CommandId::LanguageSvg);
+    assert_eq!(
+        crate::window::preview_host::mode(window.hwnd),
+        ViewMode::Split
+    );
+
+    super::super::apply_settings_action(window.hwnd, SettingsAction::SetSvgView(ViewMode::Source));
+    assert_eq!(app_mut(window.hwnd).settings.svg_view, ViewMode::Source);
+    assert_eq!(
+        crate::window::preview_host::mode(window.hwnd),
+        ViewMode::Split
+    );
+}
+
+#[test]
 fn the_link_names_the_file_not_the_tab_title() {
     // Break caught: the tab title's dirty marker, or an untitled tab's name, leaking into the link.
     let _scintilla = load_native_scintilla();

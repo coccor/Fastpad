@@ -20,6 +20,8 @@ pub const MAX_PREVIEW_LINE_HEIGHT: u8 = 30;
 pub const DEFAULT_FONT_SIZE: u16 = 11;
 /// Markdown tabs open in the source view until another view mode is chosen.
 pub const DEFAULT_MARKDOWN_VIEW: crate::preview::ViewMode = crate::preview::ViewMode::Source;
+/// SVG tabs open in the source view until another view mode is chosen.
+pub const DEFAULT_SVG_VIEW: crate::preview::ViewMode = crate::preview::ViewMode::Source;
 pub const DEFAULT_TAB_WIDTH: u8 = 4;
 pub const DEFAULT_WORD_WRAP: bool = false;
 pub const DEFAULT_LINE_NUMBERS: bool = true;
@@ -92,6 +94,7 @@ pub fn default_settings() -> Settings {
         capture_hotkey: DEFAULT_CAPTURE_HOTKEY.to_owned(),
         capture_source: false,
         markdown_view: DEFAULT_MARKDOWN_VIEW,
+        svg_view: DEFAULT_SVG_VIEW,
         settings_size: None,
         window_placement: None,
         key_overrides: std::collections::BTreeMap::new(),

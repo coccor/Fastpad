@@ -152,6 +152,8 @@ pub struct Settings {
     pub capture_source: bool,
     /// The view mode a Markdown tab opens in (2026-10-22 view modes spec §2).
     pub markdown_view: crate::preview::ViewMode,
+    /// The view mode an SVG tab opens in: Source, Split or Preview (never Live).
+    pub svg_view: crate::preview::ViewMode,
     /// The Settings dialog's size in 96-DPI pixels, width by height, once the user has sized it;
     /// `None` opens it at its natural size. Saved when a resize drag ends.
     pub settings_size: Option<(u16, u16)>,
@@ -259,6 +261,9 @@ impl Settings {
         {
             self.markdown_view = mode;
         }
+        if let Some(mode) = delta.svg_view {
+            self.svg_view = mode;
+        }
         for (id, value) in &delta.key_overrides {
             self.key_overrides.insert(id.clone(), value.clone());
         }
@@ -309,6 +314,7 @@ pub struct SettingsDelta {
     pub markdown_view: Option<ViewMode>,
     /// `markdown_live_default=`, read as `markdown_view=live` or `source` when that key is absent.
     pub markdown_live_default: Option<bool>,
+    pub svg_view: Option<ViewMode>,
     pub key_overrides: std::collections::BTreeMap<String, String>,
     pub warnings: Vec<SettingWarning>,
 }
@@ -321,8 +327,9 @@ pub struct SettingsDelta {
 /// `reload_changed_files` (`auto` or `ask`), `notes_mode`,
 /// `sidebar_view`, `sidebar_width`, `settings_size`, `window_placement`, `file_icons`,
 /// `open_editors_expanded`, `insert_spaces`, `show_whitespace`, `highlight_current_line`, `always_on_top`, `capture_hotkey` (any text; empty turns it off),
-/// `capture_source`, `markdown_view` and `markdown_live_default` are recognized.
-/// `markdown_view` is `source`, `live`, `split` or `preview` (any case).
+/// `capture_source`, `markdown_view`, `markdown_live_default` and `svg_view` are recognized.
+/// `markdown_view` is `source`, `live`, `split` or `preview` (any case); `svg_view` is
+/// `source`, `split` or `preview` (any case).
 /// `sidebar_view` is `notebook`, `search`, `favorites` or `none` (any case); `sidebar_width` is an
 /// unsigned integer in 96-DPI pixels, pulled into 180–480 when it is outside; `settings_size` is
 /// `<width>x<height>` in 96-DPI pixels, both above zero (the dialog fits it to the screen);
@@ -531,6 +538,11 @@ fn apply_line(delta: &mut SettingsDelta, line_number: usize, key: &str, value: &
         "markdown_live_default" => match parse_bool(value) {
             Some(live) => delta.markdown_live_default = Some(live),
             None => warn(delta, line_number, key, value),
+        },
+        // An SVG tab has no Live view.
+        "svg_view" => match ViewMode::parse(value) {
+            Some(mode) if ViewMode::SVG.contains(&mode) => delta.svg_view = Some(mode),
+            _ => warn(delta, line_number, key, value),
         },
         _ => delta.warnings.push(SettingWarning {
             line: line_number,
@@ -1394,6 +1406,23 @@ mod tests {
         settings.apply_delta(&delta);
         assert_eq!(settings.markdown_view, ViewMode::Split);
         assert_eq!(parse("markdown_view=full").warnings.len(), 1);
+    }
+
+    #[test]
+    fn svg_view_parses_source_split_and_preview_and_rejects_live() {
+        // Break caught: `svg_view=live` accepted for a tab that cannot show Live, or the key
+        // touching `markdown_view`.
+        let mut settings = default_settings();
+        assert_eq!(settings.svg_view, ViewMode::Source);
+        let delta = parse("svg_view=Preview\n");
+        assert!(delta.warnings.is_empty(), "{:?}", delta.warnings);
+        settings.apply_delta(&delta);
+        assert_eq!(settings.svg_view, ViewMode::Preview);
+        assert_eq!(settings.markdown_view, ViewMode::Source);
+        let live = parse("svg_view=live\n");
+        assert_eq!(live.svg_view, None);
+        assert_eq!(live.warnings.len(), 1);
+        assert_eq!(parse("svg_view=full").warnings.len(), 1);
     }
 
     #[test]
