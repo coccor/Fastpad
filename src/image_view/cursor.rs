@@ -1,7 +1,7 @@
 //! The magnifying-glass pointers over a picture: a click zooms in (a plus in the lens), Ctrl+click
 //! zooms out (a minus). Windows has no stock magnifier, so it is drawn here, anti-aliased with
 //! tiny-skia, at the cursor size for the view's DPI and about the size of the arrow: black strokes
-//! with a soft white halo and a pale lens, so it reads on any picture.
+//! with a soft white halo and a white lens, so it reads on any picture.
 
 use resvg::tiny_skia::{Color, FillRule, LineCap, Paint, PathBuilder, Pixmap, Stroke, Transform};
 use std::cell::RefCell;
@@ -17,14 +17,15 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 /// The drawing is laid out on the 32-pixel cursor cell of 96 DPI and scaled to the cursor size.
 const GRID: f32 = 32.0;
-const LENS: (f32, f32) = (8.5, 8.5);
-const LENS_RADIUS: f32 = 5.5;
+/// On a whole pixel, so the 2-pixel plus and minus bars land on pixel edges and stay crisp.
+const LENS: (f32, f32) = (9.0, 9.0);
+const LENS_RADIUS: f32 = 6.0;
 const RING_WIDTH: f32 = 1.6;
-const HANDLE_FROM: (f32, f32) = (12.6, 12.6);
-const HANDLE_TO: (f32, f32) = (18.0, 18.0);
+const HANDLE_FROM: (f32, f32) = (13.4, 13.4);
+const HANDLE_TO: (f32, f32) = (18.3, 18.3);
 const HANDLE_WIDTH: f32 = 2.6;
-const SIGN_HALF_LENGTH: f32 = 2.6;
-const SIGN_WIDTH: f32 = 1.4;
+const SIGN_HALF_LENGTH: f32 = 3.0;
+const SIGN_WIDTH: f32 = 2.0;
 /// How far the white halo reaches past every black stroke.
 const HALO: f32 = 1.1;
 
@@ -36,7 +37,7 @@ pub(crate) fn magnifier_bgra(size: u32, plus: bool) -> Option<Vec<u8>> {
     let transform = Transform::from_scale(scale, scale);
     let black = paint(Color::from_rgba8(0, 0, 0, 255));
     let halo = paint(Color::from_rgba8(255, 255, 255, 235));
-    let lens = paint(Color::from_rgba8(255, 255, 255, 190));
+    let lens = paint(Color::from_rgba8(255, 255, 255, 255));
 
     let circle = PathBuilder::from_circle(LENS.0, LENS.1, LENS_RADIUS)?;
     let handle = line(HANDLE_FROM, HANDLE_TO)?;
@@ -54,7 +55,6 @@ pub(crate) fn magnifier_bgra(size: u32, plus: bool) -> Option<Vec<u8>> {
     pixmap.stroke_path(&circle, &halo, &halo_width(RING_WIDTH), transform, None);
     pixmap.stroke_path(&handle, &halo, &halo_width(HANDLE_WIDTH), transform, None);
     pixmap.fill_path(&circle, &lens, FillRule::Winding, transform, None);
-    pixmap.stroke_path(&sign, &halo, &halo_width(SIGN_WIDTH), transform, None);
     let ring = stroke(RING_WIDTH, LineCap::Round);
     pixmap.stroke_path(&circle, &black, &ring, transform, None);
     let grip = stroke(HANDLE_WIDTH, LineCap::Round);
@@ -195,9 +195,15 @@ mod tests {
         // Break caught: Ctrl showing the same pointer as a plain hover.
         let plus = magnifier_bgra(32, true).unwrap();
         let minus = magnifier_bgra(32, false).unwrap();
-        assert_eq!(at(&plus, 32, 8, 6), (0, 0, 0, 255));
-        assert!(at(&minus, 32, 8, 6).0 > 200);
-        assert_eq!(at(&minus, 32, 6, 8), (0, 0, 0, 255));
+        // The bars are two whole pixels wide (8 and 9) and solid, never a grey smear.
+        for x in [8, 9] {
+            assert_eq!(at(&plus, 32, x, 6), (0, 0, 0, 255));
+            assert_eq!(at(&minus, 32, x, 6), (255, 255, 255, 255));
+        }
+        for y in [8, 9] {
+            assert_eq!(at(&minus, 32, 6, y), (0, 0, 0, 255));
+        }
+        assert_eq!(at(&minus, 32, 6, 7), (255, 255, 255, 255));
     }
 
     #[test]
