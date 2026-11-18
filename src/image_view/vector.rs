@@ -1,19 +1,22 @@
 //! An SVG or FastDraw picture drawn by Direct2D on the graphics card, the way a browser draws one:
 //! the parsed tree becomes Direct2D geometry once, and every paint replays it under the view's zoom
 //! and pan. Zooming never renders pixels ahead of time, so there is no blurred picture waiting to
-//! sharpen. A tree using what this does not draw (`drawable` says no: filters, masks, patterns,
-//! embedded images, blend modes, nested clips) keeps the resvg raster path.
+//! sharpen. A pattern's tile is drawn again, sharp, whenever the zoom changes its size on screen.
+//! A tree using what this does not draw (`drawable` says no: filters, masks, embedded images,
+//! blend modes, nested clips) keeps the resvg raster path.
 
 use resvg::tiny_skia::{PathSegment, Point, Transform};
 use resvg::usvg;
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D1_BEZIER_SEGMENT, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END,
-    D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_FILL_MODE, D2D1_FILL_MODE_ALTERNATE,
-    D2D1_FILL_MODE_WINDING, D2D1_GRADIENT_STOP,
+    D2D_RECT_F, D2D_SIZE_F, D2D_SIZE_U, D2D1_BEZIER_SEGMENT, D2D1_COLOR_F,
+    D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN,
+    D2D1_FILL_MODE, D2D1_FILL_MODE_ALTERNATE, D2D1_FILL_MODE_WINDING, D2D1_GRADIENT_STOP,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_CAP_STYLE, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_ROUND,
-    D2D1_CAP_STYLE_SQUARE, D2D1_COMBINE_MODE_UNION, D2D1_DASH_STYLE_CUSTOM, D2D1_DASH_STYLE_SOLID,
+    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_BRUSH_PROPERTIES,
+    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BRUSH_PROPERTIES, D2D1_CAP_STYLE,
+    D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_SQUARE, D2D1_COMBINE_MODE_UNION,
+    D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE, D2D1_DASH_STYLE_CUSTOM, D2D1_DASH_STYLE_SOLID,
     D2D1_DEFAULT_FLATTENING_TOLERANCE, D2D1_EXTEND_MODE, D2D1_EXTEND_MODE_CLAMP,
     D2D1_EXTEND_MODE_MIRROR, D2D1_EXTEND_MODE_WRAP, D2D1_GAMMA_2_2, D2D1_LAYER_OPTIONS_NONE,
     D2D1_LAYER_PARAMETERS, D2D1_LINE_JOIN, D2D1_LINE_JOIN_BEVEL, D2D1_LINE_JOIN_MITER_OR_BEVEL,
@@ -56,7 +59,7 @@ fn paint_drawable(paint: &usvg::Paint) -> bool {
         usvg::Paint::Color(_) | usvg::Paint::LinearGradient(_) => true,
         // Direct2D's radial gradient has no focal radius.
         usvg::Paint::RadialGradient(gradient) => gradient.fr().get() == 0.0,
-        usvg::Paint::Pattern(_) => false,
+        usvg::Paint::Pattern(pattern) => group_drawable(pattern.root()),
     }
 }
 
@@ -92,7 +95,23 @@ enum Brush {
         extend: D2D1_EXTEND_MODE,
         transform: Matrix3x2,
     },
+    /// `Scene::patterns[index]`, tiled.
+    Pattern {
+        index: usize,
+        opacity: f32,
+    },
 }
+
+/// A pattern: its content as a scene of its own, drawn into a tile at the zoom it shows at.
+struct PatternSpec {
+    scene: Scene,
+    /// The tile's rectangle in the pattern's space.
+    rect: (f32, f32, f32, f32),
+    transform: Transform,
+}
+
+/// The largest side a pattern tile is drawn at; past it the tile is drawn enlarged.
+const MAX_TILE: f32 = 4096.0;
 
 /// One drawing step. Shapes are in their own space; `transform` takes it to the picture's.
 enum Op {
@@ -121,7 +140,11 @@ enum Op {
 pub(crate) struct Scene {
     ops: Vec<Op>,
     brushes: Vec<Brush>,
-    made: Option<Vec<ID2D1Brush>>,
+    /// `brushes` made on the current target; `None` for a pattern, whose brush is in `tiles`.
+    made: Option<Vec<Option<ID2D1Brush>>>,
+    patterns: Vec<PatternSpec>,
+    /// Each pattern brush's tile brush, by brush, with the tile's pixel size it was drawn at.
+    tiles: std::collections::HashMap<usize, ((u32, u32), ID2D1Brush)>,
     /// The picture's own size, which the view's zoom maps to its natural size.
     size: (f32, f32),
 }
@@ -129,24 +152,36 @@ pub(crate) struct Scene {
 impl Scene {
     /// Turns `tree` into geometry. Call only for a tree `drawable` accepts.
     pub(crate) fn build(factory: &ID2D1Factory, tree: &usvg::Tree) -> Result<Self> {
+        let size = tree.size();
+        Self::of_group(factory, tree.root(), (size.width(), size.height()))
+    }
+
+    fn of_group(factory: &ID2D1Factory, root: &usvg::Group, size: (f32, f32)) -> Result<Self> {
         let mut builder = Builder {
             factory,
             ops: Vec::new(),
             brushes: Vec::new(),
+            patterns: Vec::new(),
         };
-        builder.group_children(tree.root())?;
-        let size = tree.size();
+        // As resvg: the root's children, each group adding its own transform.
+        builder.group_children(root, Transform::identity())?;
         Ok(Self {
             ops: builder.ops,
             brushes: builder.brushes,
             made: None,
-            size: (size.width(), size.height()),
+            patterns: builder.patterns,
+            tiles: std::collections::HashMap::new(),
+            size,
         })
     }
 
     /// Forgets the brushes of a render target that is gone.
     pub(crate) fn release_target(&mut self) {
         self.made = None;
+        self.tiles.clear();
+        for pattern in &mut self.patterns {
+            pattern.scene.release_target();
+        }
     }
 
     /// Draws the picture with its top-left corner at `offset` and `size` across, in the target's
@@ -157,15 +192,6 @@ impl Scene {
         offset: (f32, f32),
         size: (f32, f32),
     ) -> Result<()> {
-        if self.made.is_none() {
-            let made = self
-                .brushes
-                .iter()
-                .map(|brush| make_brush(target, brush))
-                .collect::<Result<Vec<_>>>()?;
-            self.made = Some(made);
-        }
-        let made = self.made.as_ref().expect("made above");
         let view = Matrix3x2 {
             M11: size.0 / self.size.0,
             M12: 0.0,
@@ -174,26 +200,81 @@ impl Scene {
             M31: offset.0,
             M32: offset.1,
         };
-        for op in &self.ops {
+        self.draw_under(target, view)?;
+        unsafe { target.SetTransform(&Matrix3x2::identity()) };
+        Ok(())
+    }
+
+    /// Draws the picture with `view` taking its space to the target's.
+    fn draw_under(&mut self, target: &ID2D1RenderTarget, view: Matrix3x2) -> Result<()> {
+        if self.made.is_none() {
+            let made = self
+                .brushes
+                .iter()
+                .map(|brush| make_brush(target, brush))
+                .collect::<Result<Vec<_>>>()?;
+            self.made = Some(made);
+        }
+        let Self {
+            ops,
+            brushes,
+            made,
+            patterns,
+            tiles,
+            ..
+        } = self;
+        let made = made.as_ref().expect("made above");
+        // The brush for step `brush` drawn under `device`: a pattern's tile at that zoom.
+        let mut resolve = |brush: usize, device: Matrix3x2| -> Result<Option<ID2D1Brush>> {
+            if let Some(made) = &made[brush] {
+                return Ok(Some(made.clone()));
+            }
+            let Brush::Pattern { index, opacity } = brushes[brush] else {
+                return Ok(None);
+            };
+            let spec = &mut patterns[index];
+            let Some((pixels, scale)) = tile_size(spec, device) else {
+                return Ok(None);
+            };
+            if let Some((drawn, tile)) = tiles.get(&brush)
+                && *drawn == pixels
+            {
+                return Ok(Some(tile.clone()));
+            }
+            let tile = pattern_tile(target, spec, pixels, scale, opacity)?;
+            tiles.insert(brush, (pixels, tile.clone()));
+            Ok(Some(tile))
+        };
+        for op in ops.iter() {
             match op {
                 Op::Fill {
                     geometry,
                     transform,
                     brush,
-                } => unsafe {
-                    target.SetTransform(&multiply(*transform, view));
-                    target.FillGeometry(geometry, &made[*brush], None);
-                },
+                } => {
+                    let device = multiply(*transform, view);
+                    if let Some(brush) = resolve(*brush, device)? {
+                        unsafe {
+                            target.SetTransform(&device);
+                            target.FillGeometry(geometry, &brush, None);
+                        }
+                    }
+                }
                 Op::Stroke {
                     geometry,
                     transform,
                     brush,
                     width,
                     style,
-                } => unsafe {
-                    target.SetTransform(&multiply(*transform, view));
-                    target.DrawGeometry(geometry, &made[*brush], *width, style.as_ref());
-                },
+                } => {
+                    let device = multiply(*transform, view);
+                    if let Some(brush) = resolve(*brush, device)? {
+                        unsafe {
+                            target.SetTransform(&device);
+                            target.DrawGeometry(geometry, &brush, *width, style.as_ref());
+                        }
+                    }
+                }
                 Op::Push { opacity, clip } => unsafe {
                     target.SetTransform(&view);
                     let parameters = D2D1_LAYER_PARAMETERS {
@@ -217,7 +298,6 @@ impl Scene {
                 Op::Pop => unsafe { target.PopLayer() },
             }
         }
-        unsafe { target.SetTransform(&Matrix3x2::identity()) };
         Ok(())
     }
 
@@ -246,43 +326,63 @@ struct Builder<'a> {
     factory: &'a ID2D1Factory,
     ops: Vec<Op>,
     brushes: Vec<Brush>,
+    patterns: Vec<PatternSpec>,
 }
 
 impl Builder<'_> {
-    fn group_children(&mut self, group: &usvg::Group) -> Result<()> {
+    fn group_children(&mut self, group: &usvg::Group, transform: Transform) -> Result<()> {
         for node in group.children() {
             match node {
-                usvg::Node::Group(group) => self.group(group)?,
-                usvg::Node::Path(path) => self.path(path)?,
-                usvg::Node::Text(text) => self.group(text.flattened())?,
+                usvg::Node::Group(group) => self.group(group, transform)?,
+                usvg::Node::Path(path) => self.path(path, transform)?,
+                usvg::Node::Text(text) => self.group(text.flattened(), transform)?,
                 usvg::Node::Image(_) => {}
             }
         }
         Ok(())
     }
 
-    fn group(&mut self, group: &usvg::Group) -> Result<()> {
+    fn group(&mut self, group: &usvg::Group, parent: Transform) -> Result<()> {
+        let transform = parent.pre_concat(group.transform());
         let opacity = group.opacity().get();
         let clip = group
             .clip_path()
-            .map(|clip| self.clip(clip, group.abs_transform()))
+            .map(|clip| self.clip(clip, transform))
             .transpose()?;
         let layer = opacity < 1.0 || clip.is_some();
         if layer {
             self.ops.push(Op::Push { opacity, clip });
         }
-        self.group_children(group)?;
+        self.group_children(group, transform)?;
         if layer {
             self.ops.push(Op::Pop);
         }
         Ok(())
     }
 
-    fn path(&mut self, path: &usvg::Path) -> Result<()> {
+    /// The brush for `paint`; a pattern's content becomes a scene of its own.
+    fn paint(&mut self, paint: &usvg::Paint, opacity: f32) -> Result<Option<Brush>> {
+        let usvg::Paint::Pattern(pattern) = paint else {
+            return Ok(brush(paint, opacity));
+        };
+        let rect = pattern.rect();
+        let scene = Scene::of_group(self.factory, pattern.root(), (rect.width(), rect.height()))?;
+        self.patterns.push(PatternSpec {
+            scene,
+            rect: (rect.x(), rect.y(), rect.width(), rect.height()),
+            transform: pattern.transform(),
+        });
+        Ok(Some(Brush::Pattern {
+            index: self.patterns.len() - 1,
+            opacity,
+        }))
+    }
+
+    fn path(&mut self, path: &usvg::Path, transform: Transform) -> Result<()> {
         if !path.is_visible() {
             return Ok(());
         }
-        let transform = matrix(path.abs_transform());
+        let transform = matrix(transform);
         let fill_rule = path
             .fill()
             .map_or(usvg::FillRule::NonZero, |fill| fill.rule());
@@ -297,7 +397,7 @@ impl Builder<'_> {
             if bounds.width() == 0.0 || bounds.height() == 0.0 {
                 return Ok(());
             }
-            if let Some(brush) = brush(fill.paint(), fill.opacity().get()) {
+            if let Some(brush) = builder.paint(fill.paint(), fill.opacity().get())? {
                 builder.brushes.push(brush);
                 builder.ops.push(Op::Fill {
                     geometry: geometry.clone(),
@@ -311,7 +411,7 @@ impl Builder<'_> {
             let Some(stroke) = path.stroke() else {
                 return Ok(());
             };
-            if let Some(brush) = brush(stroke.paint(), stroke.opacity().get()) {
+            if let Some(brush) = builder.paint(stroke.paint(), stroke.opacity().get())? {
                 builder.brushes.push(brush);
                 let width = stroke.width().get();
                 builder.ops.push(Op::Stroke {
@@ -559,10 +659,12 @@ fn brush(paint: &usvg::Paint, opacity: f32) -> Option<Brush> {
     }
 }
 
-fn make_brush(target: &ID2D1RenderTarget, brush: &Brush) -> Result<ID2D1Brush> {
+/// `brush` made on `target`; `None` for a pattern, made per zoom by `pattern_tile`.
+fn make_brush(target: &ID2D1RenderTarget, brush: &Brush) -> Result<Option<ID2D1Brush>> {
     unsafe {
         match brush {
-            Brush::Solid(color) => target.CreateSolidColorBrush(color, None)?.cast(),
+            Brush::Pattern { .. } => Ok(None),
+            Brush::Solid(color) => Ok(Some(target.CreateSolidColorBrush(color, None)?.cast()?)),
             Brush::Linear {
                 start,
                 end,
@@ -581,7 +683,7 @@ fn make_brush(target: &ID2D1RenderTarget, brush: &Brush) -> Result<ID2D1Brush> {
                     &collection,
                 )?;
                 made.SetTransform(transform);
-                made.cast()
+                Ok(Some(made.cast()?))
             }
             Brush::Radial {
                 center,
@@ -604,9 +706,87 @@ fn make_brush(target: &ID2D1RenderTarget, brush: &Brush) -> Result<ID2D1Brush> {
                     &collection,
                 )?;
                 made.SetTransform(transform);
-                made.cast()
+                Ok(Some(made.cast()?))
             }
         }
+    }
+}
+
+/// The pixel size of `spec`'s tile under `device`, and the scale its content draws at to fill it,
+/// as resvg sizes it. `None` when the tile would be smaller than a pixel.
+fn tile_size(spec: &PatternSpec, device: Matrix3x2) -> Option<((u32, u32), (f32, f32))> {
+    let full = multiply(matrix(spec.transform), device);
+    let mut scale = (full.M11.hypot(full.M12), full.M21.hypot(full.M22));
+    let mut pixels = (
+        (spec.rect.2 * scale.0).round(),
+        (spec.rect.3 * scale.1).round(),
+    );
+    if pixels.0 < 1.0 || pixels.1 < 1.0 {
+        return None;
+    }
+    if pixels.0 > MAX_TILE {
+        scale.0 *= MAX_TILE / pixels.0;
+        pixels.0 = MAX_TILE;
+    }
+    if pixels.1 > MAX_TILE {
+        scale.1 *= MAX_TILE / pixels.1;
+        pixels.1 = MAX_TILE;
+    }
+    Some(((pixels.0 as u32, pixels.1 as u32), scale))
+}
+
+/// Draws `spec`'s content into a `pixels` tile at `scale` and makes the brush that repeats it,
+/// placed as resvg places its pattern pixmap.
+fn pattern_tile(
+    target: &ID2D1RenderTarget,
+    spec: &mut PatternSpec,
+    pixels: (u32, u32),
+    scale: (f32, f32),
+    opacity: f32,
+) -> Result<ID2D1Brush> {
+    unsafe {
+        let tile = target.CreateCompatibleRenderTarget(
+            Some(&D2D_SIZE_F {
+                width: pixels.0 as f32,
+                height: pixels.1 as f32,
+            }),
+            Some(&D2D_SIZE_U {
+                width: pixels.0,
+                height: pixels.1,
+            }),
+            None,
+            D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE,
+        )?;
+        let surface: ID2D1RenderTarget = tile.cast()?;
+        // Brushes belong to the target they were made on: this tile is a new one.
+        spec.scene.release_target();
+        surface.BeginDraw();
+        surface.Clear(Some(&D2D1_COLOR_F::default()));
+        let drawn = spec
+            .scene
+            .draw_under(&surface, matrix(Transform::from_scale(scale.0, scale.1)));
+        surface.SetTransform(&Matrix3x2::identity());
+        surface.EndDraw(None, None)?;
+        drawn?;
+        spec.scene.release_target();
+        let bitmap = tile.GetBitmap()?;
+        let place = spec
+            .transform
+            .pre_translate(spec.rect.0, spec.rect.1)
+            .pre_scale(1.0 / scale.0, 1.0 / scale.1);
+        let brush = target.CreateBitmapBrush(
+            &bitmap,
+            Some(&D2D1_BITMAP_BRUSH_PROPERTIES {
+                extendModeX: D2D1_EXTEND_MODE_WRAP,
+                extendModeY: D2D1_EXTEND_MODE_WRAP,
+                interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+            }),
+            Some(&D2D1_BRUSH_PROPERTIES {
+                opacity,
+                transform: matrix(place),
+            }),
+        )?;
+        brush.cast()
     }
 }
 
@@ -676,12 +856,11 @@ mod tests {
     }
 
     #[test]
-    fn filters_masks_patterns_and_images_stay_on_resvg() {
+    fn filters_masks_blend_modes_and_images_stay_on_resvg() {
         // Break caught: a blurred or masked SVG drawn by Direct2D without its effect.
         for body in [
             r#"<filter id="f"><feGaussianBlur stdDeviation="2"/></filter><rect width="10" height="10" filter="url(#f)"/>"#,
             r#"<mask id="m"><rect width="5" height="5" fill="white"/></mask><rect width="10" height="10" mask="url(#m)"/>"#,
-            r#"<pattern id="p" width="4" height="4"><rect width="2" height="2"/></pattern><rect width="10" height="10" fill="url(#p)"/>"#,
             r#"<rect width="10" height="10" style="mix-blend-mode:multiply"/>"#,
         ] {
             assert!(!drawable(&svg(body)), "{body}");
@@ -813,9 +992,31 @@ mod tests {
                 r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="60">
                 <text x="10" y="40" font-family="Segoe UI" font-size="28" fill="#123">Zoom 123</text></svg>"##,
             ),
+            (
+                "patterns",
+                r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="120">
+                <defs><pattern id="dots" width="12" height="12" patternUnits="userSpaceOnUse"><circle cx="6" cy="6" r="1.5" fill="#888"/></pattern>
+                <pattern id="checks" width="0.25" height="0.5" patternTransform="rotate(20)"><rect width="10" height="10" fill="#c33"/></pattern></defs>
+                <rect width="200" height="120" fill="#fafaf7"/><rect width="200" height="120" fill="url(#dots)"/>
+                <rect x="110" y="20" width="80" height="80" fill="url(#checks)" fill-opacity="0.7" stroke="#000"/></svg>"##,
+            ),
         ];
+        // A real FastDraw diagram: its look paints the paper with a dot pattern.
+        let diagram = crate::preview::fastdraw::draw(
+            "a: node \"Orders API\" sub=\"/orders\" at 40,40 160x64
+b: node \"Queue\" at 260,40 160x64
+a -> b \"publish\"
+",
+            None,
+            false,
+        );
+        assert!(diagram.show);
+        let samples = samples
+            .into_iter()
+            .map(|(name, source)| (name, source.to_owned()))
+            .chain([("fastdraw", diagram.svg)]);
         for (name, source) in samples {
-            let tree = crate::preview::svg::parse(source).unwrap();
+            let tree = crate::preview::svg::parse(&source).unwrap();
             assert!(drawable(&tree), "{name}");
             let size = crate::preview::svg::natural_size(&tree);
             let size = (size.0 * 2, size.1 * 2);
