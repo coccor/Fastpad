@@ -496,34 +496,14 @@ fn run_command(hwnd: HWND, command: CommandId, recorded: Option<std::path::PathB
         CommandId::FormatJson => format_active_json(hwnd),
         CommandId::NextTab => cycle_tab(hwnd, true),
         CommandId::PreviousTab => cycle_tab(hwnd, false),
-        CommandId::ZoomIn | CommandId::ZoomOut | CommandId::ZoomReset
-            // An image tab never zooms the hidden editor, even with no image view to zoom.
-            if crate::window::image_host::zoom(hwnd, command)
-                || crate::window::image_host::active_is_image(hwnd)
-                || crate::window::preview_host::zoom_svg(hwnd, command) => {}
-        // One zoom for every group (split editors plan amendment 11).
-        CommandId::ZoomIn => {
-            for editor in all_editors(hwnd) {
-                let _ = editor.zoom_in();
-            }
-        }
-        CommandId::ZoomOut => {
-            for editor in all_editors(hwnd) {
-                let _ = editor.zoom_out();
-            }
-        }
-        CommandId::ZoomReset => {
-            for editor in all_editors(hwnd) {
-                let _ = editor.reset_zoom();
-            }
+        CommandId::ZoomIn | CommandId::ZoomOut | CommandId::ZoomReset => {
+            crate::window::zoom_host::run(hwnd, command);
         }
         CommandId::MarkdownViewCycle
         | CommandId::MarkdownViewSource
         | CommandId::MarkdownViewLive
         | CommandId::MarkdownViewSplit
-        | CommandId::MarkdownViewPreview => {
-            crate::window::preview_host::run_command(hwnd, command)
-        }
+        | CommandId::MarkdownViewPreview => crate::window::preview_host::run_command(hwnd, command),
         CommandId::MarkdownBold
         | CommandId::MarkdownItalic
         | CommandId::MarkdownCode
@@ -541,7 +521,9 @@ fn run_command(hwnd: HWND, command: CommandId, recorded: Option<std::path::PathB
         | CommandId::MarkdownTaskList
         | CommandId::MarkdownInsertTable
         | CommandId::MarkdownAddTableColumn
-        | CommandId::MarkdownDeleteTableColumn => crate::window::markdown_host::format(hwnd, command),
+        | CommandId::MarkdownDeleteTableColumn => {
+            crate::window::markdown_host::format(hwnd, command)
+        }
         CommandId::ToggleSidebar => crate::window::side_panel::toggle(hwnd),
         CommandId::FocusNextPane => cycle_focus(hwnd, false),
         CommandId::FocusPreviousPane => cycle_focus(hwnd, true),
@@ -564,14 +546,12 @@ fn run_command(hwnd: HWND, command: CommandId, recorded: Option<std::path::PathB
         CommandId::ShowLinksView => {
             crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Links, true)
         }
-        CommandId::NotesShowMissing => crate::window::links_view::reveal(
-            hwnd,
-            crate::window::links_view::Section::Missing,
-        ),
-        CommandId::NotesShowUnlinked => crate::window::links_view::reveal(
-            hwnd,
-            crate::window::links_view::Section::Unlinked,
-        ),
+        CommandId::NotesShowMissing => {
+            crate::window::links_view::reveal(hwnd, crate::window::links_view::Section::Missing)
+        }
+        CommandId::NotesShowUnlinked => {
+            crate::window::links_view::reveal(hwnd, crate::window::links_view::Section::Unlinked)
+        }
         CommandId::NotesToday => crate::window::library_host::open_today(hwnd),
         CommandId::NotesPreviousDaily => crate::window::library_host::step_daily(hwnd, false),
         CommandId::NotesNextDaily => crate::window::library_host::step_daily(hwnd, true),

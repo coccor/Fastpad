@@ -341,6 +341,9 @@ pub(super) unsafe extern "system" fn main_window_proc(
                 ((lparam as u32 >> 16) & 0xffff) as u16 as i16 as i32,
             );
             match status_detail_at(hwnd, point.x, point.y) {
+                Some(crate::window::status::StatusTarget::Zoom) => {
+                    crate::window::zoom_host::open_picker(hwnd);
+                }
                 Some(crate::window::status::StatusTarget::Language) => {
                     open_language_picker(hwnd);
                 }
@@ -613,6 +616,8 @@ pub(super) unsafe extern "system" fn main_window_proc(
                     if let Some(id) = group_of_child(hwnd, wparam as HWND) {
                         activate_group(hwnd, id);
                     }
+                    // A focused preview beside the editor takes the zoom the bar shows.
+                    super::chrome::invalidate_status_bar(hwnd);
                     return 0;
                 }
                 crate::window::WM_FASTPAD_PREVIEW_MENU => {
@@ -628,6 +633,10 @@ pub(super) unsafe extern "system" fn main_window_proc(
                             request,
                         );
                     }
+                    return 0;
+                }
+                crate::window::WM_FASTPAD_PREVIEW_ZOOM => {
+                    crate::window::zoom_host::wheel_markdown(hwnd, wparam != 0);
                     return 0;
                 }
                 crate::window::WM_FASTPAD_PREVIEW_ESCAPE => {
@@ -819,6 +828,10 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
     if notification.code == crate::editor::scintilla_constants::SCN_AUTOCCANCELLED {
         crate::window::markdown_completion::cancelled(hwnd, &editor);
         return;
+    }
+    // The editor taking the focus back from a preview beside it takes the zoom the bar shows.
+    if notification.code == crate::editor::scintilla_constants::SCN_FOCUSIN {
+        super::chrome::invalidate_status_bar(hwnd);
     }
     if notification.code == crate::editor::scintilla_constants::SCN_ZOOM {
         let _ = editor.remeasure_line_numbers();

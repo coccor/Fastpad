@@ -1,7 +1,7 @@
 //! Painted bottom bar: no child HWND. It appears once deferred chrome is built and then stays, so
 //! the first paint keeps the editor at full height. The left side shows the caret position, or the
-//! oldest pending notification while there is one; the right side shows the editor's zoom and
-//! names the active document's language and encoding, each of which opens a picker when clicked.
+//! oldest pending notification while there is one; the right side shows the zoom and names the
+//! active document's language and encoding, each of which opens a picker when clicked.
 
 use crate::document::Language;
 use crate::editor::CaretStatus;
@@ -42,7 +42,7 @@ pub struct ActiveDocumentStatus {
     pub encoding: Encoding,
     /// The tab is open for viewing only; the bar says so after the caret.
     pub read_only: bool,
-    /// The editor's zoom as a percentage of the configured font size (100 = none).
+    /// The zoom of what the tab zooms (the editor, or a preview showing instead of it) in percent.
     pub zoom_percent: u32,
 }
 
@@ -71,33 +71,45 @@ pub const ENCODINGS: [Encoding; 4] = [
 /// A clickable part of the bar's document details.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatusTarget {
+    Zoom,
     Language,
     Encoding,
 }
 
-/// Which detail `x` falls on, for "[zoom SEPARATOR] language SEPARATOR encoding" drawn right-aligned to
-/// `right_edge`. Widths are measured in the bar's font; `slop` widens each span on both sides so
-/// a click just beside the text still counts, without the two spans overlapping.
+/// One clickable detail of the right-aligned text: `tail` is the width from its left edge to the
+/// end of the text, `width` its own width, both measured in the bar's font.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StatusSpan {
+    pub target: StatusTarget,
+    pub tail: i32,
+    pub width: i32,
+}
+
+/// Which detail `x` falls on, for `spans` (left to right) of text drawn right-aligned to
+/// `right_edge`. `slop` widens each span on both sides so a click just beside the text still
+/// counts, without two neighbours overlapping: the gap between them is split evenly.
 pub fn status_target_at(
     x: i32,
     right_edge: i32,
-    full_width: i32,
-    language_width: i32,
-    encoding_width: i32,
+    spans: &[StatusSpan],
     slop: i32,
 ) -> Option<StatusTarget> {
-    let encoding_left = right_edge - encoding_width;
-    let language_left = right_edge - full_width;
-    let language_right = language_left + language_width;
-    // Split the gap between the two evenly so slop never makes them overlap.
-    let middle = (language_right + encoding_left) / 2;
-    if x >= (encoding_left - slop).max(middle) && x < right_edge + slop {
-        Some(StatusTarget::Encoding)
-    } else if x >= language_left - slop && x < (language_right + slop).min(middle) {
-        Some(StatusTarget::Language)
-    } else {
-        None
-    }
+    let bounds = spans
+        .iter()
+        .map(|span| (right_edge - span.tail, right_edge - span.tail + span.width))
+        .collect::<Vec<_>>();
+    spans.iter().enumerate().find_map(|(index, span)| {
+        let (left, right) = bounds[index];
+        let mut from = left - slop;
+        if let Some(&(_, previous_right)) = index.checked_sub(1).and_then(|i| bounds.get(i)) {
+            from = from.max((previous_right + left) / 2);
+        }
+        let mut to = right + slop;
+        if let Some(&(next_left, _)) = bounds.get(index + 1) {
+            to = to.min((right + next_left) / 2);
+        }
+        (x >= from && x < to).then_some(span.target)
+    })
 }
 
 pub fn status_bar_text(
@@ -198,8 +210,8 @@ pub fn encoding_name(encoding: Encoding) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveDocumentStatus, StatusBarText, StatusTarget, editor_zoom_percent, file_size_text,
-        image_status_bar_text, status_bar_text, status_target_at, status_text,
+        ActiveDocumentStatus, StatusBarText, StatusSpan, StatusTarget, editor_zoom_percent,
+        file_size_text, image_status_bar_text, status_bar_text, status_target_at, status_text,
     };
     use crate::document::Language;
     use crate::editor::CaretStatus;
@@ -229,7 +241,21 @@ mod tests {
         // Break caught: a click on the encoding opening the language picker (or the reverse), or
         // a click on the empty bar left of the details opening either.
         // "Markdown____UTF-8" right-aligned to 1000: language 800..880, gap, encoding 950..1000.
-        let at = |x| status_target_at(x, 1000, 200, 80, 50, 4);
+        let spans = |full, language, encoding| {
+            [
+                StatusSpan {
+                    target: StatusTarget::Language,
+                    tail: full,
+                    width: language,
+                },
+                StatusSpan {
+                    target: StatusTarget::Encoding,
+                    tail: encoding,
+                    width: encoding,
+                },
+            ]
+        };
+        let at = |x| status_target_at(x, 1000, &spans(200, 80, 50), 4);
         assert_eq!(at(700), None);
         assert_eq!(at(797), Some(StatusTarget::Language));
         assert_eq!(at(840), Some(StatusTarget::Language));
@@ -239,9 +265,40 @@ mod tests {
         assert_eq!(at(999), Some(StatusTarget::Encoding));
         assert_eq!(at(1004), None);
         // A gap narrower than the slop is split between the two, never shared.
-        let tight = |x| status_target_at(x, 1000, 132, 80, 50, 10);
+        let tight = |x| status_target_at(x, 1000, &spans(132, 80, 50), 10);
         assert_eq!(tight(949), Some(StatusTarget::Encoding));
         assert_eq!(tight(948), Some(StatusTarget::Language));
+    }
+
+    #[test]
+    fn a_click_on_the_zoom_left_of_the_language_finds_the_zoom() {
+        // Break caught: the zoom left out of the clickable details, or its span stealing clicks
+        // from the language beside it.
+        // "100%____Markdown____UTF-8" right-aligned to 1000: zoom 700..740, language 800..880.
+        let spans = [
+            StatusSpan {
+                target: StatusTarget::Zoom,
+                tail: 300,
+                width: 40,
+            },
+            StatusSpan {
+                target: StatusTarget::Language,
+                tail: 200,
+                width: 80,
+            },
+            StatusSpan {
+                target: StatusTarget::Encoding,
+                tail: 50,
+                width: 50,
+            },
+        ];
+        let at = |x| status_target_at(x, 1000, &spans, 4);
+        assert_eq!(at(690), None);
+        assert_eq!(at(697), Some(StatusTarget::Zoom));
+        assert_eq!(at(743), Some(StatusTarget::Zoom));
+        assert_eq!(at(770), None);
+        assert_eq!(at(797), Some(StatusTarget::Language));
+        assert_eq!(at(960), Some(StatusTarget::Encoding));
     }
 
     #[test]

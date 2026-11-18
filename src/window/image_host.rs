@@ -2,7 +2,6 @@
 //! and hides it and frees its device resources for text tabs.
 
 use crate::image_view::ImageView;
-use crate::window::commands::CommandId;
 use crate::window::main_window as host_window;
 use crate::window::split_tree::GroupId;
 use windows_sys::Win32::Foundation::{HWND, RECT};
@@ -191,18 +190,9 @@ pub(crate) fn layout(hwnd: HWND, id: GroupId, area: RECT) {
     }
 }
 
-/// Runs a zoom command on the active image tab; false when the active tab is not an image.
-pub(crate) fn zoom(hwnd: HWND, command: CommandId) -> bool {
-    let Some(view) = shown_view_hwnd(hwnd).and_then(|_| view(hwnd)) else {
-        return false;
-    };
-    match command {
-        CommandId::ZoomIn => view.zoom_in(),
-        CommandId::ZoomOut => view.zoom_out(),
-        CommandId::ZoomReset => view.zoom_reset(),
-        _ => return false,
-    }
-    true
+/// The active image tab's view while it shows, for the zoom commands and the zoom picker.
+pub(crate) fn active_view(hwnd: HWND) -> Option<ImageView> {
+    shown_view_hwnd(hwnd).and_then(|_| view(hwnd))
 }
 
 /// Re-reads the active image tab's disk stamp. A changed file is decoded again; a deleted one

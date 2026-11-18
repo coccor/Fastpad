@@ -101,6 +101,9 @@ pub const WM_FASTPAD_MOVE_PROGRESS: u32 = WM_APP + 0x61;
 /// Not part of the deferred chain: a folder move's outcome (`move_worker::Done`), as a `Box` the
 /// receiver frees. A post that fails because the window is gone is freed on the worker.
 pub const WM_FASTPAD_MOVE_DONE: u32 = WM_APP + 0x62;
+/// Ctrl+wheel over a Markdown preview; wparam is 1 to zoom in, 0 to zoom out. Posted to the main
+/// window, which zooms the previews. Not part of the deferred chain.
+pub const WM_FASTPAD_PREVIEW_ZOOM: u32 = WM_APP + 0x63;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeferredAction {

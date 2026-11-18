@@ -574,46 +574,43 @@ fn status_margin(dpi: u32) -> i32 {
     scale(10, dpi)
 }
 
-/// Which of the bottom bar's document details (painted by `paint` as `language`,
-/// `DETAILS_SEPARATOR`, `encoding`) is under client `x`, measured in the bar's font.
+/// Which of the bottom bar's right-aligned details is under client `x`. Each part is a target,
+/// the text from its start to the end of the bar's right text, and its own text, both measured
+/// in the bar's font.
 pub(crate) fn status_detail_at(
     hwnd: HWND,
     fonts: TitleFontHandles,
     x: i32,
-    language: &str,
-    encoding: &str,
+    parts: &[(crate::window::status::StatusTarget, &str, &str)],
 ) -> Option<crate::window::status::StatusTarget> {
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
     let mut client = RECT::default();
     unsafe {
         GetClientRect(hwnd, &mut client);
     }
-    let full = format!(
-        "{language}{}{encoding}",
-        crate::window::status::DETAILS_SEPARATOR
-    );
     let format = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
     let dc = unsafe { windows_sys::Win32::Graphics::Gdi::GetDC(hwnd) };
     if dc.is_null() {
         return None;
     }
-    let (full_width, language_width, encoding_width) = unsafe {
+    let spans = unsafe {
         let previous = select_font(dc, fonts.text);
-        let widths = (
-            measure_text(dc, &full, format),
-            measure_text(dc, language, format),
-            measure_text(dc, encoding, format),
-        );
+        let spans = parts
+            .iter()
+            .map(|&(target, tail, own)| crate::window::status::StatusSpan {
+                target,
+                tail: measure_text(dc, tail, format),
+                width: measure_text(dc, own, format),
+            })
+            .collect::<Vec<_>>();
         restore_font(dc, previous);
         windows_sys::Win32::Graphics::Gdi::ReleaseDC(hwnd, dc);
-        widths
+        spans
     };
     crate::window::status::status_target_at(
         x,
         client.right - status_margin(dpi),
-        full_width,
-        language_width,
-        encoding_width,
+        &spans,
         scale(4, dpi),
     )
 }

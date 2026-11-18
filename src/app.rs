@@ -64,6 +64,8 @@ pub struct App {
     pub(crate) file_drops_accepted: bool,
     /// The Direct2D factories every group's preview and image view share, created on first use.
     pub(crate) graphics: Option<Rc<crate::preview::dwrite::Graphics>>,
+    /// The Markdown previews' zoom in percent of the preview font size, one for every group.
+    pub(crate) preview_zoom: u32,
     /// The Markdown writing helpers' per-document state and their deferred work.
     pub(crate) markdown: crate::window::markdown_host::MarkdownRegistry,
     pub(crate) accessibility: AccessibilityState,
@@ -157,6 +159,7 @@ impl App {
             file_drops_accepted: false,
             last_sash_click: None,
             graphics: None,
+            preview_zoom: 100,
             markdown: Default::default(),
             accessibility: AccessibilityState::default(),
             keymap: crate::window::keymap::Keymap::defaults(),

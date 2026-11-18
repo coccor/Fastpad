@@ -598,20 +598,57 @@ pub(crate) fn owns_view(hwnd: HWND, window: HWND) -> bool {
             || svg_view(hwnd).is_some_and(|view| view.hwnd() == window))
 }
 
-/// Zooms the SVG preview while it has the keyboard focus; false otherwise, so the editor zooms.
-pub(crate) fn zoom_svg(hwnd: HWND, command: CommandId) -> bool {
-    let Some(view) = svg_view(hwnd).filter(|view| {
-        active_is_svg(hwnd) && mode(hwnd).shows_preview() && unsafe { GetFocus() } == view.hwnd()
-    }) else {
-        return false;
-    };
-    match command {
-        CommandId::ZoomIn => view.zoom_in(),
-        CommandId::ZoomOut => view.zoom_out(),
-        CommandId::ZoomReset => view.zoom_reset(),
-        _ => return false,
+/// Which preview the zoom acts on instead of the editor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ZoomedPreview {
+    Svg,
+    Markdown,
+}
+
+/// The active tab's preview while the zoom acts on it: while it fills the tab, or beside the
+/// editor while it has the keyboard focus. `None` zooms the editor.
+pub(crate) fn zoomed_preview(hwnd: HWND) -> Option<ZoomedPreview> {
+    let mode = mode(hwnd);
+    if !mode.shows_preview() || !preview_shown(hwnd) {
+        return None;
     }
-    true
+    let (kind, window) = if active_is_svg(hwnd) {
+        (ZoomedPreview::Svg, svg_view(hwnd)?.hwnd())
+    } else {
+        (ZoomedPreview::Markdown, view(hwnd)?.hwnd())
+    };
+    (mode == ViewMode::Preview || unsafe { GetFocus() } == window).then_some(kind)
+}
+
+/// The active SVG or FastDraw tab's picture while it shows.
+pub(crate) fn active_svg_view(hwnd: HWND) -> Option<ImageView> {
+    (active_is_svg(hwnd) && mode(hwnd).shows_preview())
+        .then(|| svg_view(hwnd))
+        .flatten()
+}
+
+/// Gives every group's Markdown preview the current fonts and zoom.
+pub(crate) fn refresh_all_appearance(hwnd: HWND) {
+    let groups = unsafe { host_window::app_ptr(hwnd) }
+        .map(|app| {
+            unsafe { app.as_ref() }
+                .groups
+                .iter()
+                .map(|group| group.id)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for id in groups {
+        in_group(id, || {
+            if let Some(view) = view(hwnd) {
+                // The text reflows at the new size: keep the same line at the top.
+                let top = view.top_line();
+                let (colors, fonts, dark) = appearance(hwnd);
+                view.set_appearance(colors, fonts, dark);
+                view.scroll_to_line(top);
+            }
+        });
+    }
 }
 
 pub(crate) fn run_command(hwnd: HWND, command: CommandId) {
@@ -728,16 +765,14 @@ fn appearance(hwnd: HWND) -> (PreviewColors, PreviewFonts, bool) {
             let app = unsafe { app.as_ref() };
             let high_contrast = app.theme.is_some_and(|system| system.high_contrast);
             let dark = Palette::for_cached_theme(app.theme, app.settings.theme).dark_frame;
-            (
-                preview_colors(theme, high_contrast),
-                PreviewFonts::from_settings(
-                    &app.settings.preview_font,
-                    &app.settings.font_face,
-                    app.settings.preview_font_size,
-                    app.settings.preview_line_height,
-                ),
-                dark,
-            )
+            let mut fonts = PreviewFonts::from_settings(
+                &app.settings.preview_font,
+                &app.settings.font_face,
+                app.settings.preview_font_size,
+                app.settings.preview_line_height,
+            );
+            fonts.body_size *= app.preview_zoom as f32 / 100.0;
+            (preview_colors(theme, high_contrast), fonts, dark)
         })
         .unwrap_or_else(|| {
             (
