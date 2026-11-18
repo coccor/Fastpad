@@ -1304,8 +1304,15 @@ fn leaving_live_for_split_keeps_the_place() {
     );
 }
 
+/// Sends a mouse message at client point (`x`, `y`) to `view`, with Ctrl and Shift as given, then
+/// runs what it queued.
+fn mouse(view: HWND, message: u32, point: (i32, i32), ctrl: bool, shift: bool) {
+    send_mouse(view, message, point, ctrl, shift);
+    pump_pending();
+}
+
 /// Sends a mouse message at client point (`x`, `y`) to `view`, with Ctrl and Shift as given.
-fn mouse(view: HWND, message: u32, (x, y): (i32, i32), ctrl: bool, shift: bool) {
+fn send_mouse(view: HWND, message: u32, (x, y): (i32, i32), ctrl: bool, shift: bool) {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_SHIFT,
     };
@@ -1318,7 +1325,6 @@ fn mouse(view: HWND, message: u32, (x, y): (i32, i32), ctrl: bool, shift: bool) 
     let lparam = ((y as u32 & 0xFFFF) << 16 | (x as u32 & 0xFFFF)) as isize;
     unsafe { SendMessageW(view, message, 0, lparam) };
     unsafe { SetKeyboardState(original.as_ptr()) };
-    pump_pending();
 }
 
 /// A right-click at `point`: press and release, which sends `WM_CONTEXTMENU`. `answer` picks the
@@ -1648,8 +1654,12 @@ fn escape_cancels_a_drag() {
 
 fn click(view: HWND, point: (i32, i32), ctrl: bool, shift: bool) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
-    mouse(view, WM_LBUTTONDOWN, point, ctrl, shift);
-    mouse(view, WM_LBUTTONUP, point, ctrl, shift);
+    // Down and up back to back, as a real click arrives: running queued messages in between
+    // would let a real WM_MOUSEMOVE at wherever the pointer is extend the press into a drag
+    // (the view holds capture while the button is down), moving the caret off the clicked spot.
+    send_mouse(view, WM_LBUTTONDOWN, point, ctrl, shift);
+    send_mouse(view, WM_LBUTTONUP, point, ctrl, shift);
+    pump_pending();
 }
 
 /// Client point `x_chars` average characters into row `row` (from the top of the view).
