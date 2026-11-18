@@ -2,12 +2,15 @@
 //! the parsed tree becomes Direct2D geometry once, and every paint replays it under the view's zoom
 //! and pan. Zooming never renders pixels ahead of time, so there is no blurred picture waiting to
 //! sharpen. A pattern's tile is drawn again, sharp, whenever the zoom changes its size on screen.
-//! Embedded SVG images (FastDraw's icons) are drawn as part of the tree. A tree using what this
-//! does not draw (`drawable` says no: filters, masks, embedded raster images, blend modes, nested
+//! Embedded SVG images (FastDraw's icons) are drawn as part of the tree. A group with a filter
+//! (drop shadows, blurs) or a mask is drawn offscreen at the view's zoom each paint, limited to
+//! what shows, and finished by Direct2D effects (`effects`). A tree using what this does not draw
+//! (`drawable` says no: other filter primitives, embedded raster images, blend modes, nested
 //! clips) keeps the resvg raster path.
 
 use resvg::tiny_skia::{PathSegment, Point, Transform};
 use resvg::usvg;
+use windows::Win32::Graphics::Direct2D::Common::D2D1_COMPOSITE_MODE_SOURCE_OVER;
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_SIZE_F, D2D_SIZE_U, D2D1_BEZIER_SEGMENT, D2D1_COLOR_F,
     D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN,
@@ -19,11 +22,13 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_SQUARE, D2D1_COMBINE_MODE_UNION,
     D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE, D2D1_DASH_STYLE_CUSTOM, D2D1_DASH_STYLE_SOLID,
     D2D1_DEFAULT_FLATTENING_TOLERANCE, D2D1_EXTEND_MODE, D2D1_EXTEND_MODE_CLAMP,
-    D2D1_EXTEND_MODE_MIRROR, D2D1_EXTEND_MODE_WRAP, D2D1_GAMMA_2_2, D2D1_LAYER_OPTIONS_NONE,
-    D2D1_LAYER_PARAMETERS, D2D1_LINE_JOIN, D2D1_LINE_JOIN_BEVEL, D2D1_LINE_JOIN_MITER_OR_BEVEL,
-    D2D1_LINE_JOIN_ROUND, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_QUADRATIC_BEZIER_SEGMENT,
-    D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES, D2D1_STROKE_STYLE_PROPERTIES, ID2D1Brush, ID2D1Factory,
-    ID2D1Geometry, ID2D1Layer, ID2D1PathGeometry, ID2D1RenderTarget, ID2D1StrokeStyle,
+    D2D1_EXTEND_MODE_MIRROR, D2D1_EXTEND_MODE_WRAP, D2D1_GAMMA_2_2,
+    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_LAYER_OPTIONS_NONE, D2D1_LAYER_PARAMETERS,
+    D2D1_LINE_JOIN, D2D1_LINE_JOIN_BEVEL, D2D1_LINE_JOIN_MITER_OR_BEVEL, D2D1_LINE_JOIN_ROUND,
+    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_QUADRATIC_BEZIER_SEGMENT,
+    D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES, D2D1_STROKE_STYLE_PROPERTIES, ID2D1Bitmap, ID2D1Brush,
+    ID2D1DeviceContext, ID2D1Factory, ID2D1Geometry, ID2D1Image, ID2D1Layer, ID2D1PathGeometry,
+    ID2D1RenderTarget, ID2D1StrokeStyle,
 };
 use windows::core::{Interface, Result};
 use windows_numerics::{Matrix3x2, Vector2};
@@ -34,8 +39,11 @@ pub(crate) fn drawable(tree: &usvg::Tree) -> bool {
 }
 
 fn group_drawable(group: &usvg::Group) -> bool {
-    group.mask().is_none()
-        && group.filters().is_empty()
+    group.mask().is_none_or(mask_drawable)
+        && group
+            .filters()
+            .iter()
+            .all(|filter| super::effects::filter_drawable(filter))
         && group.blend_mode() == usvg::BlendMode::Normal
         && group.clip_path().is_none_or(clip_drawable)
         && group.children().iter().all(node_drawable)
@@ -66,6 +74,10 @@ fn paint_drawable(paint: &usvg::Paint) -> bool {
         usvg::Paint::RadialGradient(gradient) => gradient.fr().get() == 0.0,
         usvg::Paint::Pattern(pattern) => group_drawable(pattern.root()),
     }
+}
+
+fn mask_drawable(mask: &usvg::Mask) -> bool {
+    group_drawable(mask.root()) && mask.mask().is_none_or(mask_drawable)
 }
 
 /// A clip path made only of shapes (and text), with no clip of its own anywhere inside.
@@ -138,6 +150,32 @@ enum Op {
         clip: Option<ID2D1Geometry>,
     },
     Pop,
+    /// A group with filters or a mask: drawn offscreen and finished by effects.
+    Effect(Box<EffectOp>),
+}
+
+/// A group drawn offscreen at each paint, as resvg draws an isolated group: its content, then its
+/// filters, its clip, its mask, and its opacity.
+struct EffectOp {
+    ops: Vec<Op>,
+    /// The group's space to the picture's.
+    transform: Transform,
+    /// What the group can cover with its filters, in its space.
+    layer: Option<resvg::tiny_skia::NonZeroRect>,
+    filters: Vec<std::sync::Arc<usvg::filter::Filter>>,
+    mask: Option<MaskOps>,
+    clip: Option<ID2D1Geometry>,
+    opacity: f32,
+}
+
+/// A mask's content, drawn into its own layer, clipped to its rectangle (in the masked group's
+/// space). As resvg: a mask of the mask applies to the masked content.
+struct MaskOps {
+    ops: Vec<Op>,
+    rect: resvg::tiny_skia::NonZeroRect,
+    kind: usvg::MaskType,
+    empty: bool,
+    mask: Option<Box<MaskOps>>,
 }
 
 /// A picture as Direct2D geometry, made once per parsed tree. The geometry belongs to the factory
@@ -228,82 +266,13 @@ impl Scene {
             tiles,
             ..
         } = self;
-        let made = made.as_ref().expect("made above");
-        // The brush for step `brush` drawn under `device`: a pattern's tile at that zoom.
-        let mut resolve = |brush: usize, device: Matrix3x2| -> Result<Option<ID2D1Brush>> {
-            if let Some(made) = &made[brush] {
-                return Ok(Some(made.clone()));
-            }
-            let Brush::Pattern { index, opacity } = brushes[brush] else {
-                return Ok(None);
-            };
-            let spec = &mut patterns[index];
-            let Some((pixels, scale)) = tile_size(spec, device) else {
-                return Ok(None);
-            };
-            if let Some((drawn, tile)) = tiles.get(&brush)
-                && *drawn == pixels
-            {
-                return Ok(Some(tile.clone()));
-            }
-            let tile = pattern_tile(target, spec, pixels, scale, opacity)?;
-            tiles.insert(brush, (pixels, tile.clone()));
-            Ok(Some(tile))
+        let mut painter = Painter {
+            made: made.as_ref().expect("made above"),
+            brushes,
+            patterns,
+            tiles,
         };
-        for op in ops.iter() {
-            match op {
-                Op::Fill {
-                    geometry,
-                    transform,
-                    brush,
-                } => {
-                    let device = multiply(*transform, view);
-                    if let Some(brush) = resolve(*brush, device)? {
-                        unsafe {
-                            target.SetTransform(&device);
-                            target.FillGeometry(geometry, &brush, None);
-                        }
-                    }
-                }
-                Op::Stroke {
-                    geometry,
-                    transform,
-                    brush,
-                    width,
-                    style,
-                } => {
-                    let device = multiply(*transform, view);
-                    if let Some(brush) = resolve(*brush, device)? {
-                        unsafe {
-                            target.SetTransform(&device);
-                            target.DrawGeometry(geometry, &brush, *width, style.as_ref());
-                        }
-                    }
-                }
-                Op::Push { opacity, clip } => unsafe {
-                    target.SetTransform(&view);
-                    let parameters = D2D1_LAYER_PARAMETERS {
-                        contentBounds: D2D_RECT_F {
-                            left: -f32::MAX,
-                            top: -f32::MAX,
-                            right: f32::MAX,
-                            bottom: f32::MAX,
-                        },
-                        geometricMask: std::mem::ManuallyDrop::new(clip.clone()),
-                        maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-                        maskTransform: Matrix3x2::identity(),
-                        opacity: *opacity,
-                        opacityBrush: std::mem::ManuallyDrop::new(None),
-                        layerOptions: D2D1_LAYER_OPTIONS_NONE,
-                    };
-                    target.PushLayer(&parameters, None::<&ID2D1Layer>);
-                    // The target took its own reference to the mask.
-                    drop(std::mem::ManuallyDrop::into_inner(parameters.geometricMask));
-                },
-                Op::Pop => unsafe { target.PopLayer() },
-            }
-        }
-        Ok(())
+        painter.ops(target, ops, view)
     }
 
     #[cfg(test)]
@@ -325,6 +294,265 @@ impl Scene {
             .count();
         (fills, strokes, layers)
     }
+}
+
+/// Draws a scene's steps, making pattern tiles as the zoom needs them.
+struct Painter<'a> {
+    made: &'a [Option<ID2D1Brush>],
+    brushes: &'a [Brush],
+    patterns: &'a mut [PatternSpec],
+    tiles: &'a mut std::collections::HashMap<usize, ((u32, u32), ID2D1Brush)>,
+}
+
+impl Painter<'_> {
+    /// The brush for step `brush` drawn under `device`: a pattern's tile at that zoom.
+    fn resolve(
+        &mut self,
+        target: &ID2D1RenderTarget,
+        brush: usize,
+        device: Matrix3x2,
+    ) -> Result<Option<ID2D1Brush>> {
+        if let Some(made) = &self.made[brush] {
+            return Ok(Some(made.clone()));
+        }
+        let Brush::Pattern { index, opacity } = self.brushes[brush] else {
+            return Ok(None);
+        };
+        let spec = &mut self.patterns[index];
+        let Some((pixels, scale)) = tile_size(spec, device) else {
+            return Ok(None);
+        };
+        if let Some((drawn, tile)) = self.tiles.get(&brush)
+            && *drawn == pixels
+        {
+            return Ok(Some(tile.clone()));
+        }
+        let tile = pattern_tile(target, spec, pixels, scale, opacity)?;
+        self.tiles.insert(brush, (pixels, tile.clone()));
+        Ok(Some(tile))
+    }
+
+    fn ops(&mut self, target: &ID2D1RenderTarget, ops: &[Op], view: Matrix3x2) -> Result<()> {
+        for op in ops {
+            match op {
+                Op::Fill {
+                    geometry,
+                    transform,
+                    brush,
+                } => {
+                    let device = multiply(*transform, view);
+                    if let Some(brush) = self.resolve(target, *brush, device)? {
+                        unsafe {
+                            target.SetTransform(&device);
+                            target.FillGeometry(geometry, &brush, None);
+                        }
+                    }
+                }
+                Op::Stroke {
+                    geometry,
+                    transform,
+                    brush,
+                    width,
+                    style,
+                } => {
+                    let device = multiply(*transform, view);
+                    if let Some(brush) = self.resolve(target, *brush, device)? {
+                        unsafe {
+                            target.SetTransform(&device);
+                            target.DrawGeometry(geometry, &brush, *width, style.as_ref());
+                        }
+                    }
+                }
+                Op::Push { opacity, clip } => unsafe {
+                    target.SetTransform(&view);
+                    push_layer(target, *opacity, clip.clone());
+                },
+                Op::Pop => unsafe { target.PopLayer() },
+                Op::Effect(effect) => self.effect(target, effect, view)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Draws `op`'s group into a layer covering what shows of it (and what its filters reach in
+    /// from outside the view), applies its filters and mask, and draws the result under its clip
+    /// and opacity.
+    fn effect(&mut self, target: &ID2D1RenderTarget, op: &EffectOp, view: Matrix3x2) -> Result<()> {
+        let device = multiply(matrix(op.transform), view);
+        let ts = transform(device);
+        let Some(bounds) = op.layer.and_then(|layer| layer.transform(ts)) else {
+            return Ok(());
+        };
+        let view_size = unsafe { target.GetSize() };
+        let reach = super::effects::reach(&op.filters, ts.get_scale()).min(4096.0);
+        // As resvg: an unfiltered layer is widened 2 pixels for its anti-aliased edges.
+        let pad = if op.filters.is_empty() { 2.0 } else { 0.0 };
+        let left = (bounds.left() - pad).floor().max(-reach.ceil());
+        let top = (bounds.top() - pad).floor().max(-reach.ceil());
+        let right = (bounds.right() + pad)
+            .ceil()
+            .min((view_size.width + reach).ceil());
+        let bottom = (bounds.bottom() + pad)
+            .ceil()
+            .min((view_size.height + reach).ceil());
+        if right <= left || bottom <= top {
+            return Ok(());
+        }
+        let size = ((right - left) as u32, (bottom - top) as u32);
+        let layer_view = Matrix3x2 {
+            M31: view.M31 - left,
+            M32: view.M32 - top,
+            ..view
+        };
+        let layer_ts = transform(multiply(matrix(op.transform), layer_view));
+        let context: ID2D1DeviceContext = target.cast()?;
+        let mut image: ID2D1Image = self
+            .offscreen(target, &op.ops, layer_view, size, None)?
+            .cast()?;
+        for filter in &op.filters {
+            match super::effects::apply_filter(&context, filter, layer_ts, &image, size)? {
+                Some(filtered) => image = filtered,
+                None => return Ok(()),
+            }
+        }
+        if let Some(mask) = &op.mask {
+            match self.masked(target, &context, image, mask, layer_view, layer_ts, size)? {
+                Some(masked) => image = masked,
+                None => return Ok(()),
+            }
+        }
+        let layer = op.clip.is_some() || op.opacity < 1.0;
+        unsafe {
+            if layer {
+                target.SetTransform(&view);
+                push_layer(target, op.opacity, op.clip.clone());
+            }
+            target.SetTransform(&Matrix3x2::identity());
+            context.DrawImage(
+                &image,
+                Some(&Vector2 { X: left, Y: top }),
+                None,
+                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                D2D1_COMPOSITE_MODE_SOURCE_OVER,
+            );
+            if layer {
+                target.PopLayer();
+            }
+        }
+        Ok(())
+    }
+
+    /// `content` under `mask`; `None` when the mask hides it all.
+    #[allow(clippy::too_many_arguments)]
+    fn masked(
+        &mut self,
+        target: &ID2D1RenderTarget,
+        context: &ID2D1DeviceContext,
+        content: ID2D1Image,
+        mask: &MaskOps,
+        view: Matrix3x2,
+        ts: Transform,
+        size: (u32, u32),
+    ) -> Result<Option<ID2D1Image>> {
+        if mask.empty {
+            return Ok(None);
+        }
+        let factory = unsafe { target.GetFactory()? };
+        let rect = unsafe {
+            factory.CreateRectangleGeometry(&D2D_RECT_F {
+                left: mask.rect.left(),
+                top: mask.rect.top(),
+                right: mask.rect.right(),
+                bottom: mask.rect.bottom(),
+            })?
+        };
+        let shape: ID2D1Image = self
+            .offscreen(
+                target,
+                &mask.ops,
+                view,
+                size,
+                Some((rect.cast()?, matrix(ts))),
+            )?
+            .cast()?;
+        let mut content = content;
+        if let Some(inner) = &mask.mask {
+            match self.masked(target, context, content, inner, view, ts, size)? {
+                Some(masked) => content = masked,
+                None => return Ok(None),
+            }
+        }
+        super::effects::apply_mask(context, &content, &shape, mask.kind).map(Some)
+    }
+
+    /// `ops` drawn under `view` into a new `size` bitmap of `target`'s device, inside `clip`
+    /// (a geometry and the transform it is drawn under) when one is given.
+    fn offscreen(
+        &mut self,
+        target: &ID2D1RenderTarget,
+        ops: &[Op],
+        view: Matrix3x2,
+        size: (u32, u32),
+        clip: Option<(ID2D1Geometry, Matrix3x2)>,
+    ) -> Result<ID2D1Bitmap> {
+        unsafe {
+            let layer = target.CreateCompatibleRenderTarget(
+                Some(&D2D_SIZE_F {
+                    width: size.0 as f32,
+                    height: size.1 as f32,
+                }),
+                Some(&D2D_SIZE_U {
+                    width: size.0,
+                    height: size.1,
+                }),
+                None,
+                D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE,
+            )?;
+            let surface: ID2D1RenderTarget = layer.cast()?;
+            surface.BeginDraw();
+            surface.Clear(Some(&D2D1_COLOR_F::default()));
+            if let Some((geometry, transform)) = &clip {
+                surface.SetTransform(transform);
+                push_layer(&surface, 1.0, Some(geometry.clone()));
+            }
+            let drawn = self.ops(&surface, ops, view);
+            if clip.is_some() {
+                surface.PopLayer();
+            }
+            surface.SetTransform(&Matrix3x2::identity());
+            surface.EndDraw(None, None)?;
+            drawn?;
+            layer.GetBitmap()
+        }
+    }
+}
+
+/// Pushes a layer of `opacity` clipped to `clip` under the target's current transform.
+unsafe fn push_layer(target: &ID2D1RenderTarget, opacity: f32, clip: Option<ID2D1Geometry>) {
+    let parameters = D2D1_LAYER_PARAMETERS {
+        contentBounds: D2D_RECT_F {
+            left: -f32::MAX,
+            top: -f32::MAX,
+            right: f32::MAX,
+            bottom: f32::MAX,
+        },
+        geometricMask: std::mem::ManuallyDrop::new(clip),
+        maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+        maskTransform: Matrix3x2::identity(),
+        opacity,
+        opacityBrush: std::mem::ManuallyDrop::new(None),
+        layerOptions: D2D1_LAYER_OPTIONS_NONE,
+    };
+    unsafe { target.PushLayer(&parameters, None::<&ID2D1Layer>) };
+    // The target took its own reference to the mask.
+    drop(std::mem::ManuallyDrop::into_inner(parameters.geometricMask));
+}
+
+/// Direct2D's row matrix as tiny-skia's transform.
+fn transform(matrix: Matrix3x2) -> Transform {
+    Transform::from_row(
+        matrix.M11, matrix.M12, matrix.M21, matrix.M22, matrix.M31, matrix.M32,
+    )
 }
 
 struct Builder<'a> {
@@ -361,6 +589,23 @@ impl Builder<'_> {
             .clip_path()
             .map(|clip| self.clip(clip, transform))
             .transpose()?;
+        if !group.filters().is_empty() || group.mask().is_some() {
+            let ops = self.nested(|builder| builder.group_children(group, transform))?;
+            let mask = group
+                .mask()
+                .map(|mask| self.mask(mask, transform))
+                .transpose()?;
+            self.ops.push(Op::Effect(Box::new(EffectOp {
+                ops,
+                transform,
+                layer: Some(group.layer_bounding_box()),
+                filters: group.filters().to_vec(),
+                mask,
+                clip,
+                opacity,
+            })));
+            return Ok(());
+        }
         let layer = opacity < 1.0 || clip.is_some();
         if layer {
             self.ops.push(Op::Push { opacity, clip });
@@ -370,6 +615,30 @@ impl Builder<'_> {
             self.ops.push(Op::Pop);
         }
         Ok(())
+    }
+
+    /// The steps `build` adds, kept apart from the ones before them.
+    fn nested(&mut self, build: impl FnOnce(&mut Self) -> Result<()>) -> Result<Vec<Op>> {
+        let before = std::mem::take(&mut self.ops);
+        let built = build(self);
+        let ops = std::mem::replace(&mut self.ops, before);
+        built.map(|()| ops)
+    }
+
+    /// `mask`'s content, placed in the masked group's space `transform`.
+    fn mask(&mut self, mask: &usvg::Mask, transform: Transform) -> Result<MaskOps> {
+        let ops = self.nested(|builder| builder.group_children(mask.root(), transform))?;
+        let inner = mask
+            .mask()
+            .map(|inner| self.mask(inner, transform).map(Box::new))
+            .transpose()?;
+        Ok(MaskOps {
+            ops,
+            rect: mask.rect(),
+            kind: mask.kind(),
+            empty: mask.root().children().is_empty(),
+            mask: inner,
+        })
     }
 
     /// The brush for `paint`; a pattern's content becomes a scene of its own.
@@ -868,13 +1137,12 @@ mod tests {
     }
 
     #[test]
-    fn filters_masks_blend_modes_and_images_stay_on_resvg() {
-        // Break caught: a blurred or masked SVG, or a photo inside one, drawn by Direct2D
-        // without its effect or its picture.
+    fn other_filters_blend_modes_and_images_stay_on_resvg() {
+        // Break caught: a turbulence or lighting filter, a blended group, or a photo inside an
+        // SVG drawn by Direct2D without its effect or its picture.
         for body in [
+            r#"<filter id="t"><feTurbulence baseFrequency="0.05"/></filter><rect width="10" height="10" filter="url(#t)"/>"#,
             r#"<image width="2" height="2" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="/>"#,
-            r#"<filter id="f"><feGaussianBlur stdDeviation="2"/></filter><rect width="10" height="10" filter="url(#f)"/>"#,
-            r#"<mask id="m"><rect width="5" height="5" fill="white"/></mask><rect width="10" height="10" mask="url(#m)"/>"#,
             r#"<rect width="10" height="10" style="mix-blend-mode:multiply"/>"#,
         ] {
             assert!(!drawable(&svg(body)), "{body}");
@@ -1017,6 +1285,61 @@ mod tests {
         save(name, &row, (width * 3, height));
     }
 
+    /// What keeps `tree` from Direct2D, for the corpus report.
+    fn not_drawable(tree: &usvg::Tree) -> Vec<String> {
+        fn walk(group: &usvg::Group, out: &mut Vec<String>) {
+            if group.blend_mode() != usvg::BlendMode::Normal {
+                out.push(format!("blend {:?}", group.blend_mode()));
+            }
+            for filter in group.filters() {
+                if !crate::image_view::effects::filter_drawable(filter) {
+                    for primitive in filter.primitives() {
+                        let kind = format!("{:?}", primitive.kind());
+                        out.push(format!(
+                            "filter {}",
+                            kind.split('(').next().unwrap_or_default()
+                        ));
+                    }
+                }
+            }
+            if let Some(clip) = group.clip_path()
+                && !super::clip_drawable(clip)
+            {
+                out.push("nested clip".to_owned());
+            }
+            if let Some(mask) = group.mask() {
+                walk(mask.root(), out);
+            }
+            for node in group.children() {
+                match node {
+                    usvg::Node::Group(group) => walk(group, out),
+                    usvg::Node::Text(text) => walk(text.flattened(), out),
+                    usvg::Node::Image(image) => match image.kind() {
+                        usvg::ImageKind::SVG(tree) => walk(tree.root(), out),
+                        _ => out.push("raster image".to_owned()),
+                    },
+                    usvg::Node::Path(path) => {
+                        for paint in path
+                            .fill()
+                            .map(|f| f.paint())
+                            .into_iter()
+                            .chain(path.stroke().map(|s| s.paint()))
+                        {
+                            if !super::paint_drawable(paint) {
+                                out.push("paint".to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(tree.root(), &mut out);
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Every `.svg` and `.fdraw` under the folders in `FASTPAD_VECTOR_CORPUS` (separated by `;`),
     /// drawn by Direct2D and by resvg, whole and as a 400% crop of the middle, and compared;
     /// diagrams in their light and dark looks. Prints what stays on resvg and why, and every
@@ -1080,7 +1403,7 @@ mod tests {
                     continue;
                 };
                 if !drawable(&tree) {
-                    raster.push(label);
+                    raster.push(format!("{label} {:?}", not_drawable(&tree)));
                     continue;
                 }
                 gpu_count += 1;
@@ -1190,6 +1513,50 @@ mod tests {
                 <image x="20" y="20" width="80" height="80" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 18 18'%3E%3Cdefs%3E%3ClinearGradient id='a' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%2332d4f5'/%3E%3Cstop offset='1' stop-color='%23198ab3'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect x='1' y='3' width='16' height='12' rx='2' fill='url(%23a)'/%3E%3Ccircle cx='9' cy='9' r='3' fill='%23fff'/%3E%3C/svg%3E"/>
                 <image x="120" y="30" width="60" height="30" preserveAspectRatio="xMidYMid meet" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'%3E%3Ccircle cx='5' cy='5' r='5' fill='%23e5484d'/%3E%3C/svg%3E"/></svg>"##,
             ),
+            (
+                "drop-shadow",
+                // The drop shadow design tools export (Figma), as in VS Code's illustrations.
+                r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="120">
+                <defs><filter id="s" x="10" y="10" width="120" height="100" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+                <feFlood flood-opacity="0" result="BackgroundImageFix"/>
+                <feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
+                <feOffset dy="4"/><feGaussianBlur stdDeviation="6"/>
+                <feColorMatrix type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.25 0"/>
+                <feBlend mode="normal" in2="BackgroundImageFix" result="effect1_dropShadow"/>
+                <feBlend mode="normal" in="SourceGraphic" in2="effect1_dropShadow" result="shape"/></filter>
+                <filter id="d"><feDropShadow dx="3" dy="5" stdDeviation="3" flood-color="#036" flood-opacity="0.6"/></filter></defs>
+                <rect width="200" height="120" fill="#f4f4f8"/>
+                <g filter="url(#s)"><rect x="30" y="26" width="80" height="56" rx="8" fill="#fff"/></g>
+                <circle cx="160" cy="60" r="24" fill="#e85" filter="url(#d)"/></svg>"##,
+            ),
+            (
+                "blur-and-composite",
+                r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="120">
+                <defs><filter id="b"><feGaussianBlur stdDeviation="4 1"/></filter>
+                <filter id="c"><feFlood flood-color="#08f" result="f"/><feComposite in="f" in2="SourceGraphic" operator="in" result="tinted"/>
+                <feMerge><feMergeNode in="tinted"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+                <filter id="a"><feFlood flood-color="#f60" flood-opacity="0.8" result="f"/><feComposite in="SourceGraphic" in2="f" operator="arithmetic" k1="0.5" k2="0.7" k3="0.2" k4="0"/></filter>
+                <filter id="h"><feColorMatrix type="hueRotate" values="90"/><feColorMatrix type="saturate" values="0.4"/></filter></defs>
+                <rect x="10" y="10" width="50" height="40" fill="#c0c" filter="url(#b)"/>
+                <path d="M80 10 h40 v40 z" fill="#333" filter="url(#c)"/>
+                <rect x="140" y="10" width="50" height="40" fill="#09c" filter="url(#a)"/>
+                <rect x="10" y="70" width="180" height="40" fill="#e33" filter="url(#h)"/></svg>"##,
+            ),
+            (
+                "masks",
+                r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="120">
+                <defs><linearGradient id="fade" x2="1"><stop offset="0" stop-color="#fff"/><stop offset="1" stop-color="#000"/></linearGradient>
+                <mask id="l"><rect width="200" height="120" fill="url(#fade)"/></mask>
+                <mask id="al" mask-type="alpha"><circle cx="150" cy="60" r="40" fill="#000" fill-opacity="0.5"/></mask>
+                <mask id="r" x="20" y="20" width="60" height="30" maskUnits="userSpaceOnUse"><rect width="200" height="120" fill="#fff"/></mask>
+                <mask id="soft" fill="white"><circle cx="40" cy="90" r="22"/></mask></defs>
+                <rect width="200" height="120" fill="#ddd"/>
+                <rect x="0" y="0" width="200" height="60" fill="#36c" mask="url(#l)"/>
+                <rect x="100" y="20" width="100" height="80" fill="#c33" mask="url(#al)"/>
+                <rect x="0" y="0" width="100" height="120" fill="#080" mask="url(#r)" opacity="0.7"/>
+                <!-- A shape's own edges in a luminance mask: faint white masks faintly. -->
+                <rect x="10" y="60" width="60" height="60" fill="#424242" mask="url(#soft)"/></svg>"##,
+            ),
         ];
         // A real FastDraw diagram: its look paints the paper with a dot pattern.
         let diagram = crate::preview::fastdraw::draw(
@@ -1242,5 +1609,73 @@ a -> b \"publish\"
         let scene = Scene::build(&_graphics.d2d, &tree).unwrap();
         // The line has no area to fill.
         assert_eq!(scene.counts(), (1, 2, 1));
+    }
+}
+#[cfg(test)]
+#[test]
+fn zz_device_context() {
+    use windows::Win32::Graphics::Direct2D::Common::*;
+    use windows::Win32::Graphics::Direct2D::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+    use windows::Win32::Graphics::Imaging::*;
+    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+    let _com = crate::preview::images::ComScope::enter();
+    let graphics = crate::preview::dwrite::Graphics::load().unwrap();
+    unsafe {
+        let wic: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).unwrap();
+        let bitmap = wic
+            .CreateBitmap(64, 64, &GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad)
+            .unwrap();
+        let props = D2D1_RENDER_TARGET_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            ..Default::default()
+        };
+        let target = graphics
+            .d2d
+            .CreateWicBitmapRenderTarget(&bitmap, &props)
+            .unwrap();
+        println!("CTX wic: {:?}", target.cast::<ID2D1DeviceContext>().is_ok());
+        let compat = target
+            .CreateCompatibleRenderTarget(
+                None,
+                Some(&D2D_SIZE_U {
+                    width: 8,
+                    height: 8,
+                }),
+                None,
+                D2D1_COMPATIBLE_RENDER_TARGET_OPTIONS_NONE,
+            )
+            .unwrap();
+        println!(
+            "CTX compat: {:?}",
+            compat.cast::<ID2D1DeviceContext>().is_ok()
+        );
+        let ctx: ID2D1DeviceContext = target.cast().unwrap();
+        let blur = ctx.CreateEffect(&CLSID_D2D1GaussianBlur);
+        println!("CTX blur effect: {:?}", blur.is_ok());
+        for (name, id) in [
+            ("alpha mask", CLSID_D2D1AlphaMask),
+            ("lum2alpha", CLSID_D2D1LuminanceToAlpha),
+            ("table", CLSID_D2D1TableTransfer),
+            ("morph", CLSID_D2D1Morphology),
+            ("tile", CLSID_D2D1Tile),
+            ("turb", CLSID_D2D1Turbulence),
+            ("convolve", CLSID_D2D1ConvolveMatrix),
+            ("flood", CLSID_D2D1Flood),
+            ("colormatrix", CLSID_D2D1ColorMatrix),
+            ("blend", CLSID_D2D1Blend),
+            ("composite", CLSID_D2D1Composite),
+            ("arith", CLSID_D2D1ArithmeticComposite),
+            ("crop", CLSID_D2D1Crop),
+            ("affine", CLSID_D2D12DAffineTransform),
+        ] {
+            println!("CTX {name}: {:?}", ctx.CreateEffect(&id).is_ok());
+        }
     }
 }

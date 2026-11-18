@@ -8,6 +8,7 @@
 pub mod accessible;
 mod cursor;
 pub mod decode;
+pub(crate) mod effects;
 mod paint;
 mod vector;
 pub mod zoom;
@@ -1551,7 +1552,7 @@ a: rect \"A\" at 0,0
         let view = view_in(&parent);
         // The filter keeps it on the raster path Direct2D leaves such pictures to.
         let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="1044" height="752">
-            <filter id="f"><feOffset dx="0"/></filter>
+            <filter id="f"><feComponentTransfer/></filter>
             <rect x="10" y="10" width="1024" height="732" fill="#48c" stroke="#000" filter="url(#f)"/></svg>"##;
         view.show_svg(svg.into(), "big.svg", true);
         settle(&view, 1);
