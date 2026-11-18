@@ -9,6 +9,7 @@ pub mod accessible;
 mod cursor;
 pub mod decode;
 mod paint;
+mod vector;
 pub mod zoom;
 
 use crate::Result;
@@ -92,6 +93,8 @@ pub struct ImageStats {
     pub whole: Option<(u32, u32)>,
     /// The zoom and area of the sharp tile over a deeply zoomed vector picture.
     pub tile: Option<(f32, decode::TileArea)>,
+    /// The picture is drawn by Direct2D at every paint, at any zoom, with no pixels rendered.
+    pub vector: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -129,6 +132,10 @@ struct ViewState {
     shown: Option<Shown>,
     generation: u64,
     image: Option<FullImage>,
+    /// The picture as Direct2D geometry while `image.vector`, made at its first paint.
+    scene: Option<vector::Scene>,
+    /// Direct2D draws pictures it can; cleared when making a scene fails, so resvg draws them.
+    gpu: bool,
     /// The visible part of a vector picture zoomed past `decode::WHOLE_PIXEL_BUDGET`, rendered
     /// sharp from the image's tree and drawn over the enlarged whole picture.
     tile: Option<Tile>,
@@ -201,6 +208,8 @@ impl ImageView {
             shown: None,
             generation: 0,
             image: None,
+            scene: None,
+            gpu: true,
             tile: None,
             tile_bitmap: None,
             tree_id: 0,
@@ -439,6 +448,7 @@ impl ImageView {
                 .as_ref()
                 .map(|image| (image.width, image.height)),
             tile: state.tile.as_ref().map(|tile| (tile.scale, tile.area)),
+            vector: drawn_by_gpu(state),
         })
         .unwrap_or_default()
     }
@@ -571,10 +581,15 @@ fn whole_size(image: &FullImage, state: &ViewState) -> (u32, u32) {
     )
 }
 
+/// Whether Direct2D draws the shown picture at every paint, so no zoom renders pixels.
+fn drawn_by_gpu(state: &ViewState) -> bool {
+    state.image.as_ref().is_some_and(|image| image.vector)
+}
+
 /// Whether the shown SVG bitmap is more than 1% off the size the current zoom renders at, so it
 /// is drawn stretched and should be rendered again.
 fn svg_needs_render(state: &ViewState) -> bool {
-    let Some(image) = &state.image else {
+    let Some(image) = state.image.as_ref().filter(|image| !image.vector) else {
         return false;
     };
     let (wanted, _) = whole_size(image, state);
@@ -584,7 +599,7 @@ fn svg_needs_render(state: &ViewState) -> bool {
 /// The tile the current zoom and position show sharp, when the vector picture is zoomed past
 /// what renders whole.
 fn tile_job(state: &ViewState) -> Option<TileJob> {
-    let image = state.image.as_ref()?;
+    let image = state.image.as_ref().filter(|image| !image.vector)?;
     image.tree.as_ref()?;
     let natural = (image.natural_width, image.natural_height);
     if !decode::tiled(natural, svg_width(state), state.max_side) {
@@ -623,7 +638,7 @@ fn wanted_tile(state: &ViewState) -> Option<TileJob> {
 /// Renders from the kept tree what the zoom and position want and the view lacks: the whole
 /// picture at another size, a sharp tile, or both. A document decode under way brings its own.
 fn refresh_vector(state: &mut ViewState) {
-    if !shows_vector(state) || state.loading || state.rendering {
+    if !shows_vector(state) || state.loading || state.rendering || drawn_by_gpu(state) {
         return;
     }
     let Some(image) = &state.image else {
@@ -663,6 +678,7 @@ fn schedule_tile(state: &mut ViewState) {
 
 fn clear_picture(state: &mut ViewState) {
     state.image = None;
+    state.scene = None;
     state.bitmap = None;
     state.tile = None;
     state.tile_bitmap = None;
@@ -693,13 +709,19 @@ fn start_svg_decode(state: &mut ViewState) {
     let width = svg_width(state);
     let tile = tile_job(state);
     let source = match state.shown.clone() {
-        Some(Shown::Svg(text)) => Source::Svg { text, width, tile },
+        Some(Shown::Svg(text)) => Source::Svg {
+            text,
+            width,
+            tile,
+            gpu: state.gpu,
+        },
         Some(Shown::FastDraw { text, file }) => Source::FastDraw {
             text,
             file,
             dark: state.colors.is_dark(),
             width,
             tile,
+            gpu: state.gpu,
         },
         _ => return,
     };
@@ -714,6 +736,9 @@ fn stop_loading(state: &mut ViewState) {
 
 fn drop_device_resources(state: &mut ViewState) {
     state.target = None;
+    if let Some(scene) = &mut state.scene {
+        scene.release_target();
+    }
     state.bitmap = None;
     state.tile_bitmap = None;
     state.checker = None;
@@ -739,6 +764,7 @@ fn accept_decoded(state: &mut ViewState, decoded: Decoded) {
                 state.zoom = Zoom::Fit;
             }
             state.image = Some(image);
+            state.scene = None;
             state.bitmap = None;
             state.tile = decoded.tile;
             state.tile_bitmap = None;
@@ -818,7 +844,7 @@ fn set_zoom(state: &mut ViewState, zoom: Zoom, anchor: (f32, f32)) {
         state.offset = zoom::zoom_about(state.offset, old, state.scale, anchor);
     }
     recompute(state);
-    if shows_vector(state) {
+    if shows_vector(state) && !drawn_by_gpu(state) {
         unsafe {
             SetTimer(
                 state.hwnd,
@@ -1489,13 +1515,44 @@ a: rect \"A\" at 0,0
     }
 
     #[test]
+    fn a_picture_direct2d_draws_zooms_without_rendering_anything_again() {
+        // Break caught: a zoom step waiting on a raster render (a blurred picture sharpening a
+        // moment later) for an SVG Direct2D can draw at any zoom.
+        let parent = TestWindow::new(400, 300);
+        let view = view_in(&parent);
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="1044" height="752">
+            <rect x="10" y="10" width="1024" height="732" fill="#48c" stroke="#000"/></svg>"##;
+        view.show_svg(svg.into(), "big.svg", true);
+        settle(&view, 1);
+        assert!(view.stats().vector);
+        assert_eq!(view.stats().whole, Some((0, 0)), "no pixels rendered");
+        while view.stats().scale < 16.0 {
+            view.zoom_in();
+        }
+        // A hidden test window gets no WM_PAINT of its own: paint it, as showing it would.
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(view.hwnd, WM_PAINT, 0, 0)
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        pump_until("any render the zoom asked for", || true);
+        let stats = view.stats();
+        assert_eq!((stats.decodes, stats.tile), (1, None));
+        assert!(
+            view.with(|state| !state.rendering && state.scene.is_some())
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn a_deep_zoom_renders_the_view_sharp_from_a_whole_picture_within_the_budget() {
         // Break caught: 800% rasterizing the whole 1044×752 picture (50 MP, 0.7 s a step in a
         // release build), or panning there leaving the uncovered part blurred.
         let parent = TestWindow::new(400, 300);
         let view = view_in(&parent);
+        // The filter keeps it on the raster path Direct2D leaves such pictures to.
         let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="1044" height="752">
-            <rect x="10" y="10" width="1024" height="732" fill="#48c" stroke="#000"/></svg>"##;
+            <filter id="f"><feOffset dx="0"/></filter>
+            <rect x="10" y="10" width="1024" height="732" fill="#48c" stroke="#000" filter="url(#f)"/></svg>"##;
         view.show_svg(svg.into(), "big.svg", true);
         settle(&view, 1);
         while view.stats().scale < 8.0 {

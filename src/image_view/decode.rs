@@ -69,6 +69,8 @@ pub struct FullImage {
     pub diagram: Option<DiagramFacts>,
     /// The parsed picture of an SVG or diagram, kept to render other zooms and tiles from.
     pub tree: Option<Arc<usvg::Tree>>,
+    /// The tree is drawn by Direct2D at every paint (`vector::Scene`); `pixels` is then empty.
+    pub vector: bool,
 }
 
 /// Past this many pixels, a vector picture is not rasterized whole at the zoom: the whole picture
@@ -149,10 +151,12 @@ pub type TileJob = (f32, TileArea);
 
 pub enum Source {
     File(PathBuf),
+    /// `gpu`: a tree Direct2D can draw comes back unrasterized, to be drawn at every paint.
     Svg {
         text: Arc<str>,
         width: u32,
         tile: Option<TileJob>,
+        gpu: bool,
     },
     FastDraw {
         text: Arc<str>,
@@ -160,6 +164,7 @@ pub enum Source {
         dark: bool,
         width: u32,
         tile: Option<TileJob>,
+        gpu: bool,
     },
 }
 
@@ -199,22 +204,25 @@ pub fn spawn(generation: u64, source: Source, max_side: u32, notify: HWND, messa
     std::thread::spawn(move || {
         let (result, tile) = match &source {
             Source::File(path) => (decode_file(path, max_side), None),
-            Source::Svg { text, width, tile } => {
-                split(decode_svg_source(text, *width, *tile, max_side))
-            }
+            Source::Svg {
+                text,
+                width,
+                tile,
+                gpu,
+            } => split(svg_source(text, *width, *tile, max_side, *gpu)),
             Source::FastDraw {
                 text,
                 file,
                 dark,
                 width,
                 tile,
-            } => split(decode_fastdraw(
+                gpu,
+            } => split(fastdraw_source(
                 text,
                 file.as_deref(),
                 *dark,
-                *width,
-                *tile,
-                max_side,
+                (*width, *tile, max_side),
+                *gpu,
             )),
         };
         post(
@@ -492,6 +500,7 @@ pub fn decode_file(path: &Path, max_side: u32) -> Result<FullImage, ImageError> 
             pixels,
             diagram: None,
             tree: None,
+            vector: false,
         })
     }
 }
@@ -555,7 +564,17 @@ pub fn decode_svg_source(
     tile: Option<TileJob>,
     max_side: u32,
 ) -> Result<(FullImage, Option<Tile>), ImageError> {
-    rasterize_svg(text, "SVG", target_width, tile, max_side)
+    svg_source(text, target_width, tile, max_side, false)
+}
+
+fn svg_source(
+    text: &str,
+    target_width: u32,
+    tile: Option<TileJob>,
+    max_side: u32,
+    gpu: bool,
+) -> Result<(FullImage, Option<Tile>), ImageError> {
+    rasterize_svg(text, "SVG", (target_width, tile, max_side), gpu)
 }
 
 /// Draws a FastDraw diagram and rasterizes it like an SVG. Errors that hide the drawing fail the
@@ -568,12 +587,26 @@ pub fn decode_fastdraw(
     tile: Option<TileJob>,
     max_side: u32,
 ) -> Result<(FullImage, Option<Tile>), ImageError> {
+    fastdraw_source(text, file, dark, (target_width, tile, max_side), false)
+}
+
+/// The zoom a picture rasterizes at: the whole picture's width, the sharp tile, and the target's
+/// largest bitmap side.
+type RasterJob = (u32, Option<TileJob>, u32);
+
+fn fastdraw_source(
+    text: &str,
+    file: Option<&Path>,
+    dark: bool,
+    job: RasterJob,
+    gpu: bool,
+) -> Result<(FullImage, Option<Tile>), ImageError> {
     let drawn = crate::preview::fastdraw::draw(text, file, dark);
     let band = crate::preview::fastdraw::band_text(&drawn.errors);
     if !drawn.show {
         return Err(ImageError::Diagram(band.unwrap_or_default()));
     }
-    let (mut image, tile) = rasterize_svg(&drawn.svg, "FastDraw", target_width, tile, max_side)?;
+    let (mut image, tile) = rasterize_svg(&drawn.svg, "FastDraw", job, gpu)?;
     image.diagram = Some(DiagramFacts {
         paper: drawn.paper,
         band,
@@ -581,18 +614,35 @@ pub fn decode_fastdraw(
     Ok((image, tile))
 }
 
+/// Parses `text` and rasterizes it for `job`, unless `gpu` and Direct2D can draw the whole tree:
+/// that comes back with no pixels, to be drawn at every paint.
 fn rasterize_svg(
     text: &str,
     format: &'static str,
-    target_width: u32,
-    tile: Option<TileJob>,
-    max_side: u32,
+    (target_width, tile, max_side): RasterJob,
+    gpu: bool,
 ) -> Result<(FullImage, Option<Tile>), ImageError> {
     if text.len() as u64 > MAX_SVG_BYTES {
         return Err(ImageError::SvgTooLarge);
     }
     let tree = parse(text).map_err(|_| ImageError::Damaged)?;
     let natural = natural_size(&tree);
+    if gpu && super::vector::drawable(&tree) {
+        return Ok((
+            FullImage {
+                width: 0,
+                height: 0,
+                natural_width: natural.0,
+                natural_height: natural.1,
+                format,
+                pixels: Vec::new(),
+                diagram: None,
+                tree: Some(Arc::new(tree)),
+                vector: true,
+            },
+            None,
+        ));
+    }
     let size = svg_render_size(natural, target_width, max_side, WHOLE_PIXEL_BUDGET);
     let (whole, tile) = render_parts(&tree, natural, Some(size), tile);
     let (width, height, pixels) = whole.expect("asked for the whole picture")?;
@@ -606,6 +656,7 @@ fn rasterize_svg(
             pixels,
             diagram: None,
             tree: Some(Arc::new(tree)),
+            vector: false,
         },
         tile,
     ))
