@@ -7,9 +7,9 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_BITMAP_BRUSH_PROPERTIES, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-    D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_BITMAP_PROPERTIES,
-    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_EXTEND_MODE_WRAP, ID2D1RenderTarget,
+    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_BRUSH_PROPERTIES,
+    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+    D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_EXTEND_MODE_WRAP, ID2D1RenderTarget,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL,
@@ -179,6 +179,42 @@ fn draw_tile(
     Ok(())
 }
 
+/// Draws the picture's Direct2D scene over `dest`, clipped to the view, making the scene at the
+/// first paint. A scene that cannot be made hands the picture back to resvg.
+fn draw_vector(
+    state: &mut ViewState,
+    target: &ID2D1RenderTarget,
+    dest: RectF,
+    client: RectF,
+) -> windows::core::Result<()> {
+    if state.scene.is_none() {
+        let tree = state.image.as_ref().and_then(|image| image.tree.clone());
+        match tree.map(|tree| super::vector::Scene::build(&state.graphics.d2d, &tree)) {
+            Some(Ok(scene)) => state.scene = Some(scene),
+            _ => {
+                state.gpu = false;
+                super::start_svg_decode(state);
+                return Ok(());
+            }
+        }
+    }
+    let Some(visible) = dest.intersect(&client) else {
+        return Ok(());
+    };
+    let Some(scene) = &mut state.scene else {
+        return Ok(());
+    };
+    unsafe { target.PushAxisAlignedClip(&visible.to_d2d(), D2D1_ANTIALIAS_MODE_ALIASED) };
+    let drawn = scene.draw(target, (dest.left, dest.top), (dest.width(), dest.height()));
+    unsafe { target.PopAxisAlignedClip() };
+    if drawn.is_err() {
+        state.scene = None;
+        state.gpu = false;
+        super::start_svg_decode(state);
+    }
+    Ok(())
+}
+
 pub(super) fn paint(state: &mut ViewState) -> windows::core::Result<()> {
     let hwnd = state.hwnd;
     let (width, height) = client_size(hwnd);
@@ -217,6 +253,7 @@ pub(super) fn paint(state: &mut ViewState) -> windows::core::Result<()> {
         );
         let (bitmap_width, bitmap_height, pixels_ptr) =
             (image.width, image.height, image.pixels.as_ptr());
+        let vector = image.vector;
         let paper = image.diagram.as_ref().map(|facts| facts.paper);
         if let Some(paper) = paper
             && let Some(visible) = dest.intersect(&client)
@@ -231,7 +268,9 @@ pub(super) fn paint(state: &mut ViewState) -> windows::core::Result<()> {
                 unsafe { target.FillRectangle(&visible.to_d2d(), checker) };
             }
         }
-        if state.bitmap.is_none() {
+        if vector {
+            draw_vector(state, &target, dest, client)?;
+        } else if state.bitmap.is_none() {
             state.bitmap = Some(unsafe {
                 target.CreateBitmap(
                     D2D_SIZE_U {
@@ -244,7 +283,9 @@ pub(super) fn paint(state: &mut ViewState) -> windows::core::Result<()> {
                 )?
             });
         }
-        let mode = if dest.width() > bitmap_width as f32 + 0.5 {
+        // A photo enlarged shows its pixels; a vector picture waiting for a sharper render is
+        // better smooth than blocky.
+        let mode = if dest.width() > bitmap_width as f32 + 0.5 && !super::shows_vector(state) {
             D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
         } else {
             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
