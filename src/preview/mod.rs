@@ -5,6 +5,7 @@ pub mod accessible;
 pub mod colors;
 pub mod dwrite;
 pub mod fastdraw;
+pub mod find;
 pub mod heights;
 pub mod html;
 mod html_entities;

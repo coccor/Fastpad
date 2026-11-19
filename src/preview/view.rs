@@ -6,6 +6,7 @@ use crate::Result;
 use crate::platform::{last_error, wide_null};
 use crate::preview::colors::{ColorRole, PreviewColors};
 use crate::preview::dwrite::Graphics;
+use crate::preview::find::{FindHit, PreviewFind};
 use crate::preview::heights::{HeightIndex, estimate_height, line_for_offset, offset_for_line};
 use crate::preview::images::{DiagramState, ImageCache, is_fdraw};
 use crate::preview::incremental::{Edit, PreviewDocument, SourceText, Update};
@@ -208,6 +209,14 @@ struct ViewState {
     update_started: Option<Instant>,
     /// On-screen links as of the last paint, shared with the accessibility provider.
     accessible: Arc<RwLock<Vec<VisibleLink>>>,
+    /// The find bar's query, while the bar shows one (2026-11-19 preview find highlights spec).
+    find: Option<PreviewFind>,
+    /// `find`'s matches in the rendered text, sorted by block, run and offset.
+    hits: Vec<FindHit>,
+    /// The index in `hits` of the current match.
+    current_hit: Option<usize>,
+    /// Blocks the last find recompute matched, for tests that check an edit stays local.
+    find_blocks_scanned: usize,
     /// Declared last so it drops last: the target, brushes, text layouts, and bitmaps above all
     /// live in d2d1.dll and dwrite.dll, which the final `Graphics` reference unloads.
     graphics: Rc<Graphics>,
@@ -267,6 +276,10 @@ impl PreviewView {
             opened_at: None,
             update_started: None,
             accessible: Arc::new(RwLock::new(Vec::new())),
+            find: None,
+            hits: Vec::new(),
+            current_hit: None,
+            find_blocks_scanned: 0,
         });
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize) };
         Ok(Self { hwnd })
@@ -455,6 +468,10 @@ impl PreviewView {
             }
             if opened {
                 state.layouts[found.block] = None;
+                // The opened sections' runs join the block, renumbering its runs.
+                if state.find.is_some() {
+                    recompute_find(state);
+                }
             }
             let reading = state.heights.anchor(state.scroll_y);
             if matches!(ensure_layouts(state, &[found.block]), Ok(true)) {
@@ -497,6 +514,8 @@ impl PreviewView {
             state.state_change = None;
             state.update_started = None;
             state.stats.block_count = 0;
+            state.hits = Vec::new();
+            state.current_hit = None;
             state.images.clear();
             drop_device_resources(state);
             *state
@@ -552,6 +571,55 @@ impl PreviewView {
                 .collect()
         })
         .unwrap_or_default()
+    }
+
+    /// Shades `find`'s matches, or none. With `reveal`, the current match is scrolled into view
+    /// when it is off screen. The matches are found again after every document update.
+    pub fn set_find(&self, find: Option<PreviewFind>, reveal: bool) {
+        self.with(|state| {
+            state.find = find;
+            recompute_find(state);
+            if reveal {
+                reveal_find(state);
+            }
+        });
+        invalidate(self.hwnd);
+    }
+
+    /// Moves the current find match to the one for the editor's `current` match, keeping the
+    /// other matches, and with `reveal` scrolls it into view (F3 before the recount lands).
+    pub fn set_find_current(&self, current: Option<std::ops::Range<usize>>, reveal: bool) {
+        self.with(|state| {
+            let Some(find) = state.find.as_mut() else {
+                return;
+            };
+            find.current = current;
+            state.current_hit = find.current.as_ref().and_then(|current| {
+                crate::preview::find::current_hit(
+                    &state.document.blocks,
+                    &state.hits,
+                    &find.editor_matches,
+                    current,
+                )
+            });
+            if reveal {
+                reveal_find(state);
+            }
+        });
+        invalidate(self.hwnd);
+    }
+
+    /// How many blocks the last find recompute matched.
+    #[cfg(test)]
+    pub fn find_blocks_scanned(&self) -> usize {
+        self.with(|state| state.find_blocks_scanned).unwrap_or(0)
+    }
+
+    /// The shaded matches and the index of the current one.
+    #[cfg(test)]
+    pub fn find_hits(&self) -> (Vec<FindHit>, Option<usize>) {
+        self.with(|state| (state.hits.clone(), state.current_hit))
+            .unwrap_or_default()
     }
 
     /// Whether some text is selected.
@@ -738,6 +806,12 @@ fn accept_update(state: &mut ViewState, update: Update, started: Instant) {
         state.selection = None;
         state.press = None;
     }
+    // The old hits index the old blocks.
+    let refind = update != Update::Unchanged && state.find.is_some();
+    let replaced = match &update {
+        Update::Replaced { old, new } => Some((old.clone(), new.clone())),
+        _ => None,
+    };
     let repaint = match update {
         Update::Unchanged => return,
         Update::Full => {
@@ -833,6 +907,13 @@ fn accept_update(state: &mut ViewState, update: Update, started: Instant) {
     state.outline = None;
     state.stats.block_count = state.document.blocks.len();
     state.stats.revision = state.document.revision;
+    if refind {
+        match replaced {
+            Some((old, new)) => refind_replaced(state, old, new),
+            None => recompute_find(state),
+        }
+        invalidate(state.hwnd);
+    }
     if repaint {
         state.update_started = Some(started);
         invalidate(state.hwnd);
@@ -998,6 +1079,41 @@ fn visible_indices(state: &mut ViewState, view_height: f32) -> Vec<usize> {
 
 fn max_scroll(state: &mut ViewState, view_height: f32) -> f32 {
     (state.heights.total() - (view_height - bar_height(state))).max(0.0)
+}
+
+/// Scrolls the current find match into view, a third of the way down, when any of it is off
+/// screen. A programmatic scroll: the editor is not told.
+fn reveal_find(state: &mut ViewState) {
+    let Some(hit) = state
+        .current_hit
+        .and_then(|index| state.hits.get(index))
+        .copied()
+    else {
+        return;
+    };
+    let reading = state.heights.anchor(state.scroll_y);
+    if matches!(ensure_layouts(state, &[hit.block]), Ok(true)) {
+        state.scroll_y = state.heights.scroll_for_anchor(reading);
+    }
+    let Some(rects) = state.layouts[hit.block]
+        .as_ref()
+        .and_then(|laid| laid.runs.get(hit.run as usize))
+        .and_then(|run| {
+            crate::preview::dwrite::range_rects(&run.layout, hit.start, hit.end, run.x, run.y).ok()
+        })
+    else {
+        return;
+    };
+    let (Some(first), Some(last)) = (rects.first(), rects.last()) else {
+        return;
+    };
+    let block_top = state.heights.top(hit.block);
+    let (top, bottom) = (block_top + first.top, block_top + last.bottom);
+    let (_, view_height) = view_size(state.hwnd);
+    let shown = view_height - bar_height(state);
+    if top < state.scroll_y || bottom > state.scroll_y + shown {
+        set_scroll(state, top - shown / 3.0, false);
+    }
 }
 
 fn set_scroll(state: &mut ViewState, y: f32, user: bool) {

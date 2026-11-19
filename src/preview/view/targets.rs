@@ -113,6 +113,10 @@ pub(super) fn toggle_details(state: &mut ViewState, key: &DetailsKey) {
         state.scroll_y = state.heights.scroll_for_anchor(reading);
     }
     state.state_change = Some(key.clone());
+    // The section's runs come and go, renumbering the block's runs the hits name.
+    if state.find.is_some() {
+        recompute_find(state);
+    }
     invalidate(state.hwnd);
 }
 

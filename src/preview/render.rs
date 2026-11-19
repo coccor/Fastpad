@@ -211,6 +211,10 @@ pub struct SelectionPaint<'a> {
     pub fill: ColorRole,
     /// Draw the selected text again in `SelectionText` (high contrast's `HighlightText`).
     pub recolor: bool,
+    /// The find bar's matches in each run, by run index: UTF-16 `(start, end, current)`.
+    pub matches: &'a dyn Fn(u32) -> Vec<(u32, u32, bool)>,
+    /// Outline every match, not only the current one (high contrast).
+    pub outline_matches: bool,
 }
 
 impl SelectionPaint<'_> {
@@ -218,7 +222,48 @@ impl SelectionPaint<'_> {
         range: &|_| None,
         fill: ColorRole::Selection,
         recolor: false,
+        matches: &|_| Vec::new(),
+        outline_matches: false,
     };
+}
+
+/// Fill opacity of a find match and of the current one, as the editor's find highlights
+/// (`editor/scintilla/find_highlight_ops.rs`).
+const MATCH_OPACITY: f32 = 60.0 / 255.0;
+const CURRENT_MATCH_OPACITY: f32 = 130.0 / 255.0;
+
+/// Shades run `run`'s find matches in `layout` drawn at `origin`: each one lightly, the current
+/// one more strongly and outlined.
+unsafe fn draw_matches(
+    target: &ID2D1RenderTarget,
+    brushes: &Brushes,
+    layout: &windows::Win32::Graphics::DirectWrite::IDWriteTextLayout,
+    origin: Vector2,
+    matches: Vec<(u32, u32, bool)>,
+    outline_all: bool,
+) {
+    let brush = brushes.get(ColorRole::FindMatch);
+    for (start, end, current) in matches {
+        let Ok(rects) = crate::preview::dwrite::range_rects(layout, start, end, origin.X, origin.Y)
+        else {
+            continue;
+        };
+        for rect in &rects {
+            unsafe {
+                brush.SetOpacity(if current {
+                    CURRENT_MATCH_OPACITY
+                } else {
+                    MATCH_OPACITY
+                });
+                target.FillRectangle(&rect.to_d2d(), brush);
+                if current || outline_all {
+                    brush.SetOpacity(1.0);
+                    target.DrawRectangle(&rect.inflate(-0.5).to_d2d(), brush, 1.0, None);
+                }
+            }
+        }
+    }
+    unsafe { brush.SetOpacity(1.0) };
 }
 
 /// Paints `ops` with their block origin at (`x`, `y`). Scrollable groups draw clipped and shifted
@@ -250,6 +295,16 @@ pub fn draw_ops(
                         X: x + left,
                         Y: y + top,
                     };
+                    if let Some(run) = run {
+                        draw_matches(
+                            target,
+                            brushes,
+                            layout,
+                            origin,
+                            (selection.matches)(*run),
+                            selection.outline_matches,
+                        );
+                    }
                     let rects = run
                         .and_then(|run| (selection.range)(run))
                         .and_then(|(start, end)| {

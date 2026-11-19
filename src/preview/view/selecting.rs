@@ -92,6 +92,107 @@ fn run_units(state: &mut ViewState, block: usize) -> Vec<Vec<u16>> {
     .collect()
 }
 
+/// Finds the find query's matches in every block's rendered runs (sections as they are shown)
+/// and picks the current one. None for a document too large for the find bar to count.
+pub(super) fn recompute_find(state: &mut ViewState) {
+    state.hits.clear();
+    state.current_hit = None;
+    if !findable(state) {
+        return;
+    }
+    let all = 0..state.document.blocks.len();
+    state.hits = hits_in_blocks(state, all, crate::window::find_bar::COUNT_CAP);
+    pick_current_hit(state);
+}
+
+/// After an incremental update replaced blocks `old` with `new`: the matches outside them are
+/// kept (renumbered past them) and only `new` is matched again, so typing with the find bar open
+/// costs the edited blocks, not the document.
+pub(super) fn refind_replaced(
+    state: &mut ViewState,
+    old: std::ops::Range<usize>,
+    new: std::ops::Range<usize>,
+) {
+    if !findable(state) {
+        state.hits.clear();
+        state.current_hit = None;
+        return;
+    }
+    let delta = new.len() as isize - old.len() as isize;
+    let mut kept = std::mem::take(&mut state.hits);
+    kept.retain(|hit| !old.contains(&hit.block));
+    for hit in &mut kept {
+        if hit.block >= old.end {
+            hit.block = (hit.block as isize + delta) as usize;
+        }
+    }
+    let room = crate::window::find_bar::COUNT_CAP.saturating_sub(kept.len());
+    let at = kept.partition_point(|hit| hit.block < new.start);
+    let found = hits_in_blocks(state, new, room);
+    kept.splice(at..at, found);
+    state.hits = kept;
+    pick_current_hit(state);
+}
+
+/// Whether there is a query and a document small enough for the find bar to count.
+fn findable(state: &ViewState) -> bool {
+    state.find.is_some()
+        && state
+            .document
+            .blocks
+            .last()
+            .is_some_and(|block| block.bytes.end <= crate::window::find_bar::COUNT_MAX_BYTES)
+}
+
+/// The query's matches in `blocks` (sections as they are shown), at most `cap`.
+fn hits_in_blocks(
+    state: &mut ViewState,
+    blocks: std::ops::Range<usize>,
+    cap: usize,
+) -> Vec<crate::preview::find::FindHit> {
+    state.find_blocks_scanned = blocks.len();
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+    let keys = section_keys(state, blocks.start..=blocks.end - 1);
+    let ViewState {
+        document,
+        find,
+        details_overrides,
+        ..
+    } = state;
+    let Some(find) = find.as_ref() else {
+        return Vec::new();
+    };
+    let runs = document.blocks[blocks.clone()]
+        .iter()
+        .zip(blocks)
+        .map(|(block, index)| {
+            let keys = keys.get(&index);
+            let runs = text_runs(&block.kind, &mut |section, attribute| {
+                keys.and_then(|keys| keys.get(section))
+                    .and_then(|key| details_overrides.get(key))
+                    .copied()
+                    .unwrap_or(attribute)
+            });
+            (index, runs.into_iter().map(|run| run.text).collect())
+        });
+    crate::preview::find::find_hits(runs, &find.matcher, cap)
+}
+
+/// Picks the current match from the editor's current one.
+fn pick_current_hit(state: &mut ViewState) {
+    state.current_hit = state.find.as_ref().and_then(|find| {
+        let current = find.current.as_ref()?;
+        crate::preview::find::current_hit(
+            &state.document.blocks,
+            &state.hits,
+            &find.editor_matches,
+            current,
+        )
+    });
+}
+
 /// The point after the last character of the document.
 fn document_end(state: &mut ViewState) -> TextPoint {
     let Some(last) = state.document.blocks.len().checked_sub(1) else {

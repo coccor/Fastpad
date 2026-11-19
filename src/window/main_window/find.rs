@@ -273,6 +273,27 @@ fn clear_find_highlights(hwnd: HWND) {
     {
         let _ = editor.clear_find_matches();
     }
+    crate::window::preview_host::set_find(hwnd, None, false);
+}
+
+/// The preview's copy of a counted query: the matcher the bar's options describe, with the
+/// editor's matches. `None` when there is nothing counted or the pattern doesn't compile.
+fn preview_find(
+    query: &str,
+    options: crate::search::MatchOptions,
+    found: Option<&find_bar::FoundMatches>,
+) -> Option<crate::preview::find::PreviewFind> {
+    let found = found?;
+    let matcher = if options.regex {
+        find_bar::regex_matcher(query, options)
+    } else {
+        crate::search::Matcher::new(query, options).ok()
+    }?;
+    Some(crate::preview::find::PreviewFind {
+        matcher,
+        editor_matches: found.ranges.clone(),
+        current: found.current(),
+    })
 }
 
 /// Whether the active group's find bar is showing, so its matches are highlighted.
@@ -340,6 +361,11 @@ pub(crate) fn refresh_find_count(hwnd: HWND) {
         Some(found) => editor.mark_find_matches(&found.ranges, found.current()),
         None => editor.clear_find_matches(),
     };
+    crate::window::preview_host::set_find(
+        hwnd,
+        preview_find(&query, options, found.as_ref()),
+        false,
+    );
     set_find_count(hwnd, found.map(|found| found.count));
 }
 
@@ -446,6 +472,7 @@ pub(super) fn select_match(
     // the bar closed (F3), nothing is highlighted.
     if find_bar_visible(hwnd) {
         let _ = editor.mark_find_current(found.clone());
+        crate::window::preview_host::set_find_current(hwnd, found.clone(), true);
     }
     set_find_no_match(hwnd, found.is_none());
     schedule_find_count(hwnd);

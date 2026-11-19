@@ -641,3 +641,117 @@ fn mermaid_blocks_draw_as_diagrams_and_keep_the_last_one_while_an_edit_renders_o
     assert_eq!(states, vec![("flowchart LR\n  A --> C".to_owned(), true)]);
     view.destroy();
 }
+
+fn preview_find(query: &str, editor_matches: &[std::ops::Range<usize>]) -> PreviewFind {
+    let current = editor_matches.first().cloned();
+    PreviewFind {
+        matcher: crate::search::Matcher::new(query, crate::search::MatchOptions::default())
+            .unwrap(),
+        editor_matches: editor_matches.to_vec(),
+        current,
+    }
+}
+
+#[test]
+fn set_find_shades_hits_and_clearing_removes_them() {
+    // Break caught: the view ignoring the find query, or keeping old shading after the bar
+    // closes.
+    let parent = TestWindow::new(800, 600);
+    let view = view_with(&parent, "one two one\n");
+    view.set_find(Some(preview_find("one", &[0..3, 8..11])), false);
+    let (hits, current) = view.find_hits();
+    assert_eq!(hits.len(), 2);
+    assert_eq!(current, Some(0));
+    view.set_find(None, false);
+    assert!(view.find_hits().0.is_empty());
+    view.destroy();
+}
+
+#[test]
+#[allow(clippy::single_range_in_vec_init)]
+fn an_edit_recomputes_the_hits() {
+    // Break caught: hits kept from before a reparse, missing new matches or pointing at blocks
+    // that no longer exist.
+    let parent = TestWindow::new(800, 600);
+    let view = view_with(&parent, "one\n");
+    view.set_find(Some(preview_find("one", &[0..3])), false);
+    view.reparse("one\n\none\n\none\n", Instant::now());
+    let (hits, _) = view.find_hits();
+    assert_eq!(hits.len(), 3);
+    let blocks = view.stats().block_count;
+    assert!(hits.iter().all(|hit| hit.block < blocks), "{hits:?}");
+    view.destroy();
+}
+
+#[test]
+#[allow(clippy::single_range_in_vec_init)]
+fn reveal_scrolls_the_current_hit_into_view() {
+    // Break caught: F3 moving the current match off screen in Preview mode, where the preview
+    // doesn't follow the editor.
+    let parent = TestWindow::new(800, 600);
+    let source = paragraphs(200);
+    let view = view_with(&parent, &source);
+    let at = source.find("para 150\n").unwrap();
+    view.set_find(Some(preview_find("para 150", &[at..at + 8])), true);
+    let line = view.top_line();
+    assert!((280..=300).contains(&line), "top line {line}");
+    view.destroy();
+}
+
+#[test]
+fn toggling_a_section_finds_its_hits_again() {
+    // Break caught: hits kept from before a section opened or closed, so its matches never
+    // show, or old run numbers shade the wrong text.
+    let parent = TestWindow::new(800, 600);
+    let view = view_with(&parent, SECTION);
+    view.set_find(Some(preview_find("Hidden", &[])), false);
+    assert!(view.find_hits().0.is_empty());
+    click(&view, visible_target(&view, true).rect);
+    assert_eq!(view.find_hits().0.len(), 1);
+    // The disclosure's rectangle is refreshed by a paint.
+    repaint(&view);
+    click(&view, visible_target(&view, true).rect);
+    assert!(view.find_hits().0.is_empty());
+    view.destroy();
+}
+
+#[test]
+fn an_incremental_edit_matches_only_the_replaced_blocks() {
+    // Break caught: every keystroke re-running the find over the whole document, or the hits
+    // after the edit keeping their old block numbers.
+    let parent = TestWindow::new(800, 600);
+    let mut source = paragraphs(50);
+    source.push_str("one\n");
+    let view = view_with(&parent, &source);
+    view.set_find(Some(preview_find("one", &[])), false);
+    assert_eq!(
+        view.find_hits().0,
+        [crate::preview::find::FindHit {
+            block: 50,
+            run: 0,
+            start: 0,
+            end: 3
+        }]
+    );
+    let position = source.find("para 10\n").unwrap();
+    let inserted = "one\n\n";
+    source.insert_str(position, inserted);
+    let update = view.apply_edits(
+        source.as_str(),
+        &[Edit {
+            position,
+            removed: 0,
+            inserted: inserted.len(),
+            lines_delta: 2,
+        }],
+        Instant::now(),
+        false,
+    );
+    let Some(Update::Replaced { new, .. }) = update else {
+        panic!("{update:?}");
+    };
+    let blocks: Vec<usize> = view.find_hits().0.iter().map(|hit| hit.block).collect();
+    assert_eq!(blocks, [10, 51]);
+    assert_eq!(view.find_blocks_scanned(), new.len());
+    view.destroy();
+}
