@@ -31,17 +31,19 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 
 /// Whether row `index` is the one a started drag carries (tree drag spec §3.2): both sides
 /// absent (no drag, and `index` past the rows the list actually has, such as the truncated row)
-/// must not read as a match. Only a dragged row matches: a tab or files are not tree rows.
+/// must not read as a match. Only a dragged row, or one of a dragged group, matches: a tab or
+/// files are not tree rows.
 pub(super) fn is_dragged_row<R: AsRef<TreeRow>>(
     dragged: Option<&DragSource>,
     rows: &[R],
     index: usize,
 ) -> bool {
-    let Some(DragSource::Row(dragged)) = dragged else {
-        return false;
-    };
-    rows.get(index)
-        .is_some_and(|row| &row.as_ref().kind == dragged)
+    let kind = rows.get(index).map(|row| &row.as_ref().kind);
+    match dragged {
+        Some(DragSource::Row(dragged)) => kind == Some(dragged),
+        Some(DragSource::Rows(items)) => kind.is_some_and(|kind| items.contains(kind)),
+        _ => false,
+    }
 }
 
 /// Draws `item`'s icon from `set` at `px` square, centred in `rect` and clipped to it (a deep row
@@ -572,6 +574,10 @@ impl NotebookView {
                 ),
                 name.clone(),
             ),
+            // A group shows its first item's icon and how many it carries.
+            DragSource::Rows(items) => {
+                (drag_item(items.first()?)?, format!("{} items", items.len()))
+            }
             DragSource::Files(_) | DragSource::GroupTab { .. } => return None,
         };
         let text = self

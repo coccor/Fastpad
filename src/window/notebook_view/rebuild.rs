@@ -201,6 +201,12 @@ pub(crate) fn rebuild(hwnd: HWND) {
             {
                 return true;
             }
+            // A group ends as one row does, when any of its rows went.
+            if let DragSource::Rows(items) = &drag.source
+                && (moved || items.iter().any(|kind| find(kind).is_none()))
+            {
+                return true;
+            }
             if drag.target.as_ref().is_some_and(|folder| {
                 !folder.as_os_str().is_empty() && find(&RowKind::Folder(folder.clone())).is_none()
             }) {

@@ -213,8 +213,6 @@ fn group_notice(failed: &[String], total: usize) -> String {
 /// moves it, and one that cannot is skipped. The view refreshes once, the selection is dropped
 /// and the cursor lands on the last row that moved; the failures are one notice. `items` are
 /// the effective selection, so a folder is not listed along with what is inside it.
-// Task 6 calls this from the drag code; until then only the tests do.
-#[allow(dead_code)]
 pub(crate) fn drop_many_into_of(
     hwnd: HWND,
     id: library_host::NotebookId,

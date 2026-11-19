@@ -734,3 +734,177 @@ fn a_folder_and_a_note_inside_it_move_once_with_the_folder() {
     );
     assert!(notices(hwnd).is_empty(), "{:?}", notices(hwnd));
 }
+
+/// The text of the drag's label, if it shows one.
+fn drag_label_text(hwnd: HWND) -> Option<String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextW;
+    let label = notebook_view(hwnd).drag_label?.hwnd();
+    let mut buffer = [0u16; 64];
+    let length = unsafe { GetWindowTextW(label, buffer.as_mut_ptr(), 64) };
+    Some(String::from_utf16_lossy(&buffer[..length as usize]))
+}
+
+/// Presses on the row showing `kind` of notebook `id` with `buttons` held and moves past the
+/// drag distance, the button still down.
+fn start_group_drag(
+    hwnd: HWND,
+    id: crate::window::library_host::NotebookId,
+    kind: &RowKind,
+    buttons: usize,
+) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+    let at = row_point(hwnd, id, kind);
+    let panel = sidebar_windows(hwnd).1;
+    mouse(panel, WM_LBUTTONDOWN, MK_LBUTTON | buttons, at);
+    let (x, y) = ((at & 0xffff) as i32, (at >> 16) as i32);
+    mouse(
+        panel,
+        WM_MOUSEMOVE,
+        MK_LBUTTON | buttons,
+        client_lparam(x + 30, y),
+    );
+}
+
+#[test]
+fn dragging_a_selection_onto_a_folder_moves_all_of_it() {
+    // Break caught: a drag from a selection that carries only the pressed row, a label naming
+    // one note, a group offered a folder one of its items refuses, or a drop moving only one.
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+    let _scintilla = load_native_scintilla();
+    let (scratch, window, _editor) = group_window("multi-drag", &["a.md", "b.md", "c.md"], &[]);
+    let hwnd = window.hwnd;
+    let id = first_id(hwnd);
+    let (a, b) = (note("a.md"), note("b.md"));
+    click_row(hwnd, &a, 0);
+    click_row(hwnd, &b, MK_CONTROL);
+    start_group_drag(hwnd, id, &b, 0);
+    assert_eq!(
+        notebook_view(hwnd)
+            .drag
+            .as_ref()
+            .map(|drag| drag.source.clone()),
+        Some(DragSource::Rows(vec![a.clone(), b.clone()]))
+    );
+    assert_eq!(drag_label_text(hwnd).as_deref(), Some("2 items"));
+    let panel = sidebar_windows(hwnd).1;
+    // The root is where both already are.
+    mouse(
+        panel,
+        WM_MOUSEMOVE,
+        MK_LBUTTON,
+        row_point(hwnd, id, &note("c.md")),
+    );
+    assert_eq!(notebook_view(hwnd).drag.as_ref().unwrap().target, None);
+    let work = row_point(hwnd, id, &RowKind::Folder("work".into()));
+    mouse(panel, WM_MOUSEMOVE, MK_LBUTTON, work);
+    assert_eq!(
+        notebook_view(hwnd).drag.as_ref().unwrap().target,
+        Some(std::path::PathBuf::from("work"))
+    );
+    mouse(panel, WM_LBUTTONUP, 0, work);
+    let folder = scratch.folder();
+    assert!(folder.join("work/a.md").exists() && folder.join("work/b.md").exists());
+    assert!(!folder.join("a.md").exists() && !folder.join("b.md").exists());
+    assert!(folder.join("c.md").exists());
+    assert_eq!(crate::window::notebook_view::selected_items(hwnd), None);
+    assert_eq!(
+        selected_row_of(hwnd),
+        Some((
+            id,
+            RowKind::Note(std::path::PathBuf::from("work").join("b.md"))
+        ))
+    );
+    assert!(drag_label_text(hwnd).is_none(), "the label went");
+}
+
+#[test]
+fn ctrl_dragging_a_selection_copies_it() {
+    // Break caught: a Ctrl+drag of a group that moves it, copies only the pressed row, or
+    // untoggles the row the drag started from.
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+    let _scintilla = load_native_scintilla();
+    let (scratch, window, _editor) =
+        group_window("multi-drag-copy", &["a.md", "b.md", "c.md"], &[]);
+    let hwnd = window.hwnd;
+    let id = first_id(hwnd);
+    let (a, b) = (note("a.md"), note("b.md"));
+    click_row(hwnd, &a, 0);
+    click_row(hwnd, &b, MK_CONTROL);
+    start_group_drag(hwnd, id, &a, MK_CONTROL);
+    assert_eq!(
+        notebook_view(hwnd)
+            .drag
+            .as_ref()
+            .map(|drag| drag.source.clone()),
+        Some(DragSource::Rows(vec![a, b]))
+    );
+    let panel = sidebar_windows(hwnd).1;
+    let work = row_point(hwnd, id, &RowKind::Folder("work".into()));
+    mouse(panel, WM_MOUSEMOVE, MK_LBUTTON | MK_CONTROL, work);
+    assert!(
+        notebook_view(hwnd)
+            .drag_hint()
+            .is_some_and(|hint| hint.starts_with("Copy to ")),
+        "{:?}",
+        notebook_view(hwnd).drag_hint()
+    );
+    mouse(panel, WM_LBUTTONUP, MK_CONTROL, work);
+    crate::window::copy_host::wait_for_copies(hwnd);
+    let folder = scratch.folder();
+    assert!(folder.join("a.md").exists() && folder.join("b.md").exists());
+    assert!(folder.join("work/a.md").exists() && folder.join("work/b.md").exists());
+    assert!(!folder.join("work/c.md").exists());
+}
+
+#[test]
+fn dropping_a_selection_on_another_notebook_moves_it_all_or_nothing() {
+    // Break caught: a group drop across notebooks that moves the items that fit and leaves the
+    // clashing one behind, or one that moves only the pressed row.
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("multi-drag-cross", "a", "b");
+    let hwnd = ab.window.hwnd;
+    std::fs::write(ab.a.join("a2.md"), "a2").unwrap();
+    std::fs::write(ab.b.join("a2.md"), "taken").unwrap();
+    rescan_and_wait(hwnd);
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, false);
+    crate::window::notebook_view::rebuild(hwnd);
+    let (a, a2) = (note("a.md"), note("a2.md"));
+    let panel = sidebar_windows(hwnd).1;
+    let drag_to_b = || {
+        click_row_in(hwnd, ab.a_id, &a, 0);
+        click_row_in(hwnd, ab.a_id, &a2, MK_CONTROL);
+        start_group_drag(hwnd, ab.a_id, &a, 0);
+        let root_b = row_point(hwnd, ab.b_id, &RowKind::Root);
+        mouse(panel, WM_MOUSEMOVE, MK_LBUTTON, root_b);
+        assert_eq!(
+            notebook_view(hwnd).drag_hint().as_deref(),
+            Some("Move to B")
+        );
+        mouse(panel, WM_LBUTTONUP, 0, root_b);
+    };
+
+    // B already has a2.md: nothing moves.
+    app_mut(hwnd).notifications.dismiss_all();
+    drag_to_b();
+    assert!(ab.a.join("a.md").exists() && ab.a.join("a2.md").exists());
+    assert!(!ab.b.join("a.md").exists());
+    assert_eq!(
+        std::fs::read_to_string(ab.b.join("a2.md")).unwrap(),
+        "taken"
+    );
+    assert_eq!(
+        notices(hwnd),
+        vec!["a2.md already exists in B. Nothing was moved.".to_owned()]
+    );
+
+    // Without the clash, both move.
+    std::fs::remove_file(ab.b.join("a2.md")).unwrap();
+    rescan_and_wait(hwnd);
+    crate::window::notebook_view::rebuild(hwnd);
+    drag_to_b();
+    pump_until(hwnd, || {
+        ab.b.join("a.md").exists() && ab.b.join("a2.md").exists()
+    });
+    assert!(!ab.a.join("a.md").exists() && !ab.a.join("a2.md").exists());
+}

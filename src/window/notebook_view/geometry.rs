@@ -371,7 +371,7 @@ impl NotebookView {
         };
         let is_row = matches!(
             self.drag.as_ref().map(|drag| &drag.source),
-            Some(DragSource::Row(_))
+            Some(DragSource::Row(_) | DragSource::Rows(_))
         );
         if let Some(under) = under {
             self.drop_notebook = Some(under);
@@ -427,9 +427,9 @@ impl NotebookView {
     /// inside its own notebook or where nothing takes it.
     pub(crate) fn drag_hint(&self) -> Option<String> {
         let drag = self.drag.as_ref().filter(|drag| drag.started)?;
-        let DragSource::Row(_) = &drag.source else {
+        if !matches!(drag.source, DragSource::Row(_) | DragSource::Rows(_)) {
             return None;
-        };
+        }
         let folder = drag.target.as_deref()?;
         let (from, dest) = (self.drag_notebook?, self.drop_notebook?);
         let root = self.notebook_folder(dest)?;

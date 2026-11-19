@@ -35,6 +35,9 @@ pub(crate) enum Hover {
 pub(crate) enum DragSource {
     /// A tree row: a drop moves it.
     Row(RowKind),
+    /// Two or more rows of one notebook, the effective selection (tree multi-select spec,
+    /// "Drag"): a drop moves them all, or with Ctrl copies them.
+    Rows(Vec<RowKind>),
     /// An Open Editors tab, from group `group`. Its name and file are taken when the drag
     /// armed, so the drag outlives its tab closing: a drop on a folder copies the file, one on a
     /// group moves or copies the view (split editors spec §6.2). Untitled tabs have no file.
@@ -73,14 +76,19 @@ pub(crate) struct Drag {
     pub(crate) copy: bool,
     /// A dragged row's file or folder on disk, for a copy's checks.
     pub(crate) row_path: Option<PathBuf>,
+    /// A dragged group's files and folders on disk, for a copy's checks.
+    pub(crate) group_paths: Vec<PathBuf>,
 }
 
 impl Drag {
-    /// A drag of `source` armed by a press at `x`, `y`; `None` for a row that cannot be dragged.
-    /// A tab or files always arm.
+    /// A drag of `source` armed by a press at `x`, `y`; `None` for a row that cannot be dragged,
+    /// or a group with one. A tab or files always arm.
     pub(crate) fn armed(source: DragSource, x: i32, y: i32) -> Option<Self> {
-        let arms = matches!(&source, DragSource::Row(kind) if draggable(kind))
-            || !matches!(source, DragSource::Row(_));
+        let arms = match &source {
+            DragSource::Row(kind) => draggable(kind),
+            DragSource::Rows(items) => !items.is_empty() && items.iter().all(draggable),
+            DragSource::Tab { .. } | DragSource::Files(_) | DragSource::GroupTab { .. } => true,
+        };
         arms.then_some(Self {
             source,
             origin: (x, y),
@@ -91,18 +99,24 @@ impl Drag {
             cross: false,
             copy: false,
             row_path: None,
+            group_paths: Vec::new(),
         })
     }
 
     /// Whether `folder`, of the notebook at `root`, takes this drag: a row copied by
     /// `tree_copy`'s rules, a row from another notebook anywhere, a row in its own notebook by
-    /// `accepts_here`, and a tab or files by `source_accepts`.
+    /// `accepts_here`, and a tab or files by `source_accepts`. A group goes the same way: copied
+    /// when any of its items copies, anywhere in another notebook, by `rows_accept` in its own.
     pub(crate) fn takes(&self, root: &Path, folder: &Path) -> bool {
         match &self.source {
             DragSource::Row(kind) if self.copy => self.row_path.as_ref().is_some_and(|path| {
                 draggable(kind) && tree_copy::any_accepted(std::slice::from_ref(path), root, folder)
             }),
             DragSource::Row(kind) if self.cross => draggable(kind),
+            DragSource::Rows(_) if self.copy => {
+                tree_copy::any_accepted(&self.group_paths, root, folder)
+            }
+            DragSource::Rows(items) if self.cross => items.iter().all(draggable),
             source => source_accepts(source, root, folder),
         }
     }
@@ -210,9 +224,9 @@ pub(crate) fn accepts_here(source: &RowKind, folder: &Path) -> bool {
     !(matches!(source, RowKind::Folder(_)) && crate::library::at_or_under(folder, path))
 }
 
-/// Whether `folder` takes a drag of `source`: a row by `accepts`, a tab or files when a copy
-/// there copies anything, so not onto itself, into itself or over its holder (open editors spec
-/// §4.3). `root` is the notebook's folder on disk.
+/// Whether `folder` takes a drag of `source`: a row by `accepts`, a group by `rows_accept`, a
+/// tab or files when a copy there copies anything, so not onto itself, into itself or over its
+/// holder (open editors spec §4.3). `root` is the notebook's folder on disk.
 pub(crate) fn source_accepts(source: &DragSource, root: &Path, folder: &Path) -> bool {
     match source {
         DragSource::Row(kind) => accepts_here(kind, folder),
@@ -224,7 +238,15 @@ pub(crate) fn source_accepts(source: &DragSource, root: &Path, folder: &Path) ->
         }
         DragSource::Tab { path: None, .. } => false,
         DragSource::Files(paths) => tree_copy::any_accepted(paths, root, folder),
+        DragSource::Rows(items) => rows_accept(items, folder),
     }
+}
+
+/// Whether `folder`, of the group's own notebook, takes a dragged group (tree multi-select spec,
+/// "Drag"): only when every item would go there by `accepts_here`. A folder that one item
+/// refuses (its own folder, itself or a folder inside it) refuses the whole group.
+pub(crate) fn rows_accept(items: &[RowKind], folder: &Path) -> bool {
+    !items.is_empty() && items.iter().all(|item| accepts_here(item, folder))
 }
 
 /// Where `source` lands when dropped into `folder`: the same name in that folder.
@@ -467,6 +489,45 @@ mod tests {
         assert!(
             accepts_here(&folder("work"), Path::new("workshop")),
             "a name prefix is not inside"
+        );
+    }
+
+    #[test]
+    fn a_group_is_refused_by_a_folder_inside_it_and_by_its_own_folder() {
+        // Break caught (Review Focus 3): a group offered a folder that one of its items refuses,
+        // so the drop moves a folder into itself or "moves" a note onto where it already is.
+        let group = [folder("work"), note("a.md")];
+        assert!(
+            !rows_accept(&group, Path::new(r"work\inner")),
+            "inside work"
+        );
+        assert!(!rows_accept(&group, Path::new("work")), "work itself");
+        assert!(!rows_accept(&group, Path::new("")), "a.md's own folder");
+        assert!(rows_accept(&group, Path::new("other")));
+        let notes = [note(r"work\b.md"), note("a.md")];
+        assert!(!rows_accept(&notes, Path::new("work")), "b.md's own folder");
+        assert!(rows_accept(&notes, Path::new(r"work\inner")));
+        assert!(!rows_accept(&[], Path::new("other")), "an empty group");
+
+        let root = Path::new(r"C:\A");
+        let mut drag = Drag::armed(DragSource::Rows(group.to_vec()), 0, 0).unwrap();
+        assert!(!drag.takes(root, Path::new(r"work\inner")));
+        assert!(drag.takes(root, Path::new("other")));
+        // Another notebook's folders all take it.
+        drag.cross = true;
+        assert!(drag.takes(Path::new(r"C:\B"), Path::new(r"work\inner")));
+        // A copy takes any folder where one of its items copies.
+        drag.cross = false;
+        drag.copy = true;
+        drag.group_paths = vec![PathBuf::from(r"C:\A\work"), PathBuf::from(r"C:\A\a.md")];
+        assert!(!drag.takes(root, Path::new("")), "both are already there");
+        assert!(
+            drag.takes(root, Path::new(r"work\inner")),
+            "a.md copies there, though work cannot"
+        );
+        assert!(
+            Drag::armed(DragSource::Rows(vec![note("a.md"), RowKind::Draft]), 0, 0).is_none(),
+            "the draft row cannot be dragged"
         );
     }
 

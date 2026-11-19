@@ -514,15 +514,24 @@ fn row_pressed(hwnd: HWND, index: usize, part: RowPart, buttons: WPARAM, x: i32,
             return None;
         }
         view.select(index);
-        Some((id, kind))
+        // The drag carries the selection as the press left it: two or more effective items
+        // as a group, a folder ticked with what is inside it as that folder alone.
+        let source = if view.multi.is_multi() {
+            match view.multi.effective().as_slice() {
+                [one] => DragSource::Row(one.clone()),
+                items => DragSource::Rows(items.to_vec()),
+            }
+        } else {
+            DragSource::Row(kind)
+        };
+        Some((id, source))
     })
     .flatten();
-    let Some((id, kind)) = taken else {
+    let Some((id, source)) = taken else {
         return false;
     };
-    // Until a group can be dragged, the drag carries the pressed row.
     if part == RowPart::Body {
-        arm_drag(hwnd, Some(id), DragSource::Row(kind), x, y);
+        arm_drag(hwnd, Some(id), source, x, y);
     }
     true
 }
