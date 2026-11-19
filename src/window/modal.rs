@@ -252,6 +252,16 @@ pub(crate) fn answer_next_choice(answer: impl FnOnce(HWND) -> usize + 'static) {
     CHOICE_ANSWERS.with(|answers| answers.borrow_mut().push_back(Box::new(answer)));
 }
 
+/// Drops the answers queued for `choose` that no question took.
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "read by the lib window tests, not by the source-linked integration targets"
+)]
+pub(crate) fn clear_choice_answers() {
+    CHOICE_ANSWERS.with(|answers| answers.borrow_mut().clear());
+}
+
 #[cfg(test)]
 thread_local! {
     static CHOICE_ANSWERS: std::cell::RefCell<std::collections::VecDeque<Answer<usize>>> =

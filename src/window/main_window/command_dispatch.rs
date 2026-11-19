@@ -82,6 +82,27 @@ pub(super) fn execute_command_with_note(
     crate::window::live_host::poll_active(hwnd);
 }
 
+/// Move to notebook… on the tree's ticked `items` of the notebook `id`: two or more go through
+/// the group's one picker; a folder ticked with what is inside it moves as that folder alone.
+fn move_ticked_to_notebook(
+    hwnd: HWND,
+    id: crate::window::library_host::NotebookId,
+    items: Vec<crate::library::tree::RowKind>,
+) {
+    use crate::library::tree::RowKind;
+    match items.as_slice() {
+        [RowKind::Folder(folder)] => {
+            crate::window::library_host::move_folder_to_notebook(hwnd, id, folder);
+        }
+        [RowKind::Note(relative)] => {
+            if let Some(root) = crate::window::library_host::notebook_folder(hwnd, id) {
+                crate::window::library_host::move_to_notebook(hwnd, &root.join(relative));
+            }
+        }
+        _ => crate::window::library_host::move_items_to_notebook(hwnd, id, items),
+    }
+}
+
 fn run_command(hwnd: HWND, command: CommandId, recorded: Option<std::path::PathBuf>) {
     #[cfg(test)]
     LAST_COMMAND.with(|last| last.set(Some(command)));
@@ -389,8 +410,16 @@ fn run_command(hwnd: HWND, command: CommandId, recorded: Option<std::path::PathB
             }
         }
         CommandId::NoteMoveToNotebook => {
-            // A selected folder row moves the folder (multi-root move spec §3.4).
-            if let Some((id, folder)) = &tree_folder {
+            // On a tree row with a selection ticked, the selection moves, as the group menu's
+            // entry (and its Ctrl+Shift+M) says (tree multi-select spec, "Move to notebook…").
+            let on_row = tree_folder.is_some() || tree_note.is_some();
+            let ticked = on_row
+                .then(|| crate::window::notebook_view::selection_effective(hwnd))
+                .flatten();
+            if let Some((id, items)) = ticked {
+                move_ticked_to_notebook(hwnd, id, items);
+            } else if let Some((id, folder)) = &tree_folder {
+                // A selected folder row moves the folder (multi-root move spec §3.4).
                 crate::window::library_host::move_folder_to_notebook(hwnd, *id, folder);
             } else if let Some(path) = note_target(hwnd, tree_note.as_deref()) {
                 crate::window::library_host::move_to_notebook(hwnd, &path);

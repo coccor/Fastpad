@@ -90,7 +90,7 @@ impl TreeSelection {
 
     /// Shift+click on `rows[to]`: selects the selectable rows of notebook `id` from the anchor to
     /// `to`, replacing the items. The anchor is the existing one, else the cursor row (an index
-    /// into `rows`), else `to`, and it stays put.
+    /// into `rows`), else `to`, and it stays put. A range of one row leaves nothing ticked.
     pub(crate) fn select_range(
         &mut self,
         rows: &[(NotebookId, RowKind)],
@@ -125,6 +125,11 @@ impl TreeSelection {
             .filter(|(rid, k)| *rid == id && selectable(k))
             .map(|(_, k)| k.clone())
             .collect();
+        // One row is no selection: the cursor row stands for it. The anchor stays, so the
+        // range goes on from it.
+        if self.items.len() < 2 {
+            self.items.clear();
+        }
     }
 
     /// Ctrl+A: every selectable row of notebook `id` that is shown.
@@ -296,6 +301,26 @@ mod tests {
         selection.toggle(&rows, NB, &note("b.md"), None);
         selection.toggle(&rows, NB, &note("a.md"), None);
         assert_eq!(selection.effective(), vec![note("a.md"), note("b.md")]);
+    }
+
+    #[test]
+    fn a_range_back_to_its_anchor_leaves_no_lone_ticked_row() {
+        // Break caught: Shift+Down then Shift+Up leaving one row ticked, painted as selected
+        // away from the cursor, that Esc cannot clear.
+        let rows = vec![(NB, RowKind::Root), (NB, note("a.md")), (NB, note("b.md"))];
+        let mut selection = TreeSelection::default();
+        selection.select_range(&rows, NB, 2, Some(1));
+        assert_eq!(selection.items, vec![note("a.md"), note("b.md")]);
+        selection.select_range(&rows, NB, 1, Some(2));
+        assert!(selection.items.is_empty());
+        assert!(!selection.contains(NB, &note("a.md")));
+        // The anchor stays, so the range goes on from it.
+        selection.select_range(&rows, NB, 2, Some(1));
+        assert_eq!(selection.items, vec![note("a.md"), note("b.md")]);
+        // From the root row (never selected) Shift+Down reaches one note only.
+        let mut fresh = TreeSelection::default();
+        fresh.select_range(&rows, NB, 1, Some(0));
+        assert!(fresh.items.is_empty());
     }
 
     #[test]

@@ -550,7 +550,7 @@ fn shift_down_extends_and_a_plain_down_clears() {
 fn ctrl_space_toggles_and_ctrl_a_selects_the_notebooks_notes_and_folders() {
     // Break caught: Ctrl+Space that moves or opens instead of ticking the cursor row, or Ctrl+A
     // that takes the root row, other notebooks' rows or rows of the wrong kind.
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_SPACE, VK_UP};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_SPACE, VK_UP};
     let _scintilla = load_native_scintilla();
     let scratch = LibraryScratch::new("multi-ctrl-space");
     std::fs::create_dir_all(scratch.folder().join("x")).unwrap();
@@ -567,13 +567,18 @@ fn ctrl_space_toggles_and_ctrl_a_selects_the_notebooks_notes_and_folders() {
         crate::window::notebook_view::selected_items(hwnd),
         Some((id, vec![a.clone(), b.clone()]))
     );
+    // A Ctrl+arrow moves the cursor and keeps the group, adding nothing to it (Explorer).
+    key_with(hwnd, VK_UP, CTRL);
+    assert_eq!(selected_row_of(hwnd), Some((id, a.clone())));
+    assert_eq!(
+        crate::window::notebook_view::selected_items(hwnd),
+        Some((id, vec![a.clone(), b.clone()]))
+    );
+    key_with(hwnd, VK_DOWN, CTRL);
     // Ctrl+Space on the cursor row (b) takes it out, leaving a lone note: no selection.
     key_with(hwnd, VK_SPACE, CTRL);
     assert_eq!(crate::window::notebook_view::selected_items(hwnd), None);
     assert_eq!(selected_row_of(hwnd), Some((id, b.clone())));
-    // A Ctrl+arrow moves nothing into the selection.
-    key_with(hwnd, VK_UP, CTRL);
-    assert_eq!(crate::window::notebook_view::selected_items(hwnd), None);
 
     key_with(hwnd, b'A' as u16, CTRL);
     let expected: Vec<RowKind> = view_rows(hwnd)
@@ -719,7 +724,9 @@ fn a_folder_and_a_note_inside_it_move_once_with_the_folder() {
     click_row(hwnd, &folder_x, MK_CONTROL);
     click_row(hwnd, &inner, MK_CONTROL);
     app_mut(hwnd).notifications.dismiss_all();
-    let (_, items) = crate::window::notebook_view::selected_items(hwnd).unwrap();
+    // One effective item is no group: actions take it alone.
+    assert_eq!(crate::window::notebook_view::selected_items(hwnd), None);
+    let (_, items) = crate::window::notebook_view::selection_effective(hwnd).unwrap();
     assert_eq!(items, vec![folder_x]);
     crate::window::tree_move::drop_many_into_of(hwnd, id, &items, std::path::Path::new("work"));
     assert!(scratch.folder().join("work/x/n.md").exists());
@@ -1069,6 +1076,15 @@ fn the_group_delete_question_counts_one_dirty_tab_in_the_singular() {
         delete_items_question(5, 0),
         "Move 5 items to the Recycle Bin?"
     );
+    // A guard: a group is two or more items, but one never reads "1 items".
+    assert_eq!(
+        delete_items_question(1, 0),
+        "Move 1 item to the Recycle Bin?"
+    );
+    assert_eq!(
+        delete_items_question(1, 2),
+        "Move 1 item to the Recycle Bin and discard unsaved changes in 2 open tabs?"
+    );
 }
 
 #[test]
@@ -1131,7 +1147,7 @@ fn a_group_delete_that_fails_for_one_item_deletes_the_rest_and_says_so_once() {
 #[test]
 fn delete_from_the_menu_of_a_ticked_row_deletes_the_group_and_of_another_row_just_it() {
     // Break caught: the menu's Delete… on a ticked row recycling only that row, or the menu
-    // opened from the keyboard on a row outside the group recycling the group.
+    // opened on a row outside the group (as a right-click there opens it) recycling the group.
     use crate::window::commands::CommandId;
     let _scintilla = load_native_scintilla();
     let (scratch, window, _editor) = notes_window(
@@ -1241,4 +1257,259 @@ fn move_to_notebook_on_a_selection_moves_all_items_with_one_picker() {
     assert!(!ab.a.join("a.md").exists() && !ab.a.join("work").exists());
     assert!(app_mut(hwnd).library.shown_move.is_none());
     assert!(app_mut(hwnd).library.shown_move_folders.is_none());
+}
+
+#[test]
+fn ctrl_shift_m_with_a_selection_moves_the_whole_group() {
+    // Break caught: the menu advertising Ctrl+Shift+M for the group while the key moves only
+    // the cursor row.
+    let _scintilla = load_native_scintilla();
+    let ab = super::cross_move::two(
+        "multi-key-move",
+        &[("a.md", "a"), (r"work\x.md", "x"), ("c.md", "c")],
+        &[],
+    );
+    let hwnd = ab.window.hwnd;
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, false);
+    crate::window::notebook_view::rebuild(hwnd);
+    let (a, work) = (note("a.md"), RowKind::Folder("work".into()));
+    click_row_in(hwnd, ab.a_id, &a, 0);
+    click_row_in(hwnd, ab.a_id, &work, MK_CONTROL);
+    let panel = sidebar_windows(hwnd).1;
+    unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(panel) };
+
+    execute_command(hwnd, CommandId::NoteMoveToNotebook);
+
+    let (mut items, _) = app_mut(hwnd)
+        .library
+        .shown_move
+        .clone()
+        .expect("the picker");
+    items.sort();
+    assert_eq!(items, [ab.a.join("a.md"), ab.a.join("work")]);
+}
+
+#[test]
+fn del_on_a_folder_ticked_with_a_note_inside_asks_the_folders_own_question() {
+    // Break caught: a folder ticked with its own note treated as a "group" of one item: "Move 1
+    // items to the Recycle Bin?" instead of the folder's question with its note count, or the
+    // cursor row (the note inside) deleted alone.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_DELETE;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("multi-folder-one");
+    std::fs::create_dir_all(scratch.folder().join("x")).unwrap();
+    scratch.note("x/n.md", "n");
+    scratch.note("x/m.md", "m");
+    scratch.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    scratch.install(window.hwnd);
+    let hwnd = window.hwnd;
+    crate::window::library_host::set_expanded(hwnd, std::path::Path::new("x"), true);
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, false);
+    crate::window::notebook_view::rebuild(hwnd);
+    let (folder_x, inner) = (
+        RowKind::Folder("x".into()),
+        RowKind::Note(std::path::PathBuf::from("x").join("n.md")),
+    );
+    click_row(hwnd, &folder_x, MK_CONTROL);
+    click_row(hwnd, &inner, MK_CONTROL);
+    assert_eq!(selected_row_of(hwnd), Some((first_id(hwnd), inner.clone())));
+    assert_eq!(crate::window::notebook_view::selected_items(hwnd), None);
+
+    // The menu on the ticked note is the folder's own full menu.
+    crate::window::menus::answer_next_popup_menu(|_| None);
+    crate::window::notebook_view::open_context_menu(hwnd, row_of(hwnd, &inner), None);
+    let labels: Vec<String> = crate::window::menus::last_popup_entries()
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect();
+    assert_eq!(labels[0], "New note here", "{labels:?}");
+
+    crate::window::modal::take_last_confirm();
+    crate::window::modal::answer_next_confirm(|_| false);
+    assert!(crate::window::notebook_view::key_down(hwnd, VK_DELETE));
+    assert_eq!(
+        crate::window::modal::take_last_confirm().as_deref(),
+        Some("Move \u{201c}x\u{201d} and its 2 notes to the Recycle Bin?")
+    );
+    assert!(scratch.folder().join("x/n.md").exists());
+}
+
+/// Queues `count` answers to the links question, each choosing "Update links" and counting the
+/// times it was asked; `shown` records whether the moved row `kind` was in the tree by then.
+fn count_link_questions(
+    hwnd: HWND,
+    count: usize,
+    kind: RowKind,
+) -> (
+    std::rc::Rc<std::cell::Cell<usize>>,
+    std::rc::Rc<std::cell::Cell<bool>>,
+) {
+    let asked = std::rc::Rc::new(std::cell::Cell::new(0));
+    let shown = std::rc::Rc::new(std::cell::Cell::new(false));
+    for _ in 0..count {
+        let (asked, shown, kind) = (asked.clone(), shown.clone(), kind.clone());
+        crate::window::modal::answer_next_choice(move |_| {
+            asked.set(asked.get() + 1);
+            shown.set(view_rows(hwnd).iter().any(|(_, row)| *row == kind));
+            0
+        });
+    }
+    (asked, shown)
+}
+
+#[test]
+fn a_group_move_asks_the_links_question_once_after_the_tree_shows_the_move() {
+    // Break caught: one "Update links?" question per moved note, or the question asked over a
+    // tree still showing the notes where they were.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("multi-move-links");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let hwnd = window.hwnd;
+    app_mut(hwnd).library.data_dir = Some(scratch.data());
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    scratch.note("P.md", "# P\n");
+    scratch.note("Q.md", "# Q\n");
+    let from = open_note(&window, &scratch, "a.md", "[p](P.md) and [q](Q.md)\n");
+    ensure_sidebar(hwnd);
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, false);
+    crate::window::notebook_view::rebuild(hwnd);
+    let moved_q = RowKind::Note(std::path::PathBuf::from("work").join("Q.md"));
+    let (asked, shown) = count_link_questions(hwnd, 2, moved_q);
+    crate::window::modal::take_last_choice();
+
+    crate::window::tree_move::drop_many_into_of(
+        hwnd,
+        first_id(hwnd),
+        &[note("P.md"), note("Q.md")],
+        std::path::Path::new("work"),
+    );
+
+    crate::window::modal::clear_choice_answers();
+    assert_eq!(asked.get(), 1, "one question for the group");
+    assert!(shown.get(), "the tree showed the move before the question");
+    let (question, _) = crate::window::modal::take_last_choice().expect("asked");
+    assert_eq!(
+        question,
+        "Update 2 links in 1 note to point to the moved notes?"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&from).unwrap(),
+        "[p](work/P.md) and [q](work/Q.md)\n"
+    );
+}
+
+#[test]
+fn a_one_row_move_shows_the_move_in_the_tree_before_asking_about_links() {
+    // Break caught: the links question shown over a tree still showing the note where it was.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("multi-move-link-one");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    let hwnd = window.hwnd;
+    app_mut(hwnd).library.data_dir = Some(scratch.data());
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    scratch.note("P.md", "# P\n");
+    open_note(&window, &scratch, "a.md", "[p](P.md)\n");
+    ensure_sidebar(hwnd);
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, false);
+    crate::window::notebook_view::rebuild(hwnd);
+    let moved = RowKind::Note(std::path::PathBuf::from("work").join("P.md"));
+    let (asked, shown) = count_link_questions(hwnd, 1, moved);
+
+    crate::window::tree_move::drop_into(hwnd, &note("P.md"), std::path::Path::new("work"));
+
+    crate::window::modal::clear_choice_answers();
+    assert_eq!(asked.get(), 1);
+    assert!(shown.get(), "the tree showed the move before the question");
+}
+
+/// Holds `keys` down in this thread's keyboard state while `run` runs.
+fn with_keys_down<R>(keys: &[u16], run: impl FnOnce() -> R) -> R {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, SetKeyboardState};
+    let mut state = [0u8; 256];
+    unsafe { GetKeyboardState(state.as_mut_ptr()) };
+    let original = state;
+    for key in keys {
+        state[usize::from(*key)] = 0x80;
+    }
+    unsafe { SetKeyboardState(state.as_ptr()) };
+    let result = run();
+    unsafe { SetKeyboardState(original.as_ptr()) };
+    result
+}
+
+#[test]
+fn ctrl_arrows_keep_the_selection_so_ctrl_space_builds_a_gapped_one() {
+    // Break caught: a keyboard that can only tick a contiguous run, because Ctrl+Down drops
+    // what Ctrl+Space ticked.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_SPACE};
+    let _scintilla = load_native_scintilla();
+    let (_scratch, window, _editor) = notes_window("multi-ctrl-gap", &["a.md", "b.md", "c.md"]);
+    let hwnd = window.hwnd;
+    let id = first_id(hwnd);
+    let (a, c) = (note("a.md"), note("c.md"));
+    click_row(hwnd, &a, 0);
+    key_with(hwnd, VK_SPACE, CTRL);
+    key_with(hwnd, VK_DOWN, CTRL);
+    key_with(hwnd, VK_DOWN, CTRL);
+    assert_eq!(selected_row_of(hwnd), Some((id, c.clone())));
+    key_with(hwnd, VK_SPACE, CTRL);
+    assert_eq!(
+        crate::window::notebook_view::selected_items(hwnd),
+        Some((id, vec![a, c]))
+    );
+}
+
+#[test]
+fn ctrl_spaces_character_does_not_reach_type_ahead() {
+    // Break caught: the ' ' that Ctrl+Space types joining the type-ahead prefix, so a letter
+    // typed right after it finds nothing.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_CHAR;
+    let _scintilla = load_native_scintilla();
+    let (_scratch, window, _editor) = notes_window("multi-ctrl-char", &["a.md", "b.md", "c.md"]);
+    let hwnd = window.hwnd;
+    let id = first_id(hwnd);
+    click_row(hwnd, &note("a.md"), 0);
+    let panel = sidebar_windows(hwnd).1;
+    with_keys_down(&[VK_CONTROL], || unsafe {
+        SendMessageW(panel, WM_CHAR, ' ' as usize, 0)
+    });
+    assert_eq!(selected_row_of(hwnd), Some((id, note("a.md"))));
+    unsafe { SendMessageW(panel, WM_CHAR, 'c' as usize, 0) };
+    assert_eq!(selected_row_of(hwnd), Some((id, note("c.md"))));
+}
+
+#[test]
+fn the_keyboard_menu_on_an_unticked_row_opens_the_groups_menu() {
+    // Break caught: Shift+F10 on the cursor row outside the group offering that row's own menu
+    // while Del on the same row takes the group.
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU;
+    let _scintilla = load_native_scintilla();
+    let (scratch, window, _editor) = notes_window("multi-key-menu", &["a.md", "b.md", "c.md"]);
+    let hwnd = window.hwnd;
+    let (a, b, c) = (note("a.md"), note("b.md"), note("c.md"));
+    click_row(hwnd, &a, 0);
+    click_row(hwnd, &b, MK_CONTROL);
+    select_row(hwnd, &c);
+    assert!(crate::window::notebook_view::selected_items(hwnd).is_some());
+    let panel = sidebar_windows(hwnd).1;
+    crate::window::modal::take_last_confirm();
+    crate::window::modal::answer_next_confirm(|_| false);
+    crate::window::menus::answer_next_popup_menu(|_| Some(CommandId::NoteDelete));
+    unsafe { SendMessageW(panel, WM_CONTEXTMENU, panel as usize, -1) };
+    let labels: Vec<String> = crate::window::menus::last_popup_entries()
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect();
+    assert_eq!(labels, ["Move to notebook...", "Delete..."]);
+    assert_eq!(
+        crate::window::modal::take_last_confirm().as_deref(),
+        Some("Move 2 items to the Recycle Bin?")
+    );
+    assert!(scratch.folder().join("c.md").exists());
 }

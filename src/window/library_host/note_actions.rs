@@ -445,13 +445,16 @@ fn perform_delete_note(hwnd: HWND, path: &Path) -> Result<(), Option<String>> {
 /// The one question of a group delete of `items` rows, `dirty` of the open tabs they take
 /// having unsaved changes (tree multi-select spec, "Delete").
 pub(crate) fn delete_items_question(items: usize, dirty: usize) -> String {
+    let what = if items == 1 {
+        "1 item".to_owned()
+    } else {
+        format!("{items} items")
+    };
     match dirty {
-        0 => format!("Move {items} items to the Recycle Bin?"),
-        1 => format!(
-            "Move {items} items to the Recycle Bin and discard unsaved changes in 1 open tab?"
-        ),
+        0 => format!("Move {what} to the Recycle Bin?"),
+        1 => format!("Move {what} to the Recycle Bin and discard unsaved changes in 1 open tab?"),
         _ => format!(
-            "Move {items} items to the Recycle Bin and discard unsaved changes in {dirty} open tabs?"
+            "Move {what} to the Recycle Bin and discard unsaved changes in {dirty} open tabs?"
         ),
     }
 }

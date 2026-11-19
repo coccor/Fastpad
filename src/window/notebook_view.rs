@@ -318,9 +318,10 @@ fn row_ticked(multi: &TreeSelection, rows: &[ViewRow], index: usize) -> bool {
         .is_some_and(|row| multi.contains(row.notebook, &row.kind))
 }
 
-/// The multi-selection's effective group (its notebook and rows, not those inside another
-/// selected folder), when two or more rows are ticked.
-pub(crate) fn selected_items(hwnd: HWND) -> Option<(NotebookId, Vec<RowKind>)> {
+/// The multi-selection's effective items (its notebook and rows, not those inside another
+/// selected folder) whenever two or more rows are ticked: one item when a folder is ticked with
+/// what is inside it. Actions take one item through their one-item paths.
+pub(crate) fn selection_effective(hwnd: HWND) -> Option<(NotebookId, Vec<RowKind>)> {
     rebuild::with_view(hwnd, |view| {
         let id = view.multi.notebook().filter(|_| view.multi.is_multi())?;
         Some((id, view.multi.effective()))
@@ -328,19 +329,36 @@ pub(crate) fn selected_items(hwnd: HWND) -> Option<(NotebookId, Vec<RowKind>)> {
     .flatten()
 }
 
-/// Esc in the panel: drops a multi-selection, leaving the cursor row (tree multi-select spec,
-/// "Interaction details"). True when there was one to drop, so the focus stays in the tree.
+/// The multi-selection's effective group, when it holds two or more effective items.
+pub(crate) fn selected_items(hwnd: HWND) -> Option<(NotebookId, Vec<RowKind>)> {
+    selection_effective(hwnd).filter(|(_, items)| items.len() >= 2)
+}
+
+/// The one effective item of a multi-selection whose ticked rows are a folder and what is
+/// inside it: actions on the selection act on that folder alone.
+pub(crate) fn selected_single(hwnd: HWND) -> Option<(NotebookId, RowKind)> {
+    match selection_effective(hwnd)? {
+        (id, items) if items.len() == 1 => items.into_iter().next().map(|item| (id, item)),
+        _ => None,
+    }
+}
+
+/// Esc in the panel: drops a multi-selection (or a lone ticked row), leaving the cursor row
+/// (tree multi-select spec, "Interaction details"). True when there was one to drop, so the
+/// focus stays in the tree.
 pub(crate) fn clear_selection(hwnd: HWND) -> bool {
     rebuild::with_view(hwnd, |view| {
         // Esc while the button is down: its release clicks nothing either.
         view.pending_collapse = None;
         view.pending_toggle = None;
-        let multi = view.multi.is_multi();
-        if multi {
+        // Any ticked row goes, a lone one too (Ctrl+Space's first tick, left behind as Ctrl+arrows
+        // move the cursor away).
+        let ticked = !view.multi.items().is_empty();
+        if ticked {
             view.multi.clear();
             view.invalidate();
         }
-        multi
+        ticked
     })
     .unwrap_or(false)
 }

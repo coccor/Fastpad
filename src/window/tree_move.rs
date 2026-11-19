@@ -180,7 +180,9 @@ pub(crate) fn drop_into(hwnd: HWND, source: &RowKind, folder: &Path) {
     }
 }
 
-/// `drop_into` for a row of the notebook `id`: the move stays inside that notebook.
+/// `drop_into` for a row of the notebook `id`: the move stays inside that notebook. The tree
+/// shows the move before anything is said about it: a tab left behind, then the question about
+/// the links to what moved.
 pub(crate) fn drop_into_of(
     hwnd: HWND,
     id: library_host::NotebookId,
@@ -188,11 +190,15 @@ pub(crate) fn drop_into_of(
     folder: &Path,
 ) {
     match try_drop_into_of(hwnd, id, source, folder) {
-        Ok(row) => {
+        Ok(dropped) => {
             side_panel::with_accessible_events(hwnd, || {
                 side_panel::refresh(hwnd);
-                notebook_view::select_row(hwnd, id, &row);
+                notebook_view::select_row(hwnd, id, &dropped.row);
             });
+            if let Some(notice) = dropped.stuck_notice {
+                push_notice(hwnd, notice);
+            }
+            library_host::notes_moved_of(hwnd, id, &dropped.moves);
         }
         Err(Some(notice)) => push_notice(hwnd, notice),
         Err(None) => {}
@@ -212,19 +218,39 @@ pub(crate) fn group_notice(failed: &[String], total: usize, verb: &str) -> Strin
 
 /// A drop of several rows of the notebook `id` into `folder`: each one moves as `drop_into_of`
 /// moves it, and one that cannot is skipped. The view refreshes once, the selection is dropped
-/// and the cursor lands on the last row that moved; the failures are one notice. `items` are
-/// the effective selection, so a folder is not listed along with what is inside it.
+/// and the cursor lands on the last row that moved; then come the tabs left behind, one question
+/// about the links to everything that moved, and the failures as one notice. `items` are the
+/// effective selection, so a folder is not listed along with what is inside it. A target folder,
+/// or an item, that a move to another notebook holds refuses the whole group, saying so once.
 pub(crate) fn drop_many_into_of(
     hwnd: HWND,
     id: library_host::NotebookId,
     items: &[RowKind],
     folder: &Path,
 ) {
+    let Some(root) = library_host::notebook_folder(hwnd, id) else {
+        return;
+    };
+    if super::cross_move_host::refuse_if_moving(hwnd, &root.join(folder))
+        || items.iter().any(|item| {
+            tree_drag::source_path(item).is_some_and(|old| {
+                super::cross_move_host::refuse_item_if_moving(hwnd, &root.join(old))
+            })
+        })
+    {
+        return;
+    }
     let mut last = None;
+    let mut moves = Vec::new();
+    let mut stuck = Vec::new();
     let mut failed = Vec::new();
     for source in items {
         match try_drop_into_of(hwnd, id, source, folder) {
-            Ok(row) => last = Some(row),
+            Ok(dropped) => {
+                last = Some(dropped.row);
+                moves.extend(dropped.moves);
+                stuck.extend(dropped.stuck_notice);
+            }
             Err(Some(notice)) => failed.push(notice),
             Err(None) => {}
         }
@@ -236,20 +262,35 @@ pub(crate) fn drop_many_into_of(
             notebook_view::select_row(hwnd, id, row);
         }
     });
+    for notice in stuck {
+        push_notice(hwnd, notice);
+    }
+    library_host::notes_moved_of(hwnd, id, &moves);
     if !failed.is_empty() {
         push_notice(hwnd, group_notice(&failed, items.len(), "moved"));
     }
 }
 
-/// The move of `drop_into_of` without the view: the row at its new path, or `Err` with the
-/// notice to show (`None` when the drop is silently refused). The target folder and its
-/// ancestors are expanded and the links followed; the caller refreshes and selects.
+/// A move `try_drop_into_of` made, and what is left to say about it.
+#[derive(Debug)]
+pub(crate) struct Dropped {
+    /// The moved row at its new path.
+    pub(crate) row: RowKind,
+    /// The notes that moved, old and new paths relative to the notebook, for the links to them.
+    pub(crate) moves: Vec<(PathBuf, PathBuf)>,
+    /// The notice for tabs that could not follow when the undo failed too.
+    pub(crate) stuck_notice: Option<String>,
+}
+
+/// The move of `drop_into_of` without the view: what moved, or `Err` with the notice to show
+/// (`None` when the drop is silently refused). The target folder and its ancestors are
+/// expanded; the caller refreshes, selects, shows the stuck tabs' notice and follows the links.
 pub(crate) fn try_drop_into_of(
     hwnd: HWND,
     id: library_host::NotebookId,
     source: &RowKind,
     folder: &Path,
-) -> Result<RowKind, Option<String>> {
+) -> Result<Dropped, Option<String>> {
     let root = library_host::notebook_folder(hwnd, id).ok_or(None)?;
     let (Some(old), Some(new)) = (
         tree_drag::source_path(source),
@@ -323,18 +364,18 @@ pub(crate) fn try_drop_into_of(
     } else {
         RowKind::Note(new.clone())
     };
-    if !moved.stuck.is_empty() {
-        push_notice(
-            hwnd,
-            library_host::rename_undo_failed_notice(&name, &new.to_string_lossy(), &moved.stuck),
-        );
-    }
+    let stuck_notice = (!moved.stuck.is_empty()).then(|| {
+        library_host::rename_undo_failed_notice(&name, &new.to_string_lossy(), &moved.stuck)
+    });
     // Links that would no longer reach what moved (second brain phase 1 spec §7.6).
     let moves = if is_folder {
         library_host::folder_moves_of(hwnd, id, old, &new)
     } else {
         vec![(old.to_path_buf(), new.clone())]
     };
-    library_host::notes_moved_of(hwnd, id, &moves);
-    Ok(row)
+    Ok(Dropped {
+        row,
+        moves,
+        stuck_notice,
+    })
 }

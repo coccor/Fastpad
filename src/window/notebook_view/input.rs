@@ -172,7 +172,12 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
         WM_KEYDOWN => key_down(hwnd, wparam as u16).then_some(0),
         WM_CHAR => {
             let ch = char::from_u32(wparam as u32).filter(|ch| !ch.is_control())?;
-            typed(hwnd, ch);
+            // Ctrl+Space ticks the cursor row (key_down_with); the space it also types is not a
+            // name to look for.
+            let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL)) } < 0;
+            if !(ch == ' ' && ctrl) {
+                typed(hwnd, ch);
+            }
             Some(0)
         }
         WM_MOUSEWHEEL => {
@@ -892,14 +897,15 @@ fn extend_selection(view: &mut NotebookView, before: Option<usize>) {
 
 /// The panel's keys (spec §10, open editors spec §3.5): the arrows run one selection through
 /// the header rows, the Open Editors rows and the tree. With Shift they extend the tree's
-/// multi-selection; without it they drop that selection. Ctrl+Space ticks the cursor row and
-/// Ctrl+A every note and folder of its notebook. Returns false for keys it leaves to the panel.
+/// multi-selection; with Ctrl they move the cursor and keep it (Explorer), so Ctrl+Space can
+/// tick rows apart; plain, they drop it. Ctrl+Space ticks the cursor row and Ctrl+A every note
+/// and folder of its notebook. Returns false for keys it leaves to the panel.
 pub(crate) fn key_down_with(hwnd: HWND, key: u16, modifiers: Modifiers) -> bool {
     if let Some(list_key) = ListKey::from_virtual_key(u32::from(key)) {
         with_view(hwnd, |view| {
             let in_tree = view.cursor == Cursor::Tree;
             let before = view.list.selected;
-            if in_tree && !modifiers.shift {
+            if in_tree && !modifiers.shift && !modifiers.ctrl {
                 view.multi.clear();
             }
             let shape = view.shape();
@@ -1016,18 +1022,23 @@ pub(crate) fn key_down_with(hwnd: HWND, key: u16, modifiers: Modifiers) -> bool 
             true
         }
         VK_F2 | VK_DELETE => {
-            // Del on a multi-selection takes the whole group; F2 renames the cursor row alone.
+            // Del on a multi-selection takes the whole group, or, for a folder ticked with what
+            // is inside it, that folder alone (not the cursor row, which may be inside it); F2
+            // renames the cursor row alone.
             if key == VK_DELETE
                 && let Some((id, items)) = selected_items(hwnd)
             {
                 crate::window::library_host::delete_items(hwnd, id, &items);
                 return true;
             }
-            let Some((id, kind)) = with_view(hwnd, |view| match view.target(selected) {
-                Target::Row(id, row) => Some((id, row.kind)),
-                _ => None,
-            })
-            .flatten() else {
+            let single = (key == VK_DELETE).then(|| selected_single(hwnd)).flatten();
+            let Some((id, kind)) = single.or_else(|| {
+                with_view(hwnd, |view| match view.target(selected) {
+                    Target::Row(id, row) => Some((id, row.kind)),
+                    _ => None,
+                })
+                .flatten()
+            }) else {
                 return true;
             };
             let Some(root) = crate::window::library_host::notebook_folder(hwnd, id) else {
