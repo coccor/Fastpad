@@ -628,6 +628,7 @@ fn set_find_shades_hits_and_clearing_removes_them() {
 }
 
 #[test]
+#[allow(clippy::single_range_in_vec_init)]
 fn an_edit_recomputes_the_hits() {
     // Break caught: hits kept from before a reparse, missing new matches or pointing at blocks
     // that no longer exist.
@@ -643,6 +644,7 @@ fn an_edit_recomputes_the_hits() {
 }
 
 #[test]
+#[allow(clippy::single_range_in_vec_init)]
 fn reveal_scrolls_the_current_hit_into_view() {
     // Break caught: F3 moving the current match off screen in Preview mode, where the preview
     // doesn't follow the editor.
