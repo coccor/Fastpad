@@ -920,6 +920,28 @@ pub(crate) fn sync_visibility(hwnd: HWND) {
         host_window::layout_group(hwnd, parent);
     }
     host_window::invalidate_title_strip(hwnd);
+    // A preview just shown (another mode, another tab) shades an open find bar's matches once
+    // the count reruns.
+    if shown {
+        crate::window::main_window::schedule_find_count(hwnd);
+    }
+}
+
+/// Shades the find bar's matches in the target group's Markdown preview, while it shows in Split
+/// or Preview (2026-11-19 preview find highlights spec); `None`, or any other mode, clears them.
+pub(crate) fn set_find(hwnd: HWND, find: Option<crate::preview::find::PreviewFind>, reveal: bool) {
+    let Some(view) = view(hwnd) else {
+        return;
+    };
+    let shows = matches!(mode(hwnd), ViewMode::Split | ViewMode::Preview) && !active_is_svg(hwnd);
+    view.set_find(find.filter(|_| shows), reveal);
+}
+
+/// Moves the target group's preview's current find match to the editor's `current` match.
+pub(crate) fn set_find_current(hwnd: HWND, current: Option<std::ops::Range<usize>>, reveal: bool) {
+    if let Some(view) = view(hwnd) {
+        view.set_find_current(current, reveal);
+    }
 }
 
 pub(crate) fn load_active_document(hwnd: HWND, force: bool) {

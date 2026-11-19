@@ -650,3 +650,80 @@ fn the_chevron_adds_the_replace_row_pushing_the_editor_down_and_tab_moves_betwee
     assert_eq!(unsafe { GetFocus() }, query);
     assert!(editor_below_bar());
 }
+
+/// A shown main window whose active tab is Markdown holding `text`, in `mode`.
+fn markdown_window(
+    text: &str,
+    mode: crate::preview::ViewMode,
+) -> (ProductionWindow, crate::editor::Editor) {
+    let window = ProductionWindow::new(make_app());
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+            window.hwnd,
+            windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW,
+        );
+    }
+    let editor = install_test_editor(&window);
+    editor.populate_clean(text).unwrap();
+    app_mut(window.hwnd)
+        .tabs
+        .set_active_language(crate::document::Language::Markdown);
+    let group = app_mut(window.hwnd).tabs.active_group();
+    crate::window::preview_host::set_group_mode(window.hwnd, group, mode);
+    (window, editor)
+}
+
+fn preview_hits(hwnd: HWND) -> (usize, Option<usize>) {
+    let (hits, current) = crate::window::preview_host::view(hwnd)
+        .expect("a preview")
+        .find_hits();
+    (hits.len(), current)
+}
+
+#[test]
+fn the_preview_shades_find_matches_and_follows_f3() {
+    // Break caught: the find bar marking only the hidden editor in Preview mode, F3 not moving
+    // the preview's current match, or closing the bar leaving the preview shaded.
+    let _scintilla = load_native_scintilla();
+    let (window, editor) = markdown_window("**a** b a\n\na\n", crate::preview::ViewMode::Preview);
+    execute_command(window.hwnd, CommandId::Find);
+    set_find_query(window.hwnd, "a");
+    editor.set_selection(0..0).unwrap();
+    super::super::refresh_find_count(window.hwnd);
+    assert_eq!(preview_hits(window.hwnd), (3, None));
+
+    execute_command(window.hwnd, CommandId::FindNext);
+    assert_eq!(editor.selection().unwrap(), 2..3);
+    assert_eq!(preview_hits(window.hwnd), (3, Some(0)));
+    execute_command(window.hwnd, CommandId::FindNext);
+    assert_eq!(preview_hits(window.hwnd).1, Some(1));
+    execute_command(window.hwnd, CommandId::FindNext);
+    assert_eq!(preview_hits(window.hwnd).1, Some(2));
+
+    super::super::close_find_bar(window.hwnd);
+    assert_eq!(preview_hits(window.hwnd), (0, None));
+    drop(editor);
+}
+
+#[test]
+fn split_mode_shades_the_preview_and_source_mode_leaves_the_editor_marked() {
+    // Break caught: Split left out, or a find with no preview shown panicking or skipping the
+    // editor's own marks.
+    let _scintilla = load_native_scintilla();
+    let (window, editor) = markdown_window("x y x\n", crate::preview::ViewMode::Split);
+    execute_command(window.hwnd, CommandId::Find);
+    set_find_query(window.hwnd, "x");
+    super::super::refresh_find_count(window.hwnd);
+    assert_eq!(preview_hits(window.hwnd).0, 2);
+
+    let group = app_mut(window.hwnd).tabs.active_group();
+    crate::window::preview_host::set_group_mode(
+        window.hwnd,
+        group,
+        crate::preview::ViewMode::Source,
+    );
+    super::super::refresh_find_count(window.hwnd);
+    let bar = app_mut(window.hwnd).find_bar().unwrap();
+    assert!(!bar.no_match());
+    drop(editor);
+}

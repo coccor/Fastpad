@@ -577,6 +577,29 @@ impl PreviewView {
         invalidate(self.hwnd);
     }
 
+    /// Moves the current find match to the one for the editor's `current` match, keeping the
+    /// other matches, and with `reveal` scrolls it into view (F3 before the recount lands).
+    pub fn set_find_current(&self, current: Option<std::ops::Range<usize>>, reveal: bool) {
+        self.with(|state| {
+            let Some(find) = state.find.as_mut() else {
+                return;
+            };
+            find.current = current;
+            state.current_hit = find.current.as_ref().and_then(|current| {
+                crate::preview::find::current_hit(
+                    &state.document.blocks,
+                    &state.hits,
+                    &find.editor_matches,
+                    current,
+                )
+            });
+            if reveal {
+                reveal_find(state);
+            }
+        });
+        invalidate(self.hwnd);
+    }
+
     /// The shaded matches and the index of the current one.
     #[cfg(test)]
     pub fn find_hits(&self) -> (Vec<FindHit>, Option<usize>) {
