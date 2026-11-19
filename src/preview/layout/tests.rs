@@ -120,14 +120,47 @@ fn wide_tables_and_long_code_lines_scroll_horizontally() {
             &format!("| {wide} | {wide} |\n|---|---|\n| a | b |\n"),
             200.0,
         );
-        assert!(table.scroll_width > 200.0);
+        assert!(table.scroll_limit > 0.0);
         assert!(
             flatten(&table.ops)
                 .iter()
                 .any(|op| matches!(op, DrawOp::Scrollable { .. }))
         );
         let code = laid(context, &format!("```\n{wide}{wide}\n```\n"), 200.0);
-        assert!(code.scroll_width > 200.0);
+        assert!(code.scroll_limit > 0.0);
+    });
+}
+
+#[test]
+fn indented_wide_tables_scroll_to_their_last_column() {
+    // Break caught: the scroll limit subtracted the pane's width from the table's, so a table
+    // indented by a quote or list stopped short of its right edge by the indent.
+    with_context(&no_images, None, |context| {
+        let wide = "wide ".repeat(30);
+        for (prefix, rest) in [("> ", "> "), ("- ", "  ")] {
+            let block = laid(
+                context,
+                &format!("{prefix}| {wide} | end |\n{rest}|---|---|\n{rest}| a | b |\n"),
+                300.0,
+            );
+            let (clip, content_width) = flatten(&block.ops)
+                .into_iter()
+                .find_map(|op| match op {
+                    DrawOp::Scrollable {
+                        clip,
+                        content_width,
+                        ..
+                    } => Some((*clip, *content_width)),
+                    _ => None,
+                })
+                .expect("a scrollable table");
+            assert!(clip.left > 0.0, "{prefix:?} indents the table");
+            assert_eq!(
+                block.scroll_limit,
+                content_width - clip.width(),
+                "{prefix:?} scrolls the last column into view"
+            );
+        }
     });
 }
 

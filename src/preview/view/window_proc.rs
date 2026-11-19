@@ -106,12 +106,10 @@ pub(super) unsafe extern "system" fn preview_proc(
                     let document_y =
                         point.y as f32 / dpi_scale(hwnd) + state.scroll_y - bar_height(state);
                     let index = state.heights.index_at(document_y);
-                    let (view_width, _) = view_size(hwnd);
-                    let (_, content_width) = content_frame(view_width, state.centered);
                     if let Some(Some(laid)) = state.layouts.get(index)
-                        && laid.scroll_width > content_width
+                        && laid.scroll_limit > 0.0
                     {
-                        let limit = laid.scroll_width - content_width;
+                        let limit = laid.scroll_limit;
                         let sign = if message == WM_MOUSEHWHEEL { 1.0 } else { -1.0 };
                         let offset = state.h_scroll.entry(index).or_insert(0.0);
                         *offset = (*offset + sign * step).clamp(0.0, limit);
