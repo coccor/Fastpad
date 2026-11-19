@@ -260,8 +260,9 @@ pub struct LaidBlock {
     pub ops: Vec<DrawOp>,
     pub targets: Vec<Target>,
     pub images: Vec<ImageSlot>,
-    /// The widest horizontally scrollable content, or 0 when nothing scrolls.
-    pub scroll_width: f32,
+    /// How far the block's horizontally scrollable content can scroll: the most any of it
+    /// overflows its clip, or 0 when nothing scrolls.
+    pub scroll_limit: f32,
     /// Laid-out headings: their document-order index within the block and their y.
     pub headings: Vec<(u32, f32)>,
     /// The block holds a Mermaid code block, whose look depends on the diagrams the cache holds.
@@ -591,7 +592,7 @@ struct Output<'k> {
     runs: Vec<LaidRun>,
     targets: Vec<Target>,
     images: Vec<ImageSlot>,
-    scroll_width: f32,
+    scroll_limit: f32,
     headings: Vec<(u32, f32)>,
     diagrams: bool,
     keys: &'k [DetailsKey],
@@ -606,7 +607,7 @@ impl<'k> Output<'k> {
             runs: Vec::new(),
             targets: Vec::new(),
             images: Vec::new(),
-            scroll_width: 0.0,
+            scroll_limit: 0.0,
             headings: Vec::new(),
             diagrams: false,
             keys,
@@ -654,7 +655,7 @@ pub fn layout_block(
         ops: output.ops,
         targets: output.targets,
         images: output.images,
-        scroll_width: output.scroll_width,
+        scroll_limit: output.scroll_limit,
         headings: output.headings,
         diagrams: output.diagrams,
     })
@@ -1153,7 +1154,7 @@ fn push_code(
         run: Some(run),
     };
     if scrolls {
-        output.scroll_width = output.scroll_width.max(content_width);
+        output.scroll_limit = output.scroll_limit.max(content_width - rect.width());
         output.ops.push(DrawOp::Scrollable {
             clip: rect,
             content_width,
@@ -1464,7 +1465,7 @@ fn push_table(
         }
     }
     if scrolls {
-        output.scroll_width = output.scroll_width.max(table_width);
+        output.scroll_limit = output.scroll_limit.max(table_width - clip.width());
         output.ops.push(DrawOp::Scrollable {
             clip,
             content_width: table_width,

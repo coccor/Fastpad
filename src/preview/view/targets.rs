@@ -248,7 +248,7 @@ pub(super) fn focus_link(state: &mut ViewState, block: usize, link: usize) {
         && let Some(clip) = hit.clip
     {
         let current = state.h_scroll.get(&block).copied().unwrap_or(0.0);
-        let limit = (laid.scroll_width - clip.width()).max(0.0);
+        let limit = laid.scroll_limit;
         let mut offset = current;
         if rect.right - offset > clip.right {
             offset = rect.right - clip.right;

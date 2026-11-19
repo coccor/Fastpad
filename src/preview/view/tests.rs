@@ -250,6 +250,46 @@ fn links_clipped_out_of_a_wide_table_are_hidden_until_focus_reveals_them() {
 }
 
 #[test]
+fn the_wheel_scrolls_a_quoted_wide_table_to_its_last_column() {
+    // Break caught: the wheel's limit subtracted the pane's width rather than the quote's, so an
+    // indented table stopped scrolling before its last column came into view.
+    use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEHWHEEL;
+    let parent = TestWindow::new(800, 600);
+    let wide = "wide ".repeat(40);
+    let view = view_with(
+        &parent,
+        &format!("> | {wide} | end |\n> |---|---|\n> | a | b |\n"),
+    );
+    let mut point = windows_sys::Win32::Foundation::POINT { x: 100, y: 20 };
+    unsafe { ClientToScreen(view.hwnd(), &mut point) };
+    let lparam = ((point.y as u16 as isize) << 16) | (point.x as u16 as isize);
+    for _ in 0..200 {
+        unsafe { SendMessageW(view.hwnd(), WM_MOUSEHWHEEL, 120 << 16, lparam) };
+    }
+    let (offset, needed) = with_state(view.hwnd(), |state| {
+        let laid = state.layouts[0].as_ref().expect("the table is laid out");
+        let needed = laid
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                crate::preview::layout::DrawOp::Scrollable {
+                    clip,
+                    content_width,
+                    ..
+                } => Some(content_width - clip.width()),
+                _ => None,
+            })
+            .expect("the table scrolls");
+        (state.h_scroll.get(&0).copied().unwrap_or(0.0), needed)
+    })
+    .unwrap();
+    assert!(needed > 0.0);
+    assert_eq!(offset, needed, "the table's right edge reaches the quote's");
+    view.destroy();
+}
+
+#[test]
 fn unchanged_updates_do_not_record_an_update() {
     let parent = TestWindow::new(800, 600);
     let source = "# A\n\ntext\n";
