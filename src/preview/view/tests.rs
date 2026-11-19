@@ -602,12 +602,12 @@ fn mermaid_blocks_draw_as_diagrams_and_keep_the_last_one_while_an_edit_renders_o
     view.destroy();
 }
 
-fn preview_find(query: &str, editor_matches: Vec<std::ops::Range<usize>>) -> PreviewFind {
+fn preview_find(query: &str, editor_matches: &[std::ops::Range<usize>]) -> PreviewFind {
     let current = editor_matches.first().cloned();
     PreviewFind {
         matcher: crate::search::Matcher::new(query, crate::search::MatchOptions::default())
             .unwrap(),
-        editor_matches,
+        editor_matches: editor_matches.to_vec(),
         current,
     }
 }
@@ -618,7 +618,7 @@ fn set_find_shades_hits_and_clearing_removes_them() {
     // closes.
     let parent = TestWindow::new(800, 600);
     let view = view_with(&parent, "one two one\n");
-    view.set_find(Some(preview_find("one", vec![0..3, 8..11])), false);
+    view.set_find(Some(preview_find("one", &[0..3, 8..11])), false);
     let (hits, current) = view.find_hits();
     assert_eq!(hits.len(), 2);
     assert_eq!(current, Some(0));
@@ -633,7 +633,7 @@ fn an_edit_recomputes_the_hits() {
     // that no longer exist.
     let parent = TestWindow::new(800, 600);
     let view = view_with(&parent, "one\n");
-    view.set_find(Some(preview_find("one", vec![0..3])), false);
+    view.set_find(Some(preview_find("one", &[0..3])), false);
     view.reparse("one\n\none\n\none\n", Instant::now());
     let (hits, _) = view.find_hits();
     assert_eq!(hits.len(), 3);
@@ -650,7 +650,7 @@ fn reveal_scrolls_the_current_hit_into_view() {
     let source = paragraphs(200);
     let view = view_with(&parent, &source);
     let at = source.find("para 150\n").unwrap();
-    view.set_find(Some(preview_find("para 150", vec![at..at + 8])), true);
+    view.set_find(Some(preview_find("para 150", &[at..at + 8])), true);
     let line = view.top_line();
     assert!((280..=300).contains(&line), "top line {line}");
     view.destroy();
