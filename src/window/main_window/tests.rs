@@ -78,6 +78,7 @@ mod split_groups;
 mod startup_notebooks;
 mod tab_drag;
 mod tree_and_open_editors_drag;
+mod tree_multi_select;
 mod window_basics;
 mod window_lifecycle;
 

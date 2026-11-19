@@ -24,10 +24,19 @@ impl NotebookView {
     }
 }
 
+/// `open_menu` as a right-click opens it: the tests' way in to the row menus.
+#[cfg(test)]
+pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
+    open_menu(hwnd, index, at, false);
+}
+
 /// Row `index`'s context menu (spec §6.6), at `at` (main-window client coordinates) or under
 /// the row when opened from the keyboard. The chosen entry acts on that row, not the active
-/// tab. "Open in new tab" is `CommandId::Open` and "New note here" is `CommandId::NoteNew` here.
-pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
+/// tab, or on the whole multi-selection when the row is part of one. "Open in new tab" is
+/// `CommandId::Open` and "New note here" is `CommandId::NoteNew` here. `keyboard` is a menu
+/// opened by Shift+F10 or the menu key: with a selection ticked it is the selection's menu
+/// whatever row the cursor is on, as Del acts on the selection.
+pub(crate) fn open_menu(hwnd: HWND, index: usize, at: Option<POINT>, keyboard: bool) {
     let Some((target, point)) = with_view(hwnd, |view| {
         if view.mode != Mode::Tree {
             return None;
@@ -41,9 +50,26 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
     .flatten() else {
         return;
     };
-    let Target::Row(id, row) = target else {
+    let Target::Row(mut id, mut row) = target else {
         return;
     };
+    let ticked = with_view(hwnd, |view| view.multi.contains(id, &row.kind)).unwrap_or(false);
+    if keyboard || ticked {
+        if let Some((group, items)) = selected_items(hwnd) {
+            group_menu(hwnd, group, items, point);
+            return;
+        }
+        // A folder ticked with what is inside it: the menu is that folder's own, whichever of
+        // its ticked rows it was opened on.
+        if let Some((single, kind)) = selected_single(hwnd)
+            && let Some(Target::Row(folder_id, folder_row)) = with_view(hwnd, |view| {
+                view_row_index(&view.rows, single, &kind).map(|at| view.target(at))
+            })
+            .flatten()
+        {
+            (id, row) = (folder_id, folder_row);
+        }
+    }
     let Some(root) = crate::window::library_host::notebook_folder(hwnd, id) else {
         return;
     };
@@ -146,6 +172,26 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
     }
 }
 
+/// The context menu of a row in a multi-selection, at `point` (tree multi-select spec,
+/// "Non-goals"): only Move to notebook… and Delete…, each on the whole group `items` of the
+/// notebook `notebook`.
+fn group_menu(hwnd: HWND, notebook: NotebookId, items: Vec<RowKind>, point: POINT) {
+    let entries = [
+        MenuEntry::command("Move to notebook...", CommandId::NoteMoveToNotebook),
+        MenuEntry::Separator,
+        MenuEntry::local("Delete...\tDel", CommandId::NoteDelete),
+    ];
+    match crate::window::menus::track_popup(hwnd, &entries, point) {
+        Some(CommandId::NoteMoveToNotebook) => {
+            crate::window::library_host::move_items_to_notebook(hwnd, notebook, items);
+        }
+        Some(CommandId::NoteDelete) => {
+            crate::window::library_host::delete_items(hwnd, notebook, &items);
+        }
+        _ => {}
+    }
+}
+
 /// `WM_CONTEXTMENU`: from a right-click (screen coordinates) or from Shift+F10 or the
 /// context-menu key (`lparam` of -1, for the selected row).
 pub(super) fn context_menu(hwnd: HWND, lparam: LPARAM) {
@@ -173,6 +219,6 @@ pub(super) fn context_menu(hwnd: HWND, lparam: LPARAM) {
     })
     .flatten();
     if let Some((index, at)) = target {
-        open_context_menu(hwnd, index, at);
+        open_menu(hwnd, index, at, keyboard);
     }
 }

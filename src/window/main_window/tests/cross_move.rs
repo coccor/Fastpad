@@ -566,5 +566,5 @@ fn ctrl_shift_m_takes_the_selected_folder_row() {
     execute_command(hwnd, crate::window::commands::CommandId::NoteMoveToNotebook);
 
     let (item, _) = app_mut(hwnd).library.shown_move.clone().unwrap();
-    assert_eq!(item, t.a.join("work"));
+    assert_eq!(item, [t.a.join("work")]);
 }

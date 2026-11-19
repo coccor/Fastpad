@@ -288,7 +288,9 @@ pub(crate) fn row_foreground(look: RowLook, palette: &Palette) -> u32 {
 /// Paints the rows in view into `area` of `hdc`. For each row it paints the selection (the
 /// unfocused color when `focused` is false) or the hover background, then calls `draw_row` with
 /// the row's index, rectangle and look. `bar` says whether the focused selection also gets the
-/// accent bar: it marks where the keyboard is, which is not always the selected row. Last it paints the thin scroll thumb at the right edge.
+/// accent bar: it marks where the keyboard is, which is not always the selected row.
+/// `also_selected(index)` marks rows selected besides `state.selected` (a multi-selection); they
+/// get the selection fill but never the bar. Last it paints the thin scroll thumb at the right edge.
 /// The fills are rounded and inset from the row's edges (`draw_row` still gets the whole row),
 /// except in high contrast, where they cover the whole row. `behind(index)` is the color under row
 /// `index` (the panel's fill, or a band the caller painted under it): the rounded corners blend
@@ -304,6 +306,7 @@ pub(crate) fn paint(
     palette: &Palette,
     focused: bool,
     bar: bool,
+    also_selected: &dyn Fn(usize) -> bool,
     behind: &dyn Fn(usize) -> u32,
     dpi: u32,
     draw_row: &mut dyn FnMut(HDC, usize, RECT, RowLook),
@@ -328,7 +331,7 @@ pub(crate) fn paint(
                 bottom: top + state.row_height,
             };
             let look = RowLook {
-                selected: state.selected == Some(index),
+                selected: state.selected == Some(index) || also_selected(index),
                 hover: state.hover == Some(index),
                 focused,
             };
@@ -356,7 +359,7 @@ pub(crate) fn paint(
                     background,
                     behind(index),
                 );
-                if bar {
+                if bar && state.selected == Some(index) {
                     paint_selection_bar(hdc, backplate, palette, background, dpi);
                 }
             } else if look.hover {
@@ -657,6 +660,7 @@ mod tests {
                     &palette,
                     focused,
                     focused,
+                    &|_| false,
                     &|_| palette.editor_background,
                     96,
                     &mut |_, index, rect, look| {
@@ -746,6 +750,7 @@ mod tests {
                 &palette,
                 true,
                 true,
+                &|_| false,
                 &|index| {
                     if index == 1 {
                         band
@@ -807,6 +812,7 @@ mod tests {
                     palette,
                     focused,
                     focused,
+                    &|_| false,
                     &|_| palette.editor_background,
                     96,
                     &mut |_, _, _, _| {},
@@ -872,6 +878,7 @@ mod tests {
                     &palette,
                     true,
                     bar,
+                    &|_| false,
                     &|_| palette.editor_background,
                     96,
                     &mut |_, index, _, look| looks.push((index, look.focused)),
@@ -936,6 +943,7 @@ mod tests {
                 &palette,
                 true,
                 true,
+                &|_| false,
                 &|_| palette.editor_background,
                 96,
                 &mut |_, _, _, _| {},

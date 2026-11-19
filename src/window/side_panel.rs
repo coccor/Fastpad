@@ -1075,10 +1075,15 @@ unsafe extern "system" fn panel_proc(
         {
             0
         }
-        // Esc anywhere in the panel returns to the editor (spec §10). The search box's own Esc
-        // is handled in its subclass.
+        // Esc anywhere in the panel returns to the editor (spec §10). In the Notebook view a
+        // multi-selection is dropped first, by an Esc of its own, and the focus stays (tree
+        // multi-select spec); in other views it is not shown, so it takes no Esc. The search
+        // box's own Esc is handled in its subclass.
         WM_KEYDOWN if wparam as u16 == VK_ESCAPE => {
-            return_focus_to_editor(main);
+            let notebook = current_view(main) == SidebarView::Notebook;
+            if !(notebook && crate::window::notebook_view::clear_selection(main)) {
+                return_focus_to_editor(main);
+            }
             0
         }
         WM_SETCURSOR if resizing(main) || pointer_over_grip(panel) => {

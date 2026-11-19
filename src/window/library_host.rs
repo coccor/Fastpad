@@ -105,12 +105,12 @@ pub(crate) struct LibraryHost {
     /// Bumped whenever `set_expanded` changes the expanded set, so the Notebook view knows its
     /// rows are stale without comparing the sets.
     expansion_revision: u64,
-    /// The note an open Move to notebook picker moves, and the notebooks it lists, in row order.
-    /// The row after the last is "Browse…".
-    pub(crate) shown_move: Option<(PathBuf, Vec<PathBuf>)>,
+    /// The notes and folders an open Move to notebook picker moves (one, or a multi-selection's
+    /// group), and the notebooks it lists, in row order. The row after the last is "Browse…".
+    pub(crate) shown_move: Option<(Vec<PathBuf>, Vec<PathBuf>)>,
     /// What Move to notebook's folder step moves, into which open notebook, and the folders it
     /// lists, in row order (multi-root move spec §3.4).
-    pub(crate) shown_move_folders: Option<(PathBuf, NotebookId, Vec<PathBuf>)>,
+    pub(crate) shown_move_folders: Option<(Vec<PathBuf>, NotebookId, Vec<PathBuf>)>,
     /// Copies into the tree, queued on one worker thread (open editors spec §4.5).
     pub(crate) copy_worker: super::copy_host::CopyWorker,
     /// A folder moving to a notebook on another drive, on its worker (multi-root move spec §2.3).

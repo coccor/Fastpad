@@ -290,6 +290,7 @@ impl TagsView {
             &palette,
             paint.focused,
             paint.focused,
+            &|_| false,
             &|_| paint.background,
             dpi,
             &mut |hdc, index, rect, look| self.draw_row(hdc, index, rect, look, paint),

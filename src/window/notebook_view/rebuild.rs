@@ -139,16 +139,68 @@ pub(super) fn snapshot(hwnd: HWND) -> Snapshot {
     }
 }
 
+/// The multi-selection's rows that the library of their notebook still lists. `None` when the
+/// notebook is open but its library is not there to ask (loading, reloading): the selection
+/// stays as it is until the next rebuild. A notebook no longer open lists nothing.
+fn listed_selection(hwnd: HWND) -> Option<Vec<RowKind>> {
+    let Some((id, items)) = with_view(hwnd, |view| {
+        view.multi
+            .notebook()
+            .map(|id| (id, view.multi.items().to_vec()))
+    })
+    .flatten() else {
+        return Some(Vec::new());
+    };
+    listed_of(hwnd, id, items)
+}
+
+/// The rows a started group drag carries that the library of their notebook still lists, which
+/// includes those a collapsed folder hides; `None` without a group drag, or while that library
+/// is not there to ask.
+fn listed_group(hwnd: HWND) -> Option<Vec<RowKind>> {
+    let (id, items) = with_view(hwnd, |view| match &view.drag.as_ref()?.source {
+        DragSource::Rows(items) => Some((view.drag_notebook?, items.clone())),
+        _ => None,
+    })
+    .flatten()?;
+    listed_of(hwnd, id, items)
+}
+
+/// `items` of the notebook `id` that its library still lists. `None` when the notebook is open
+/// but its library is not there to ask (loading, reloading). A notebook no longer open lists
+/// nothing.
+fn listed_of(hwnd: HWND, id: NotebookId, items: Vec<RowKind>) -> Option<Vec<RowKind>> {
+    if !library_host::notebooks(hwnd)
+        .iter()
+        .any(|(open, _)| *open == id)
+    {
+        return Some(Vec::new());
+    }
+    library_host::with_notebook(hwnd, id, |state| {
+        items
+            .into_iter()
+            .filter(|kind| match kind {
+                RowKind::Note(path) | RowKind::Folder(path) => state.is_listed(path),
+                _ => false,
+            })
+            .collect()
+    })
+}
+
 /// Rebuilds the rows from the library, the tabs and the notebook lists, keeping the selection
 /// and the scroll position by path. `side_panel::refresh` calls it.
 pub(crate) fn rebuild(hwnd: HWND) {
     let snapshot = snapshot(hwnd);
     let names = crate::library::local::display_names(&snapshot.recent);
+    // The ticked rows the library still lists, which includes those a collapsed folder hides.
+    // Read before the view is borrowed: each call borrows the App on its own.
+    let listed = listed_selection(hwnd);
+    let group_listed = listed_group(hwnd);
     let lost = with_view(hwnd, |view| {
         // The drag's notebook now at another folder (its slot reused for another notebook): a
         // row that happens to share a relative path there is not the same row.
         let folder_before = view.drag_notebook.and_then(|id| view.notebook_folder(id));
-        view.apply(snapshot, names);
+        view.apply(snapshot, names, listed.as_deref());
         view.invalidate();
         let folder_after = view.drag_notebook.and_then(|id| view.notebook_folder(id));
         let moved = folder_before.is_some_and(|before| {
@@ -166,6 +218,19 @@ pub(crate) fn rebuild(hwnd: HWND) {
         let lost = view.drag.as_mut().is_some_and(|drag| {
             if let DragSource::Row(kind) = &drag.source
                 && (moved || find(kind).is_none())
+            {
+                return true;
+            }
+            // A group ends as one row does, when any of its rows went. A row a collapsed folder
+            // hides is still there while the library lists it (or cannot be asked yet).
+            let present = |kind: &RowKind| {
+                find(kind).is_some()
+                    || group_listed
+                        .as_ref()
+                        .is_none_or(|listed| listed.contains(kind))
+            };
+            if let DragSource::Rows(items) = &drag.source
+                && (moved || !items.iter().all(present))
             {
                 return true;
             }
@@ -430,6 +495,23 @@ pub(crate) fn row_in_place_of(
         Some((index, next))
     })
     .flatten()
+}
+
+/// Refreshes the sidebar after rows went, then selects the row that took their place
+/// (`row_in_place_of`, taken before they went): by what it shows, or by index only when that
+/// row went too.
+pub(crate) fn refresh_and_select_place(
+    hwnd: HWND,
+    place: Option<(usize, Option<(NotebookId, RowKind)>)>,
+) {
+    crate::window::side_panel::with_accessible_events(hwnd, || {
+        crate::window::side_panel::refresh(hwnd);
+        if let Some((index, kind)) = place
+            && !kind.is_some_and(|(id, kind)| select_row(hwnd, id, &kind))
+        {
+            select_index(hwnd, index);
+        }
+    });
 }
 
 /// Selects row `index` (the last row when past the end) and scrolls it into view.

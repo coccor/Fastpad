@@ -9,6 +9,7 @@ use crate::window::menus::MenuEntry;
 use crate::window::panel_cursor::{self, Cursor};
 use crate::window::row_list::{self, ListKey};
 use crate::window::side_panel::point_of;
+use crate::window::sidebar_accessibility::{MK_CONTROL, MK_SHIFT};
 use crate::window::tooltip::Tooltip;
 use crate::window::tree_drag::DragSource;
 use std::path::{Path, PathBuf};
@@ -17,8 +18,8 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM}
 use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_DELETE, VK_F2, VK_LEFT,
-    VK_RETURN, VK_RIGHT,
+    GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_DELETE, VK_F2,
+    VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, WM_CAPTURECHANGED, WM_CHAR, WM_CONTEXTMENU, WM_KEYDOWN, WM_KEYUP,
@@ -40,7 +41,7 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
         // The panel class has CS_DBLCLKS: the second press of a double-click comes as this.
         WM_LBUTTONDBLCLK => {
             let (x, y) = point_of(lparam);
-            double_click(hwnd, x, y);
+            double_click(hwnd, x, y, wparam);
             Some(0)
         }
         WM_MOUSELEAVE => {
@@ -57,7 +58,7 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
         }
         WM_LBUTTONDOWN => {
             let (x, y) = point_of(lparam);
-            left_down(hwnd, x, y);
+            left_down(hwnd, x, y, wparam);
             Some(0)
         }
         WM_MBUTTONDOWN => {
@@ -90,6 +91,7 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
             if drag_release(hwnd, x, y, wparam) {
                 return Some(0);
             }
+            release_press(hwnd);
             // Released after the borrow ends: ReleaseCapture sends WM_CAPTURECHANGED here.
             if with_view(hwnd, |view| view.thumb_grab.take().is_some()).unwrap_or(false) {
                 unsafe {
@@ -122,11 +124,25 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
             let (x, y) = point_of(lparam);
             let hit = hit_after_commit(hwnd, x, y);
             focus_panel_for(hwnd, hit.as_ref());
-            if let Some(Hit::Row { index, .. }) = hit {
-                with_view(hwnd, |view| {
-                    view.cursor = Cursor::Tree;
-                    view.select(index);
-                });
+            // A press inside the multi-selection keeps it, for its menu; anywhere else on the
+            // tree it goes (tree multi-select spec, "Interaction details").
+            match hit {
+                Some(Hit::Row { index, .. }) => {
+                    with_view(hwnd, |view| {
+                        if !in_multi(view, index) {
+                            view.multi.clear();
+                        }
+                        view.cursor = Cursor::Tree;
+                        view.select(index);
+                    });
+                }
+                Some(Hit::Root(_)) => {
+                    with_view(hwnd, |view| {
+                        view.multi.clear();
+                        view.invalidate();
+                    });
+                }
+                _ => {}
             }
             Some(0)
         }
@@ -156,7 +172,12 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
         WM_KEYDOWN => key_down(hwnd, wparam as u16).then_some(0),
         WM_CHAR => {
             let ch = char::from_u32(wparam as u32).filter(|ch| !ch.is_control())?;
-            typed(hwnd, ch);
+            // Ctrl+Space ticks the cursor row (key_down_with); the space it also types is not a
+            // name to look for.
+            let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL)) } < 0;
+            if !(ch == ' ' && ctrl) {
+                typed(hwnd, ch);
+            }
             Some(0)
         }
         WM_MOUSEWHEEL => {
@@ -341,10 +362,12 @@ pub(super) fn focus_panel_for(hwnd: HWND, hit: Option<&Hit>) {
     }
 }
 
-pub(super) fn left_down(hwnd: HWND, x: i32, y: i32) {
+/// `WM_LBUTTONDOWN` at `x`, `y`, with `buttons` (the message's `MK_` flags).
+pub(super) fn left_down(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) {
     // A drag armed by an earlier press whose release never came here. `cancel_drag` also ends
     // one that had started, label and all, though its capture should have ended it already.
     cancel_drag(hwnd);
+    drop_pending_press(hwnd);
     // A right press's cancel whose own release has not come yet: this press ends the wait, and
     // the capture kept for it (the release then opens the menu as any other would).
     drop_right_release_wait(hwnd);
@@ -414,6 +437,7 @@ pub(super) fn left_down(hwnd: HWND, x: i32, y: i32) {
         // A click on a root row, off its buttons, selects it and toggles its notebook.
         Hit::Root(id) => {
             with_view(hwnd, |view| {
+                view.multi.clear();
                 if let Some(index) = view_row_index(&view.rows, id, &RowKind::Root) {
                     view.select(index);
                 }
@@ -438,6 +462,9 @@ pub(super) fn left_down(hwnd: HWND, x: i32, y: i32) {
             }
         }
         Hit::Row { index, part } => {
+            if row_pressed(hwnd, index, part, buttons, x, y) {
+                return;
+            }
             with_view(hwnd, |view| view.select(index));
             // Read before the click acts: opening a note or toggling a folder can move rows.
             let source = (part == RowPart::Body)
@@ -457,6 +484,103 @@ pub(super) fn left_down(hwnd: HWND, x: i32, y: i32) {
         }
         Hit::Empty => {}
     }
+}
+
+/// Whether tree row `index` is one of two or more ticked rows.
+fn in_multi(view: &NotebookView, index: usize) -> bool {
+    view.multi.is_multi() && view.multi_contains_row(index)
+}
+
+/// A left press on tree row `index` that the multi-selection takes (tree multi-select spec,
+/// "Interaction details"): Ctrl toggles a note or folder in (or, on a ticked one, out at the
+/// release), Shift selects the range to it, and a plain press inside the selection waits for
+/// the release. None of them opens or toggles anything; each can start a drag. False leaves the
+/// press to the one-row click, after dropping any selection.
+fn row_pressed(hwnd: HWND, index: usize, part: RowPart, buttons: WPARAM, x: i32, y: i32) -> bool {
+    let taken = with_view(hwnd, |view| {
+        let row = view.rows.get(index).filter(|_| view.mode == Mode::Tree)?;
+        let (id, kind) = (row.notebook, row.kind.clone());
+        let (ctrl, shift) = (buttons & MK_CONTROL != 0, buttons & MK_SHIFT != 0);
+        if (ctrl || shift) && selection::selectable(&kind) {
+            let rows = view.row_keys();
+            let cursor = view.list.selected;
+            if shift {
+                view.multi.select_range(&rows, id, index, cursor);
+            } else if view.multi.contains(id, &kind) {
+                view.pending_toggle = Some((id, kind.clone()));
+            } else {
+                let cursor = cursor.and_then(|at| rows.get(at).cloned());
+                view.multi.toggle(&rows, id, &kind, cursor);
+            }
+        } else if in_multi(view, index) {
+            view.pending_collapse = Some((id, kind.clone(), part));
+        } else {
+            view.multi.clear();
+            return None;
+        }
+        view.select(index);
+        // The drag carries the selection as the press left it: two or more effective items
+        // as a group, a folder ticked with what is inside it as that folder alone.
+        let source = if view.multi.is_multi() {
+            match view.multi.effective().as_slice() {
+                [one] => DragSource::Row(one.clone()),
+                items => DragSource::Rows(items.to_vec()),
+            }
+        } else {
+            DragSource::Row(kind)
+        };
+        Some((id, source))
+    })
+    .flatten();
+    let Some((id, source)) = taken else {
+        return false;
+    };
+    if part == RowPart::Body {
+        arm_drag(hwnd, Some(id), source, x, y);
+    }
+    true
+}
+
+/// `WM_LBUTTONUP` with no drag under way: a plain press inside the multi-selection collapses
+/// it to its row and clicks that row now; a Ctrl+press on a ticked row takes it out now.
+fn release_press(hwnd: HWND) {
+    let Some((collapse, toggle)) = with_view(hwnd, |view| {
+        (view.pending_collapse.take(), view.pending_toggle.take())
+    }) else {
+        return;
+    };
+    // The pressed row is looked up again: a rebuild may have moved it, or taken it away, in
+    // which case the press does nothing.
+    if let Some((id, kind)) = toggle {
+        with_view(hwnd, |view| {
+            if view_row_index(&view.rows, id, &kind).is_some() {
+                let rows = view.row_keys();
+                view.multi.toggle(&rows, id, &kind, None);
+                view.invalidate();
+            }
+        });
+    }
+    if let Some((id, kind, part)) = collapse {
+        let index = with_view(hwnd, |view| {
+            let index = view_row_index(&view.rows, id, &kind)?;
+            view.multi.clear();
+            view.select(index);
+            Some(index)
+        })
+        .flatten();
+        if let Some(index) = index {
+            row_clicked(hwnd, index, part, false);
+        }
+    }
+}
+
+/// Forgets a press's deferred click or untoggle: a new press came, or the release went to
+/// another window.
+pub(super) fn drop_pending_press(hwnd: HWND) {
+    with_view(hwnd, |view| {
+        view.pending_collapse = None;
+        view.pending_toggle = None;
+    });
 }
 
 /// `WM_LBUTTONDBLCLK`: a row's second press opens it as a normal tab, which also promotes its
@@ -488,8 +612,12 @@ fn pinned_at(hwnd: HWND, index: usize) -> Option<(NotebookId, PathBuf)> {
     .flatten()
 }
 
-pub(super) fn double_click(hwnd: HWND, x: i32, y: i32) {
+pub(super) fn double_click(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) {
     match with_view(hwnd, |view| view.hit_test(x, y)) {
+        // With Ctrl or Shift held it is one more selecting press, and opens nothing.
+        Some(Hit::Row { .. }) if buttons & (MK_CONTROL | MK_SHIFT) != 0 => {
+            left_down(hwnd, x, y, buttons);
+        }
         Some(Hit::Row { index, part }) => row_clicked(hwnd, index, part, true),
         // The first press already toggled the root, as on a folder row.
         Some(Hit::Root(_)) => {}
@@ -498,7 +626,7 @@ pub(super) fn double_click(hwnd: HWND, x: i32, y: i32) {
                 open_pinned(hwnd, id, &path, Activation::Permanent);
             }
         }
-        Some(_) => left_down(hwnd, x, y),
+        Some(_) => left_down(hwnd, x, y, buttons),
         None => {}
     }
 }
@@ -736,12 +864,50 @@ pub(crate) fn second_button(hwnd: HWND) {
     }
 }
 
-/// The panel's keys (spec §10, open editors spec §3.5): the arrows run one selection through
-/// the header rows, the Open Editors rows and the tree. Returns false for keys it leaves to the
-/// panel.
+/// The modifier keys held with a key press.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Modifiers {
+    pub shift: bool,
+    pub ctrl: bool,
+}
+
+/// A tree key with Shift and Ctrl as the keyboard has them now.
 pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
+    let held = |key| unsafe { GetKeyState(i32::from(key)) } < 0;
+    let modifiers = Modifiers {
+        shift: held(VK_SHIFT),
+        ctrl: held(VK_CONTROL),
+    };
+    key_down_with(hwnd, key, modifiers)
+}
+
+/// Shift+list key: the selection runs from its anchor to the cursor row the key just moved to.
+/// `before` is the tree row the cursor was on.
+fn extend_selection(view: &mut NotebookView, before: Option<usize>) {
+    if view.cursor != Cursor::Tree {
+        return;
+    }
+    let Some(to) = view.list.selected else { return };
+    let Some(id) = view.rows.get(to).map(|row| row.notebook) else {
+        return;
+    };
+    let rows = view.row_keys();
+    view.multi.select_range(&rows, id, to, before);
+}
+
+/// The panel's keys (spec §10, open editors spec §3.5): the arrows run one selection through
+/// the header rows, the Open Editors rows and the tree. With Shift they extend the tree's
+/// multi-selection; with Ctrl they move the cursor and keep it (Explorer), so Ctrl+Space can
+/// tick rows apart; plain, they drop it. Ctrl+Space ticks the cursor row and Ctrl+A every note
+/// and folder of its notebook. Returns false for keys it leaves to the panel.
+pub(crate) fn key_down_with(hwnd: HWND, key: u16, modifiers: Modifiers) -> bool {
     if let Some(list_key) = ListKey::from_virtual_key(u32::from(key)) {
         with_view(hwnd, |view| {
+            let in_tree = view.cursor == Cursor::Tree;
+            let before = view.list.selected;
+            if in_tree && !modifiers.shift && !modifiers.ctrl {
+                view.multi.clear();
+            }
             let shape = view.shape();
             // A list with nothing selected yet moves as one list does: the first Up or Down
             // selects a row in view.
@@ -752,6 +918,9 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
             if own_list {
                 let height = view.list_height();
                 view.list.move_selection(list_key, height);
+                if in_tree && modifiers.shift {
+                    extend_selection(view, before);
+                }
                 view.invalidate();
                 return;
             }
@@ -798,6 +967,9 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
                     }
                 }
             }
+            if in_tree && modifiers.shift {
+                extend_selection(view, before);
+            }
             view.invalidate();
         });
         return true;
@@ -811,6 +983,31 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
         return matches!(key, VK_RETURN | VK_LEFT | VK_RIGHT | VK_F2 | VK_DELETE);
     };
     match key {
+        VK_SPACE if modifiers.ctrl => {
+            with_view(hwnd, |view| {
+                let Some(row) = view.rows.get(selected).filter(|_| view.mode == Mode::Tree) else {
+                    return;
+                };
+                let (id, kind) = (row.notebook, row.kind.clone());
+                let rows = view.row_keys();
+                let cursor = rows.get(selected).cloned();
+                view.multi.toggle(&rows, id, &kind, cursor);
+                view.invalidate();
+            });
+            true
+        }
+        key if key == u16::from(b'A') && modifiers.ctrl => {
+            with_view(hwnd, |view| {
+                let Some(row) = view.rows.get(selected).filter(|_| view.mode == Mode::Tree) else {
+                    return;
+                };
+                let id = row.notebook;
+                let rows = view.row_keys();
+                view.multi.select_all(&rows, id);
+                view.invalidate();
+            });
+            true
+        }
         // Enter opens a normal tab: the preview tab is the mouse's (spec §6.4).
         VK_RETURN => {
             activate(hwnd, selected, Activation::Permanent);
@@ -825,11 +1022,23 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
             true
         }
         VK_F2 | VK_DELETE => {
-            let Some((id, kind)) = with_view(hwnd, |view| match view.target(selected) {
-                Target::Row(id, row) => Some((id, row.kind)),
-                _ => None,
-            })
-            .flatten() else {
+            // Del on a multi-selection takes the whole group, or, for a folder ticked with what
+            // is inside it, that folder alone (not the cursor row, which may be inside it); F2
+            // renames the cursor row alone.
+            if key == VK_DELETE
+                && let Some((id, items)) = selected_items(hwnd)
+            {
+                crate::window::library_host::delete_items(hwnd, id, &items);
+                return true;
+            }
+            let single = (key == VK_DELETE).then(|| selected_single(hwnd)).flatten();
+            let Some((id, kind)) = single.or_else(|| {
+                with_view(hwnd, |view| match view.target(selected) {
+                    Target::Row(id, row) => Some((id, row.kind)),
+                    _ => None,
+                })
+                .flatten()
+            }) else {
                 return true;
             };
             let Some(root) = crate::window::library_host::notebook_folder(hwnd, id) else {

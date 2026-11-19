@@ -148,16 +148,33 @@ pub(super) fn arm_drag(
             .map(|(root, path)| root.join(path)),
         _ => None,
     };
-    // A row moving to another drive stays put until the move ends (multi-root move spec §3.3).
+    // A group's files and folders on disk, for a Ctrl copy's checks.
+    let group_paths = match &source {
+        DragSource::Rows(items) => from
+            .and_then(|id| crate::window::library_host::notebook_folder(hwnd, id))
+            .map(|root| {
+                items
+                    .iter()
+                    .filter_map(tree_drag::source_path)
+                    .map(|path| root.join(path))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    // A row moving to another drive stays put until the move ends (multi-root move spec §3.3),
+    // and so does a group with any such row in it.
     if row_path
-        .as_deref()
-        .is_some_and(|path| crate::window::cross_move_host::blocks(hwnd, path))
+        .iter()
+        .chain(&group_paths)
+        .any(|path| crate::window::cross_move_host::blocks(hwnd, path))
     {
         return;
     }
     with_view(hwnd, |view| {
         view.drag = Drag::armed(source, x, y).map(|mut drag| {
             drag.row_path = row_path;
+            drag.group_paths = group_paths;
             drag
         });
         view.drag_notebook = from;
@@ -177,12 +194,14 @@ pub(super) fn drag_move(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) -> bool {
         return false;
     };
     if buttons & MK_LBUTTON == 0 {
-        // The release went elsewhere: a menu, a dialog, another window.
+        // The release went elsewhere: a menu, a dialog, another window. The press's deferred
+        // click goes with it.
         if started {
             cancel_drag(hwnd);
         } else {
             with_view(hwnd, |view| view.drag = None);
         }
+        drop_pending_press(hwnd);
         return started;
     }
     if !started {
@@ -194,6 +213,10 @@ pub(super) fn drag_move(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) -> bool {
             if let Some(drag) = view.drag.as_mut() {
                 drag.started = true;
             }
+            // The press became a drag: its release neither collapses nor untoggles the
+            // selection (tree multi-select spec, "Interaction details").
+            view.pending_collapse = None;
+            view.pending_toggle = None;
             view.list.hover = None;
             view.hover = None;
             view.hover_pin = false;
@@ -392,6 +415,11 @@ pub(super) fn drag_release(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) -> bool 
                 }
             }
             DragSource::Tab { path: None, .. } | DragSource::GroupTab { .. } => {}
+            DragSource::Rows(items) => {
+                if let (Some(from), Some(dest)) = (notebook, dest) {
+                    drop_rows(hwnd, from, dest, items, folder, drag.copy, drag.group_paths);
+                }
+            }
             DragSource::Files(_) => {}
         }
     }
@@ -427,14 +455,42 @@ fn drop_row(
     }
 }
 
+/// A group of rows of the notebook `from` dropped into `folder` of the notebook `dest` (tree
+/// multi-select spec, "Drag", "Failures"): moved inside its notebook item by item, with one
+/// notice for what did not move; moved across all or nothing; or with Ctrl copied, from
+/// `paths`, their files and folders on disk.
+fn drop_rows(
+    hwnd: HWND,
+    from: NotebookId,
+    dest: NotebookId,
+    items: &[RowKind],
+    folder: PathBuf,
+    copy: bool,
+    paths: Vec<PathBuf>,
+) {
+    match tree_drag::drop_action(from, dest, copy) {
+        tree_drag::DropAction::MoveHere => {
+            crate::window::tree_move::drop_many_into_of(hwnd, from, items, &folder);
+        }
+        tree_drag::DropAction::MoveAcross => crate::window::cross_move_host::move_items(
+            hwnd,
+            from,
+            items.to_vec(),
+            crate::window::cross_move_host::Destination::Open { id: dest, folder },
+        ),
+        tree_drag::DropAction::Copy => {
+            crate::window::copy_host::copy_into_of(hwnd, dest, paths, &folder, None);
+        }
+    }
+}
+
 /// Ctrl went down or up during a started row drag (`down`): the drop's action, its hint and
 /// the cursor follow at once, without a mouse move (multi-root move spec §3.1).
 pub(super) fn drag_ctrl(hwnd: HWND, down: bool) {
     let Some(pointer) = with_view(hwnd, |view| {
-        let drag = view
-            .drag
-            .as_mut()
-            .filter(|drag| drag.started && matches!(drag.source, DragSource::Row(_)))?;
+        let drag = view.drag.as_mut().filter(|drag| {
+            drag.started && matches!(drag.source, DragSource::Row(_) | DragSource::Rows(_))
+        })?;
         drag.copy = down;
         Some(drag.pointer)
     })

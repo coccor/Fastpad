@@ -579,7 +579,7 @@ fn move_offers_favorites_by_name_then_recent_never_the_open_one_then_browse() {
 
     crate::window::library_host::move_to_notebook(window.hwnd, &a);
     let (note, destinations) = app_mut(window.hwnd).library.shown_move.clone().unwrap();
-    assert_eq!(note, a);
+    assert_eq!(note, std::slice::from_ref(&a));
     assert_eq!(destinations, vec![alpha, zeta, beta]);
 
     crate::window::answer_next_folder_dialog({

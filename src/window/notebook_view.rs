@@ -17,6 +17,7 @@ use crate::window::panel_cursor::Cursor;
 use crate::window::row_list::RowListState;
 use crate::window::tooltip::Tooltip;
 use crate::window::tree_drag::Drag;
+use selection::TreeSelection;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -34,6 +35,7 @@ mod geometry;
 mod input;
 mod paint;
 mod rebuild;
+mod selection;
 
 pub(crate) use add_notebook::*;
 pub(crate) use context_menu::*;
@@ -308,6 +310,57 @@ impl AsRef<TreeRow> for ViewRow {
     fn as_ref(&self) -> &TreeRow {
         &self.row
     }
+}
+
+/// Whether row `index` of `rows` is one of the multi-selection's ticked rows.
+fn row_ticked(multi: &TreeSelection, rows: &[ViewRow], index: usize) -> bool {
+    rows.get(index)
+        .is_some_and(|row| multi.contains(row.notebook, &row.kind))
+}
+
+/// The multi-selection's effective items (its notebook and rows, not those inside another
+/// selected folder) whenever two or more rows are ticked: one item when a folder is ticked with
+/// what is inside it. Actions take one item through their one-item paths.
+pub(crate) fn selection_effective(hwnd: HWND) -> Option<(NotebookId, Vec<RowKind>)> {
+    rebuild::with_view(hwnd, |view| {
+        let id = view.multi.notebook().filter(|_| view.multi.is_multi())?;
+        Some((id, view.multi.effective()))
+    })
+    .flatten()
+}
+
+/// The multi-selection's effective group, when it holds two or more effective items.
+pub(crate) fn selected_items(hwnd: HWND) -> Option<(NotebookId, Vec<RowKind>)> {
+    selection_effective(hwnd).filter(|(_, items)| items.len() >= 2)
+}
+
+/// The one effective item of a multi-selection whose ticked rows are a folder and what is
+/// inside it: actions on the selection act on that folder alone.
+pub(crate) fn selected_single(hwnd: HWND) -> Option<(NotebookId, RowKind)> {
+    match selection_effective(hwnd)? {
+        (id, items) if items.len() == 1 => items.into_iter().next().map(|item| (id, item)),
+        _ => None,
+    }
+}
+
+/// Esc in the panel: drops a multi-selection (or a lone ticked row), leaving the cursor row
+/// (tree multi-select spec, "Interaction details"). True when there was one to drop, so the
+/// focus stays in the tree.
+pub(crate) fn clear_selection(hwnd: HWND) -> bool {
+    rebuild::with_view(hwnd, |view| {
+        // Esc while the button is down: its release clicks nothing either.
+        view.pending_collapse = None;
+        view.pending_toggle = None;
+        // Any ticked row goes, a lone one too (Ctrl+Space's first tick, left behind as Ctrl+arrows
+        // move the cursor away).
+        let ticked = !view.multi.items().is_empty();
+        if ticked {
+            view.multi.clear();
+            view.invalidate();
+        }
+        ticked
+    })
+    .unwrap_or(false)
 }
 
 /// The index of the row of notebook `id` that shows `kind`.
@@ -589,6 +642,16 @@ pub(crate) struct NotebookView {
     /// The one keyboard selection through the Open Editors rows and the tree (open editors spec
     /// §3.5). `Cursor::Tree` leaves it to `list.selected`.
     pub(crate) cursor: Cursor,
+    /// The notes and folders ticked together in the tree (tree multi-select spec). The cursor row
+    /// is `list.selected`, which stands for a single selection.
+    pub(crate) multi: TreeSelection,
+    /// A plain press on a row inside the multi-selection, and the part it hit: its click waits
+    /// for the release, which collapses the selection to it unless a drag started first. Kept
+    /// by notebook and kind, so a rebuild before the release cannot move it onto another row.
+    pending_collapse: Option<(NotebookId, RowKind, RowPart)>,
+    /// A Ctrl+press on a ticked row: it leaves the selection at the release, unless a drag
+    /// started first (a Ctrl+drag copies the group).
+    pending_toggle: Option<(NotebookId, RowKind)>,
     /// Full rebuilds so far, for the tests that check a tab switch skips one.
     #[cfg(test)]
     pub(crate) rebuilds: usize,
@@ -660,6 +723,9 @@ impl NotebookView {
             typed: TypeAhead::default(),
             thumb_grab: None,
             drag: None,
+            multi: TreeSelection::default(),
+            pending_collapse: None,
+            pending_toggle: None,
             drag_notebook: None,
             drop_notebook: None,
             eat_right_up: false,
@@ -785,7 +851,25 @@ impl NotebookView {
         rows
     }
 
-    fn apply(&mut self, snapshot: Snapshot, names: Vec<(String, Option<String>)>) {
+    /// Whether row `index` is ticked in the multi-selection.
+    pub(crate) fn multi_contains_row(&self, index: usize) -> bool {
+        row_ticked(&self.multi, &self.rows, index)
+    }
+
+    /// The rows as notebook and kind keys, for the selection model's slice parameters.
+    pub(crate) fn row_keys(&self) -> Vec<(NotebookId, RowKind)> {
+        self.rows
+            .iter()
+            .map(|row| (row.notebook, row.kind.clone()))
+            .collect()
+    }
+
+    fn apply(
+        &mut self,
+        snapshot: Snapshot,
+        names: Vec<(String, Option<String>)>,
+        listed: Option<&[RowKind]>,
+    ) {
         let reset = snapshot.mode != self.mode;
         if reset {
             self.list = RowListState::new(self.list.row_height);
@@ -849,6 +933,13 @@ impl NotebookView {
             Mode::NoNotebook => self.recent.len(),
         };
         self.list.set_count(count);
+        // Ticked rows that went away (deleted outside FastPad) leave the selection; those only
+        // hidden under a collapsed folder stay, and all stay while the library can't be asked.
+        if let Some(listed) = listed {
+            let keys = self.row_keys();
+            self.multi
+                .retain_present(&keys, |kind| listed.contains(kind));
+        }
         // Measured in the new mode's list area.
         let height = self.list_height();
         if self.mode == Mode::Tree {
