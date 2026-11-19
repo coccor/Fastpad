@@ -213,10 +213,12 @@ impl crate::window::sidebar_accessibility::AccessibleView for NotebookView {
                 &row.name, rect,
             ));
         }
+        // Every ticked row reports selected; only the cursor row holds the focus.
+        let cursor = self.list().selected == Some(index);
         let mut item = tree_item(
             row,
-            self.list().selected == Some(index),
-            focused,
+            cursor || self.multi_contains_row(index),
+            focused && cursor,
             rect,
             visible,
         );

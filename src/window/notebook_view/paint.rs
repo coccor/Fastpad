@@ -816,6 +816,7 @@ impl NotebookView {
                     palette,
                     focused,
                     tree_bar,
+                    &|_| false,
                     &|_| paint.background,
                     dpi,
                     &mut |dc, index, rect, look| {
@@ -829,6 +830,7 @@ impl NotebookView {
                 self.inline.set_colors(*palette);
                 let highlight = self.drop_highlight();
                 let rows = &self.rows;
+                let multi = &self.multi;
                 let roots = &self.roots;
                 let images = &mut self.images;
                 let (icon_set, light_theme) = (paint.icon_set, paint.light_theme);
@@ -858,6 +860,7 @@ impl NotebookView {
                     palette,
                     focused,
                     tree_bar,
+                    &|index| row_ticked(multi, rows, index),
                     &|index| under_row(highlight, index, palette, paint.background),
                     dpi,
                     &mut |dc, index, rect, look| {
@@ -1000,6 +1003,7 @@ impl NotebookView {
             palette,
             paint.focused,
             editors_bar,
+            &|_| false,
             &|_| paint.background,
             dpi,
             &mut |dc, index, rect, look| match editors.rows.get(index) {

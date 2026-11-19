@@ -1,7 +1,7 @@
 //! The Notebook tree's multi-selection: which note and folder rows are ticked, in one notebook.
 //! Pure state with no window, so the rules are testable on their own.
 
-// Later tasks wire the model into the tree view; until then only the tests use it.
+// The click and key handling that toggles and ranges the selection is wired in later tasks.
 #![allow(dead_code)]
 
 use crate::library::tree::{RowKind, ancestors};
@@ -31,6 +31,11 @@ impl TreeSelection {
     /// Whether `kind` of notebook `id` is selected.
     pub(crate) fn contains(&self, id: NotebookId, kind: &RowKind) -> bool {
         self.notebook == Some(id) && self.items.contains(kind)
+    }
+
+    /// Every ticked row, in tree order.
+    pub(crate) fn items(&self) -> &[RowKind] {
+        &self.items
     }
 
     /// The notebook the selection lives in.
