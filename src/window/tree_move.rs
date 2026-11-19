@@ -168,12 +168,6 @@ fn folder_label(root: &Path, folder: &Path) -> String {
     }
 }
 
-/// The source is gone: say so, and let a rescan catch the tree up.
-fn gone(hwnd: HWND, id: library_host::NotebookId, name: &str) {
-    push_notice(hwnd, format!("{name} no longer exists."));
-    library_host::request_rescan_of(hwnd, id);
-}
-
 /// A drop in the tree (tree drag spec §3.4, §4, §5): moves `source` into `folder` (relative to
 /// the notebook; empty for the root), keeping its name. A folder that refuses it does nothing; a
 /// taken name, a vanished source, a refusal from Windows or a tab that cannot follow moves
@@ -193,17 +187,84 @@ pub(crate) fn drop_into_of(
     source: &RowKind,
     folder: &Path,
 ) {
-    let Some(root) = library_host::notebook_folder(hwnd, id) else {
-        return;
-    };
+    match try_drop_into_of(hwnd, id, source, folder) {
+        Ok(row) => {
+            side_panel::with_accessible_events(hwnd, || {
+                side_panel::refresh(hwnd);
+                notebook_view::select_row(hwnd, id, &row);
+            });
+        }
+        Err(Some(notice)) => push_notice(hwnd, notice),
+        Err(None) => {}
+    }
+}
+
+/// The notice for a group move that left `failed` of `total` items where they were: one line
+/// per failure, each the text the one-item drop would have shown.
+fn group_notice(failed: &[String], total: usize) -> String {
+    format!(
+        "{} of {} items were not moved:
+{}",
+        failed.len(),
+        total,
+        failed.join(
+            "
+"
+        )
+    )
+}
+
+/// A drop of several rows of the notebook `id` into `folder`: each one moves as `drop_into_of`
+/// moves it, and one that cannot is skipped. The view refreshes once, the selection is dropped
+/// and the cursor lands on the last row that moved; the failures are one notice. `items` are
+/// the effective selection, so a folder is not listed along with what is inside it.
+// Task 6 calls this from the drag code; until then only the tests do.
+#[allow(dead_code)]
+pub(crate) fn drop_many_into_of(
+    hwnd: HWND,
+    id: library_host::NotebookId,
+    items: &[RowKind],
+    folder: &Path,
+) {
+    let mut last = None;
+    let mut failed = Vec::new();
+    for source in items {
+        match try_drop_into_of(hwnd, id, source, folder) {
+            Ok(row) => last = Some(row),
+            Err(Some(notice)) => failed.push(notice),
+            Err(None) => {}
+        }
+    }
+    notebook_view::clear_selection(hwnd);
+    side_panel::with_accessible_events(hwnd, || {
+        side_panel::refresh(hwnd);
+        if let Some(row) = &last {
+            notebook_view::select_row(hwnd, id, row);
+        }
+    });
+    if !failed.is_empty() {
+        push_notice(hwnd, group_notice(&failed, items.len()));
+    }
+}
+
+/// The move of `drop_into_of` without the view: the row at its new path, or `Err` with the
+/// notice to show (`None` when the drop is silently refused). The target folder and its
+/// ancestors are expanded and the links followed; the caller refreshes and selects.
+pub(crate) fn try_drop_into_of(
+    hwnd: HWND,
+    id: library_host::NotebookId,
+    source: &RowKind,
+    folder: &Path,
+) -> Result<RowKind, Option<String>> {
+    let root = library_host::notebook_folder(hwnd, id).ok_or(None)?;
     let (Some(old), Some(new)) = (
         tree_drag::source_path(source),
         tree_drag::destination(source, folder),
     ) else {
-        return;
+        return Err(None);
     };
     if !tree_drag::accepts_here(source, folder) {
-        return;
+        return Err(None);
     }
     let name = old
         .file_name()
@@ -213,7 +274,7 @@ pub(crate) fn drop_into_of(
     if super::cross_move_host::refuse_if_moving(hwnd, &root.join(folder))
         || super::cross_move_host::refuse_item_if_moving(hwnd, &root.join(old))
     {
-        return;
+        return Err(None);
     }
     let is_folder = matches!(source, RowKind::Folder(_));
     let (listed, taken) = library_host::with_notebook(hwnd, id, |state| {
@@ -226,12 +287,11 @@ pub(crate) fn drop_into_of(
     })
     .unwrap_or((false, false));
     if !listed {
-        gone(hwnd, id, &name);
-        return;
+        library_host::request_rescan_of(hwnd, id);
+        return Err(Some(format!("{name} no longer exists.")));
     }
     if taken {
-        push_notice(hwnd, taken_notice(&name, &folder_label(&root, folder)));
-        return;
+        return Err(Some(taken_notice(&name, &folder_label(&root, folder))));
     }
     let result = if is_folder {
         move_folder(hwnd, &root, old, &new)
@@ -241,28 +301,23 @@ pub(crate) fn drop_into_of(
     let moved = match result {
         Ok(moved) => moved,
         Err(MoveError::Taken) => {
-            push_notice(hwnd, taken_notice(&name, &folder_label(&root, folder)));
-            return;
+            return Err(Some(taken_notice(&name, &folder_label(&root, folder))));
         }
         Err(MoveError::Missing(_)) => {
-            gone(hwnd, id, &name);
-            return;
+            library_host::request_rescan_of(hwnd, id);
+            return Err(Some(format!("{name} no longer exists.")));
         }
         Err(MoveError::TargetGone(error)) => {
-            push_notice(hwnd, format!("Couldn't move {name}: {error}"));
             library_host::request_rescan_of(hwnd, id);
-            return;
+            return Err(Some(format!("Couldn't move {name}: {error}")));
         }
         Err(MoveError::Failed(error)) => {
-            push_notice(hwnd, format!("Couldn't move {name}: {error}"));
-            return;
+            return Err(Some(format!("Couldn't move {name}: {error}")));
         }
         Err(MoveError::TabCantFollow) => {
-            push_notice(
-                hwnd,
-                format!("Couldn't move {name}: another tab already has that file open."),
-            );
-            return;
+            return Err(Some(format!(
+                "Couldn't move {name}: another tab already has that file open."
+            )));
         }
     };
     for ancestor in tree::ancestors(&new) {
@@ -274,10 +329,6 @@ pub(crate) fn drop_into_of(
     } else {
         RowKind::Note(new.clone())
     };
-    side_panel::with_accessible_events(hwnd, || {
-        side_panel::refresh(hwnd);
-        notebook_view::select_row(hwnd, id, &row);
-    });
     if !moved.stuck.is_empty() {
         push_notice(
             hwnd,
@@ -291,4 +342,5 @@ pub(crate) fn drop_into_of(
         vec![(old.to_path_buf(), new.clone())]
     };
     library_host::notes_moved_of(hwnd, id, &moves);
+    Ok(row)
 }

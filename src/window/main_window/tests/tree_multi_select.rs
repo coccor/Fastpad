@@ -611,3 +611,118 @@ fn f2_on_a_selection_renames_the_cursor_row_only() {
         Some((id, vec![a, c]))
     );
 }
+
+/// Notes `names` plus the folder `work` (holding `inside`) in a fresh notebook shown in the
+/// Notebook view.
+fn group_window(
+    label: &str,
+    names: &[&str],
+    inside: &[&str],
+) -> (LibraryScratch, ProductionWindow, crate::editor::Editor) {
+    let scratch = LibraryScratch::new(label);
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    for name in names {
+        scratch.note(name, name);
+    }
+    for name in inside {
+        scratch.note(&format!("work/{name}"), "taken");
+    }
+    let (window, editor) = notebook_window(&scratch);
+    (scratch, window, editor)
+}
+
+#[test]
+fn a_group_moves_into_a_folder_and_the_cursor_lands_on_the_last_one() {
+    // Break caught: a group move that stops after the first row, leaves the ticks painted, or
+    // parks the cursor on the first row instead of the last one moved.
+    let _scintilla = load_native_scintilla();
+    let (scratch, window, _editor) = group_window("multi-move", &["a.md", "b.md", "c.md"], &[]);
+    let hwnd = window.hwnd;
+    let id = first_id(hwnd);
+    let (a, b) = (note("a.md"), note("b.md"));
+    click_row(hwnd, &a, 0);
+    click_row(hwnd, &b, MK_CONTROL);
+    let (_, items) = crate::window::notebook_view::selected_items(hwnd).unwrap();
+    crate::window::tree_move::drop_many_into_of(hwnd, id, &items, std::path::Path::new("work"));
+    let folder = scratch.folder();
+    assert!(folder.join("work/a.md").exists() && folder.join("work/b.md").exists());
+    assert!(!folder.join("a.md").exists() && !folder.join("b.md").exists());
+    assert!(folder.join("c.md").exists());
+    assert_eq!(crate::window::notebook_view::selected_items(hwnd), None);
+    assert_eq!(
+        selected_row_of(hwnd),
+        Some((
+            id,
+            RowKind::Note(std::path::PathBuf::from("work").join("b.md"))
+        ))
+    );
+    assert!(notices(hwnd).is_empty(), "{:?}", notices(hwnd));
+}
+
+#[test]
+fn a_taken_name_skips_that_item_moves_the_rest_and_says_so_once() {
+    // Break caught: one clash aborting the whole group, or one notice per failure instead of a
+    // single summary.
+    let _scintilla = load_native_scintilla();
+    let (scratch, window, _editor) =
+        group_window("multi-taken", &["a.md", "b.md", "c.md"], &["b.md"]);
+    let hwnd = window.hwnd;
+    let id = first_id(hwnd);
+    app_mut(hwnd).notifications.dismiss_all();
+    let items = [note("a.md"), note("b.md"), note("c.md")];
+    crate::window::tree_move::drop_many_into_of(hwnd, id, &items, std::path::Path::new("work"));
+    let folder = scratch.folder();
+    assert!(folder.join("work/a.md").exists() && folder.join("work/c.md").exists());
+    assert_eq!(
+        std::fs::read_to_string(folder.join("work/b.md")).unwrap(),
+        "taken"
+    );
+    assert!(folder.join("b.md").exists(), "the clashing note stayed");
+    assert_eq!(
+        notices(hwnd),
+        vec![format!(
+            "1 of 3 items were not moved:\n{}",
+            crate::window::tree_move::taken_notice("b.md", "work")
+        )]
+    );
+    assert_eq!(
+        selected_row_of(hwnd),
+        Some((
+            id,
+            RowKind::Note(std::path::PathBuf::from("work").join("c.md"))
+        ))
+    );
+}
+
+#[test]
+fn a_folder_and_a_note_inside_it_move_once_with_the_folder() {
+    // Break caught: the note inside a selected folder moving on its own (and failing, or
+    // landing twice) because the group move saw both rows.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("multi-nested");
+    std::fs::create_dir_all(scratch.folder().join("x")).unwrap();
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    scratch.note("x/n.md", "n");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    scratch.install(window.hwnd);
+    let hwnd = window.hwnd;
+    let id = first_id(hwnd);
+    crate::window::library_host::set_expanded(hwnd, std::path::Path::new("x"), true);
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, false);
+    crate::window::notebook_view::rebuild(hwnd);
+    let (folder_x, inner) = (
+        RowKind::Folder("x".into()),
+        RowKind::Note(std::path::PathBuf::from("x").join("n.md")),
+    );
+    click_row(hwnd, &folder_x, MK_CONTROL);
+    click_row(hwnd, &inner, MK_CONTROL);
+    app_mut(hwnd).notifications.dismiss_all();
+    let (_, items) = crate::window::notebook_view::selected_items(hwnd).unwrap();
+    assert_eq!(items, vec![folder_x]);
+    crate::window::tree_move::drop_many_into_of(hwnd, id, &items, std::path::Path::new("work"));
+    assert!(scratch.folder().join("work/x/n.md").exists());
+    assert!(!scratch.folder().join("x").exists());
+    assert!(notices(hwnd).is_empty(), "{:?}", notices(hwnd));
+}
