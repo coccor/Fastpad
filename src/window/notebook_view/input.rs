@@ -502,13 +502,13 @@ fn row_pressed(hwnd: HWND, index: usize, part: RowPart, buttons: WPARAM, x: i32,
             if shift {
                 view.multi.select_range(&rows, id, index, cursor);
             } else if view.multi.contains(id, &kind) {
-                view.pending_toggle = Some(index);
+                view.pending_toggle = Some((id, kind.clone()));
             } else {
                 let cursor = cursor.and_then(|at| rows.get(at).cloned());
                 view.multi.toggle(&rows, id, &kind, cursor);
             }
         } else if in_multi(view, index) {
-            view.pending_collapse = Some((index, part));
+            view.pending_collapse = Some((id, kind.clone(), part));
         } else {
             view.multi.clear();
             return None;
@@ -535,21 +535,28 @@ fn release_press(hwnd: HWND) {
     }) else {
         return;
     };
-    if let Some(index) = toggle {
+    // The pressed row is looked up again: a rebuild may have moved it, or taken it away, in
+    // which case the press does nothing.
+    if let Some((id, kind)) = toggle {
         with_view(hwnd, |view| {
-            let rows = view.row_keys();
-            if let Some((id, kind)) = rows.get(index).cloned() {
+            if view_row_index(&view.rows, id, &kind).is_some() {
+                let rows = view.row_keys();
                 view.multi.toggle(&rows, id, &kind, None);
                 view.invalidate();
             }
         });
     }
-    if let Some((index, part)) = collapse {
-        with_view(hwnd, |view| {
+    if let Some((id, kind, part)) = collapse {
+        let index = with_view(hwnd, |view| {
+            let index = view_row_index(&view.rows, id, &kind)?;
             view.multi.clear();
-            view.invalidate();
-        });
-        row_clicked(hwnd, index, part, false);
+            view.select(index);
+            Some(index)
+        })
+        .flatten();
+        if let Some(index) = index {
+            row_clicked(hwnd, index, part, false);
+        }
     }
 }
 

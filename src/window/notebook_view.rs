@@ -336,6 +336,9 @@ pub(crate) fn selected_items(hwnd: HWND) -> Option<(NotebookId, Vec<RowKind>)> {
 /// "Interaction details"). True when there was one to drop, so the focus stays in the tree.
 pub(crate) fn clear_selection(hwnd: HWND) -> bool {
     rebuild::with_view(hwnd, |view| {
+        // Esc while the button is down: its release clicks nothing either.
+        view.pending_collapse = None;
+        view.pending_toggle = None;
         let multi = view.multi.is_multi();
         if multi {
             view.multi.clear();
@@ -629,11 +632,12 @@ pub(crate) struct NotebookView {
     /// is `list.selected`, which stands for a single selection.
     pub(crate) multi: TreeSelection,
     /// A plain press on a row inside the multi-selection, and the part it hit: its click waits
-    /// for the release, which collapses the selection to it unless a drag started first.
-    pending_collapse: Option<(usize, RowPart)>,
+    /// for the release, which collapses the selection to it unless a drag started first. Kept
+    /// by notebook and kind, so a rebuild before the release cannot move it onto another row.
+    pending_collapse: Option<(NotebookId, RowKind, RowPart)>,
     /// A Ctrl+press on a ticked row: it leaves the selection at the release, unless a drag
     /// started first (a Ctrl+drag copies the group).
-    pending_toggle: Option<usize>,
+    pending_toggle: Option<(NotebookId, RowKind)>,
     /// Full rebuilds so far, for the tests that check a tab switch skips one.
     #[cfg(test)]
     pub(crate) rebuilds: usize,

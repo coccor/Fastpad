@@ -375,3 +375,123 @@ fn a_right_click_inside_the_selection_keeps_it() {
     assert_eq!(crate::window::notebook_view::selected_items(hwnd), None);
     assert_eq!(selected_row_of(hwnd), Some((first_id(hwnd), b)));
 }
+
+#[test]
+fn escape_in_another_sidebar_view_returns_to_the_editor_despite_a_selection() {
+    // Break caught: Esc in Favorites or Search silently dropping a tree selection nobody can
+    // see there, leaving the keyboard stuck in the panel.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_SHOW, ShowWindow, WM_KEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let (_scratch, window, _editor) = notes_window("multi-escape-other", &["a.md", "b.md"]);
+    let hwnd = window.hwnd;
+    unsafe { ShowWindow(hwnd, SW_SHOW) };
+    super::super::return_focus_to_editor(hwnd);
+    let editor = focused();
+    click_row(hwnd, &note("a.md"), 0);
+    click_row(hwnd, &note("b.md"), MK_CONTROL);
+    assert!(crate::window::notebook_view::selected_items(hwnd).is_some());
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Favorites, true);
+    let panel = sidebar_windows(hwnd).1;
+    assert_eq!(focused(), panel);
+    unsafe { SendMessageW(panel, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
+    assert_eq!(focused(), editor, "one Esc returns to the editor");
+}
+
+#[test]
+fn a_release_after_a_rebuild_clicks_the_row_pressed_not_the_one_now_at_its_place() {
+    // Break caught: a deferred click kept as a row index, so a rebuild between press and
+    // release (the file watcher adding a note above) opens whichever note slid into that place,
+    // or one that was deleted meanwhile.
+    let _scintilla = load_native_scintilla();
+    let (scratch, window, _editor) = notes_window("multi-release-moved", &["b.md", "c.md", "d.md"]);
+    let hwnd = window.hwnd;
+    app_mut(hwnd).library.data_dir = Some(scratch.data());
+    let (b, c, d) = (note("b.md"), note("c.md"), note("d.md"));
+    let panel = sidebar_windows(hwnd).1;
+
+    // A note added above the pressed one.
+    click_row(hwnd, &b, 0);
+    click_row(hwnd, &d, MK_CONTROL);
+    let at = row_point(hwnd, first_id(hwnd), &d);
+    let old_index = row_of(hwnd, &d);
+    mouse(panel, WM_LBUTTONDOWN, MK_LBUTTON, at);
+    scratch.note("a.md", "a");
+    rescan_and_wait(hwnd);
+    crate::window::notebook_view::rebuild(hwnd);
+    assert_eq!(view_rows(hwnd)[old_index].1, c, "c now sits where d was");
+    mouse(panel, WM_LBUTTONUP, 0, at);
+    assert!(
+        opened(hwnd, &scratch.folder().join("d.md")),
+        "the pressed note opens"
+    );
+    assert!(!opened(hwnd, &scratch.folder().join("c.md")));
+    assert_eq!(selected_row_of(hwnd), Some((first_id(hwnd), d.clone())));
+    assert_eq!(crate::window::notebook_view::selected_items(hwnd), None);
+
+    // The pressed note deleted before the release: nothing opens.
+    click_row(hwnd, &b, 0);
+    click_row(hwnd, &c, MK_CONTROL);
+    click_row(hwnd, &d, MK_CONTROL);
+    let at = row_point(hwnd, first_id(hwnd), &d);
+    mouse(panel, WM_LBUTTONDOWN, MK_LBUTTON, at);
+    std::fs::remove_file(scratch.folder().join("d.md")).unwrap();
+    rescan_and_wait(hwnd);
+    crate::window::notebook_view::rebuild(hwnd);
+    let tabs = tab_paths(hwnd);
+    mouse(panel, WM_LBUTTONUP, 0, at);
+    assert_eq!(tab_paths(hwnd), tabs, "nothing opens");
+}
+
+#[test]
+fn a_cancelled_drag_from_the_selection_neither_collapses_nor_untoggles_it() {
+    // Break caught: a press's deferred click outliving the drag it became, so the release
+    // after an Esc-cancelled drag collapses the group and opens a note, or untoggles the row
+    // a Ctrl+drag started from.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_KEYDOWN, WM_MOUSEMOVE};
+    let _scintilla = load_native_scintilla();
+    let (scratch, window, _editor) = notes_window("multi-drag-cancel", &["a.md", "b.md", "c.md"]);
+    let hwnd = window.hwnd;
+    let (a, b, c) = (note("a.md"), note("b.md"), note("c.md"));
+    let panel = sidebar_windows(hwnd).1;
+    let id = first_id(hwnd);
+    let group = Some((id, vec![a.clone(), c.clone()]));
+    click_row(hwnd, &a, 0);
+    click_row(hwnd, &c, MK_CONTROL);
+    let tabs = tab_paths(hwnd);
+
+    // Drags the press on `from` (with `buttons`) to b, cancels it with Esc, then releases.
+    let drag_and_cancel = |from: &RowKind, buttons: usize| {
+        let at = row_point(hwnd, id, from);
+        mouse(panel, WM_LBUTTONDOWN, MK_LBUTTON | buttons, at);
+        mouse(
+            panel,
+            WM_MOUSEMOVE,
+            MK_LBUTTON | buttons,
+            row_point(hwnd, id, &b),
+        );
+        assert!(
+            notebook_view(hwnd)
+                .drag
+                .as_ref()
+                .is_some_and(|drag| drag.started),
+            "the drag started"
+        );
+        unsafe { SendMessageW(panel, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
+        assert!(notebook_view(hwnd).drag.is_none(), "Esc cancelled it");
+        mouse(panel, WM_LBUTTONUP, buttons, at);
+    };
+
+    drag_and_cancel(&c, 0);
+    assert_eq!(crate::window::notebook_view::selected_items(hwnd), group);
+    assert_eq!(tab_paths(hwnd), tabs, "no note opened");
+    assert!(!opened(hwnd, &scratch.folder().join("c.md")));
+
+    drag_and_cancel(&a, MK_CONTROL);
+    assert_eq!(
+        crate::window::notebook_view::selected_items(hwnd),
+        group,
+        "a stays ticked"
+    );
+}
