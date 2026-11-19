@@ -34,6 +34,7 @@ mod geometry;
 mod input;
 mod paint;
 mod rebuild;
+mod selection;
 
 pub(crate) use add_notebook::*;
 pub(crate) use context_menu::*;
