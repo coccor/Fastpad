@@ -18,10 +18,10 @@ pub const DEFAULT_PREVIEW_LINE_HEIGHT: u8 = 16;
 pub const MIN_PREVIEW_LINE_HEIGHT: u8 = 10;
 pub const MAX_PREVIEW_LINE_HEIGHT: u8 = 30;
 pub const DEFAULT_FONT_SIZE: u16 = 11;
-/// Markdown tabs open in the source view until another view mode is chosen.
-pub const DEFAULT_MARKDOWN_VIEW: crate::preview::ViewMode = crate::preview::ViewMode::Source;
-/// SVG tabs open in the source view until another view mode is chosen.
-pub const DEFAULT_SVG_VIEW: crate::preview::ViewMode = crate::preview::ViewMode::Source;
+/// Markdown tabs open in the preview until another view mode is chosen.
+pub const DEFAULT_MARKDOWN_VIEW: crate::preview::ViewMode = crate::preview::ViewMode::Preview;
+/// SVG tabs open in the preview until another view mode is chosen.
+pub const DEFAULT_SVG_VIEW: crate::preview::ViewMode = crate::preview::ViewMode::Preview;
 pub const DEFAULT_TAB_WIDTH: u8 = 4;
 pub const DEFAULT_WORD_WRAP: bool = false;
 pub const DEFAULT_LINE_NUMBERS: bool = true;
@@ -131,6 +131,8 @@ mod tests {
         assert!(!settings.always_on_top);
         assert_eq!(settings.capture_hotkey, "Ctrl+Alt+N");
         assert!(!settings.capture_source);
+        assert_eq!(settings.markdown_view, crate::preview::ViewMode::Preview);
+        assert_eq!(settings.svg_view, crate::preview::ViewMode::Preview);
     }
 
     #[test]

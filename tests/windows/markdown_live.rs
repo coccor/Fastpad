@@ -267,6 +267,7 @@ fn a_tab_that_is_not_markdown_stays_in_source_with_a_notice() {
 fn a_note_over_the_size_limit_stays_in_source_with_a_notice() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
+    main.with_app(|app| app.settings.markdown_view = crate::preview::ViewMode::Source);
     main.make_markdown(&"x".repeat(live::LIVE_MAX_BYTES + 1));
     main.set_live(true);
     assert!(main.live_view().is_none());

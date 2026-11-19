@@ -140,6 +140,7 @@ fn a_new_markdown_view_default_reaches_new_tabs_and_leaves_open_ones_alone() {
     let _scintilla = load_native_scintilla();
     let window = ProductionWindow::new(make_app());
     let _editor = install_test_editor(&window);
+    app_mut(window.hwnd).settings.markdown_view = ViewMode::Source;
     let markdown = || {
         app_mut(window.hwnd)
             .tabs

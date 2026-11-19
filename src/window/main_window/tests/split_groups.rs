@@ -175,6 +175,7 @@ fn a_preview_opened_in_one_group_leaves_the_other_group_alone() {
     let _scintilla = load_native_scintilla();
     let window = ProductionWindow::new(make_app());
     let editor = install_test_editor(&window);
+    app_mut(window.hwnd).settings.markdown_view = crate::preview::ViewMode::Source;
     editor.set_text("# title").unwrap();
     app_mut(window.hwnd)
         .tabs

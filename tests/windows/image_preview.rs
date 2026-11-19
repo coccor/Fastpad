@@ -573,6 +573,7 @@ fn an_svg_opens_as_text_and_the_preview_renders_and_follows_edits() {
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="40" height="20"/></svg>"#,
     )
     .unwrap();
+    main.with_app(|app| app.settings.svg_view = crate::preview::ViewMode::Source);
     main.open(&path).unwrap();
     pump_pending();
     assert!(!main.with_app(|app| app.tabs.active().unwrap().is_image()));

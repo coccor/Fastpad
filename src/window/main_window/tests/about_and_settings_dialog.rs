@@ -302,7 +302,7 @@ fn the_settings_dialog_changes_settings_from_the_keyboard() {
     // leaves the field, or changes that aren't saved (settings dialog spec §3.3).
     use crate::config::FileIconSet;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        VK_ESCAPE, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
+        VK_ESCAPE, VK_LEFT, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CHAR, WM_KEYDOWN};
     let _scintilla = load_native_scintilla();
@@ -327,10 +327,10 @@ fn the_settings_dialog_changes_settings_from_the_keyboard() {
         key(VK_TAB); // Preview line height
         key(VK_UP); // 1.6 -> 1.7
         key(VK_TAB); // Markdown view
-        key(VK_RIGHT); // Source → Split
+        key(VK_LEFT); // Preview → Split
         key(VK_TAB); // SVG view
-        key(VK_RIGHT); // Source → Split
-        key(VK_RIGHT); // Split → Preview
+        key(VK_LEFT); // Preview → Split
+        key(VK_LEFT); // Split → Source
         key(VK_TAB); // Tab width
         key(VK_RIGHT); // 4 → 8
         key(VK_TAB); // Indent with spaces
@@ -346,14 +346,14 @@ fn the_settings_dialog_changes_settings_from_the_keyboard() {
     assert_eq!(settings.preview_font_size, 15);
     assert_eq!(settings.preview_line_height, 17);
     assert_eq!(settings.markdown_view, crate::preview::ViewMode::Split);
-    assert_eq!(settings.svg_view, crate::preview::ViewMode::Preview);
+    assert_eq!(settings.svg_view, crate::preview::ViewMode::Source);
     assert_eq!(settings.tab_width, 8);
     assert!(settings.insert_spaces);
     super::super::save_settings_to(None);
     assert_eq!(
         std::fs::read_to_string(&ini).unwrap(),
         "# kept\r\nfile_icons=minimal\r\nfont_size=16\r\npreview_font_size=15\r\n\
-         preview_line_height=1.7\r\nmarkdown_view=split\r\nsvg_view=preview\r\ntab_width=8\r\n\
+         preview_line_height=1.7\r\nmarkdown_view=split\r\nsvg_view=source\r\ntab_width=8\r\n\
          insert_spaces=true\r\n"
     );
 }
