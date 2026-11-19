@@ -213,6 +213,8 @@ struct ViewState {
     hits: Vec<FindHit>,
     /// The index in `hits` of the current match.
     current_hit: Option<usize>,
+    /// Blocks the last find recompute matched, for tests that check an edit stays local.
+    find_blocks_scanned: usize,
     /// Declared last so it drops last: the target, brushes, text layouts, and bitmaps above all
     /// live in d2d1.dll and dwrite.dll, which the final `Graphics` reference unloads.
     graphics: Rc<Graphics>,
@@ -275,6 +277,7 @@ impl PreviewView {
             find: None,
             hits: Vec::new(),
             current_hit: None,
+            find_blocks_scanned: 0,
         });
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize) };
         Ok(Self { hwnd })
@@ -463,6 +466,10 @@ impl PreviewView {
             }
             if opened {
                 state.layouts[found.block] = None;
+                // The opened sections' runs join the block, renumbering its runs.
+                if state.find.is_some() {
+                    recompute_find(state);
+                }
             }
             let reading = state.heights.anchor(state.scroll_y);
             if matches!(ensure_layouts(state, &[found.block]), Ok(true)) {
@@ -598,6 +605,12 @@ impl PreviewView {
             }
         });
         invalidate(self.hwnd);
+    }
+
+    /// How many blocks the last find recompute matched.
+    #[cfg(test)]
+    pub fn find_blocks_scanned(&self) -> usize {
+        self.with(|state| state.find_blocks_scanned).unwrap_or(0)
     }
 
     /// The shaded matches and the index of the current one.
@@ -793,6 +806,10 @@ fn accept_update(state: &mut ViewState, update: Update, started: Instant) {
     }
     // The old hits index the old blocks.
     let refind = update != Update::Unchanged && state.find.is_some();
+    let replaced = match &update {
+        Update::Replaced { old, new } => Some((old.clone(), new.clone())),
+        _ => None,
+    };
     let repaint = match update {
         Update::Unchanged => return,
         Update::Full => {
@@ -889,7 +906,10 @@ fn accept_update(state: &mut ViewState, update: Update, started: Instant) {
     state.stats.block_count = state.document.blocks.len();
     state.stats.revision = state.document.revision;
     if refind {
-        recompute_find(state);
+        match replaced {
+            Some((old, new)) => refind_replaced(state, old, new),
+            None => recompute_find(state),
+        }
         invalidate(state.hwnd);
     }
     if repaint {

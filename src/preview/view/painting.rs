@@ -131,6 +131,7 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
                     range: &range,
                     fill,
                     recolor,
+                    outline_matches: colors.outline_find_matches,
                     matches: &|run| {
                         let first =
                             hits.partition_point(|hit| (hit.block, hit.run) < (*index, run));

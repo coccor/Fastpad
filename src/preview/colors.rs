@@ -73,6 +73,9 @@ pub struct PreviewColors {
     /// The find bar's matches: the editor's find colour (the accent), or `Highlight` in high
     /// contrast. Filled from the palette like the selection colours.
     pub find_match: u32,
+    /// Outline every find match, not only the current one: high contrast, where a tint is not
+    /// guaranteed to show.
+    pub outline_find_matches: bool,
 }
 
 impl PreviewColors {
@@ -121,6 +124,7 @@ const GITHUB_LIGHT: PreviewColors = PreviewColors {
     inactive_selection: 0,
     selection_text: 0,
     find_match: 0,
+    outline_find_matches: false,
 };
 
 const GITHUB_DARK: PreviewColors = PreviewColors {
@@ -140,6 +144,7 @@ const GITHUB_DARK: PreviewColors = PreviewColors {
     inactive_selection: 0,
     selection_text: 0,
     find_match: 0,
+    outline_find_matches: false,
 };
 
 const PAPER_PREVIEW: PreviewColors = PreviewColors {
@@ -159,6 +164,7 @@ const PAPER_PREVIEW: PreviewColors = PreviewColors {
     inactive_selection: 0,
     selection_text: 0,
     find_match: 0,
+    outline_find_matches: false,
 };
 
 const LAMP_PREVIEW: PreviewColors = PreviewColors {
@@ -178,6 +184,7 @@ const LAMP_PREVIEW: PreviewColors = PreviewColors {
     inactive_selection: 0,
     selection_text: 0,
     find_match: 0,
+    outline_find_matches: false,
 };
 
 const fn catppuccin_colors(flavor: &Flavor) -> PreviewColors {
@@ -198,6 +205,7 @@ const fn catppuccin_colors(flavor: &Flavor) -> PreviewColors {
         inactive_selection: 0,
         selection_text: 0,
         find_match: 0,
+        outline_find_matches: false,
     }
 }
 
@@ -233,6 +241,7 @@ pub fn preview_colors(theme: Theme, high_contrast: bool) -> PreviewColors {
                 .selection_foreground
                 .unwrap_or(palette.editor_foreground),
             find_match: palette.selection_background,
+            outline_find_matches: true,
         };
     }
     let colors = match theme {
@@ -314,6 +323,9 @@ mod tests {
                 Palette::for_theme(theme, true).selection_background,
                 "{theme:?}"
             );
+            assert!(!preview_colors(theme, false).outline_find_matches);
+            // High contrast can't rely on a tint: every match is outlined.
+            assert!(preview_colors(theme, true).outline_find_matches);
         }
         assert_eq!(
             ColorRole::ALL[ColorRole::FindMatch as usize],
