@@ -97,6 +97,8 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
         fonts,
         paused,
         selection,
+        hits,
+        current_hit,
         ..
     } = state;
     let recolor = colors.selection_text != colors.text;
@@ -129,7 +131,16 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
                     range: &range,
                     fill,
                     recolor,
-                    matches: &|_| Vec::new(),
+                    matches: &|run| {
+                        let first =
+                            hits.partition_point(|hit| (hit.block, hit.run) < (*index, run));
+                        hits[first..]
+                            .iter()
+                            .take_while(|hit| hit.block == *index && hit.run == run)
+                            .enumerate()
+                            .map(|(at, hit)| (hit.start, hit.end, *current_hit == Some(first + at)))
+                            .collect()
+                    },
                 },
             );
             if let Some((focus_block, focus_link)) = *focus

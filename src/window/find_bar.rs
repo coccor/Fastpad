@@ -277,7 +277,7 @@ pub(crate) fn replace_all(
 }
 
 mod count;
-pub(crate) use count::{MatchCount, find_matches};
+pub(crate) use count::{COUNT_CAP, COUNT_MAX_BYTES, MatchCount, find_matches};
 
 // --- Window integration: native child controls hosting Find/Replace ---
 

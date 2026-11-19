@@ -92,6 +92,48 @@ fn run_units(state: &mut ViewState, block: usize) -> Vec<Vec<u16>> {
     .collect()
 }
 
+/// Finds the find query's matches in every block's rendered runs (sections as they are shown)
+/// and picks the current one. None for a document too large for the find bar to count.
+pub(super) fn recompute_find(state: &mut ViewState) {
+    state.hits.clear();
+    state.current_hit = None;
+    let Some(last) = state.document.blocks.len().checked_sub(1) else {
+        return;
+    };
+    if state.find.is_none()
+        || state.document.blocks[last].bytes.end > crate::window::find_bar::COUNT_MAX_BYTES
+    {
+        return;
+    }
+    let keys = section_keys(state, 0..=last);
+    let ViewState {
+        document,
+        find,
+        details_overrides,
+        ..
+    } = state;
+    let Some(find) = find.as_ref() else {
+        return;
+    };
+    let runs = document.blocks.iter().enumerate().map(|(index, block)| {
+        let keys = keys.get(&index);
+        let runs = text_runs(&block.kind, &mut |section, attribute| {
+            keys.and_then(|keys| keys.get(section))
+                .and_then(|key| details_overrides.get(key))
+                .copied()
+                .unwrap_or(attribute)
+        });
+        (index, runs.into_iter().map(|run| run.text).collect())
+    });
+    let hits =
+        crate::preview::find::find_hits(runs, &find.matcher, crate::window::find_bar::COUNT_CAP);
+    let current = find.current.as_ref().and_then(|current| {
+        crate::preview::find::current_hit(&document.blocks, &hits, &find.editor_matches, current)
+    });
+    state.hits = hits;
+    state.current_hit = current;
+}
+
 /// The point after the last character of the document.
 fn document_end(state: &mut ViewState) -> TextPoint {
     let Some(last) = state.document.blocks.len().checked_sub(1) else {
