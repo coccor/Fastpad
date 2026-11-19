@@ -26,7 +26,10 @@ fn hit(block: usize, run: u32, start: u32, end: u32) -> FindHit {
 fn hits_are_found_in_rendered_text_not_markup() {
     // Break caught: matching the source instead of the rendered text, so `**` finds the bold
     // markers the preview never draws, or the hit sits two characters late.
-    assert_eq!(hits_in("**bold** text\n", "bold", 10, true), [hit(0, 0, 0, 4)]);
+    assert_eq!(
+        hits_in("**bold** text\n", "bold", 10, true),
+        [hit(0, 0, 0, 4)]
+    );
     assert!(hits_in("**bold** text\n", "**", 10, true).is_empty());
 }
 

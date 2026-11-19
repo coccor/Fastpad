@@ -26,10 +26,12 @@ pub enum ColorRole {
     InactiveSelection,
     /// Selected text, in high contrast (`HighlightText`).
     SelectionText,
+    /// The find bar's matches: the editor's find colour, drawn at the editor's opacities.
+    FindMatch,
 }
 
 impl ColorRole {
-    pub const ALL: [ColorRole; 15] = [
+    pub const ALL: [ColorRole; 16] = [
         Self::Background,
         Self::Text,
         Self::Muted,
@@ -45,6 +47,7 @@ impl ColorRole {
         Self::Selection,
         Self::InactiveSelection,
         Self::SelectionText,
+        Self::FindMatch,
     ];
 }
 
@@ -67,6 +70,9 @@ pub struct PreviewColors {
     pub selection: u32,
     pub inactive_selection: u32,
     pub selection_text: u32,
+    /// The find bar's matches: the editor's find colour (the accent), or `Highlight` in high
+    /// contrast. Filled from the palette like the selection colours.
+    pub find_match: u32,
 }
 
 impl PreviewColors {
@@ -87,6 +93,7 @@ impl PreviewColors {
             ColorRole::Selection => self.selection,
             ColorRole::InactiveSelection => self.inactive_selection,
             ColorRole::SelectionText => self.selection_text,
+            ColorRole::FindMatch => self.find_match,
         }
     }
 
@@ -113,6 +120,7 @@ const GITHUB_LIGHT: PreviewColors = PreviewColors {
     selection: 0,
     inactive_selection: 0,
     selection_text: 0,
+    find_match: 0,
 };
 
 const GITHUB_DARK: PreviewColors = PreviewColors {
@@ -131,6 +139,7 @@ const GITHUB_DARK: PreviewColors = PreviewColors {
     selection: 0,
     inactive_selection: 0,
     selection_text: 0,
+    find_match: 0,
 };
 
 const PAPER_PREVIEW: PreviewColors = PreviewColors {
@@ -149,6 +158,7 @@ const PAPER_PREVIEW: PreviewColors = PreviewColors {
     selection: 0,
     inactive_selection: 0,
     selection_text: 0,
+    find_match: 0,
 };
 
 const LAMP_PREVIEW: PreviewColors = PreviewColors {
@@ -167,6 +177,7 @@ const LAMP_PREVIEW: PreviewColors = PreviewColors {
     selection: 0,
     inactive_selection: 0,
     selection_text: 0,
+    find_match: 0,
 };
 
 const fn catppuccin_colors(flavor: &Flavor) -> PreviewColors {
@@ -186,6 +197,7 @@ const fn catppuccin_colors(flavor: &Flavor) -> PreviewColors {
         selection: 0,
         inactive_selection: 0,
         selection_text: 0,
+        find_match: 0,
     }
 }
 
@@ -220,6 +232,7 @@ pub fn preview_colors(theme: Theme, high_contrast: bool) -> PreviewColors {
             selection_text: palette
                 .selection_foreground
                 .unwrap_or(palette.editor_foreground),
+            find_match: palette.selection_background,
         };
     }
     let colors = match theme {
@@ -237,6 +250,7 @@ pub fn preview_colors(theme: Theme, high_contrast: bool) -> PreviewColors {
         selection: palette.selection_background,
         inactive_selection: palette.inactive_selection_background,
         selection_text: palette.selection_foreground.unwrap_or(colors.text),
+        find_match: palette.accent,
         ..colors
     }
 }
@@ -282,6 +296,29 @@ mod tests {
         assert_eq!(mocha.border, crate::catppuccin::MOCHA.surface1);
         assert_eq!(mocha.muted, crate::catppuccin::MOCHA.subtext0);
         assert_eq!(mocha.code_background, crate::catppuccin::MOCHA.mantle);
+    }
+
+    #[test]
+    fn find_matches_use_the_accent_or_highlight_in_high_contrast() {
+        // Break caught: the preview shading find matches in a colour other than the editor's
+        // find colour, or relying on a tinted accent in high contrast, where only the system
+        // highlight colour is guaranteed to stand out.
+        for theme in Theme::ALL {
+            assert_eq!(
+                preview_colors(theme, false).find_match,
+                Palette::for_theme(theme, false).accent,
+                "{theme:?}"
+            );
+            assert_eq!(
+                preview_colors(theme, true).find_match,
+                Palette::for_theme(theme, true).selection_background,
+                "{theme:?}"
+            );
+        }
+        assert_eq!(
+            ColorRole::ALL[ColorRole::FindMatch as usize],
+            ColorRole::FindMatch
+        );
     }
 
     #[test]

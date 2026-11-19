@@ -129,6 +129,7 @@ pub(super) fn paint(state: &mut ViewState) -> Result<PaintOutcome> {
                     range: &range,
                     fill,
                     recolor,
+                    matches: &|_| Vec::new(),
                 },
             );
             if let Some((focus_block, focus_link)) = *focus
