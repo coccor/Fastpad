@@ -908,3 +908,61 @@ fn dropping_a_selection_on_another_notebook_moves_it_all_or_nothing() {
     });
     assert!(!ab.a.join("a.md").exists() && !ab.a.join("a2.md").exists());
 }
+
+#[test]
+fn a_group_drag_with_a_row_a_collapsed_folder_hides_survives_a_rebuild() {
+    // Break caught: a group drag that counts a ticked note hidden by a collapsed folder as gone,
+    // so the first rebuild under the drag (the file watcher, a tab change) cancels it.
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("multi-drag-hidden");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    std::fs::create_dir_all(scratch.folder().join("dest")).unwrap();
+    scratch.note("work/a.md", "a");
+    scratch.note("c.md", "c");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    scratch.install(window.hwnd);
+    let hwnd = window.hwnd;
+    let id = first_id(hwnd);
+    let work = std::path::Path::new("work");
+    crate::window::library_host::set_expanded(hwnd, work, true);
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, false);
+    crate::window::notebook_view::rebuild(hwnd);
+    let (hidden, c) = (
+        RowKind::Note(std::path::PathBuf::from("work").join("a.md")),
+        note("c.md"),
+    );
+    click_row(hwnd, &hidden, 0);
+    click_row(hwnd, &c, MK_CONTROL);
+    crate::window::library_host::set_expanded(hwnd, work, false);
+    crate::window::notebook_view::rebuild(hwnd);
+    assert_eq!(
+        crate::window::notebook_view::selected_items(hwnd),
+        Some((id, vec![hidden.clone(), c.clone()]))
+    );
+    start_group_drag(hwnd, id, &c, 0);
+    assert_eq!(
+        notebook_view(hwnd)
+            .drag
+            .as_ref()
+            .map(|drag| drag.source.clone()),
+        Some(DragSource::Rows(vec![hidden, c]))
+    );
+    crate::window::notebook_view::rebuild(hwnd);
+    assert!(
+        notebook_view(hwnd)
+            .drag
+            .as_ref()
+            .is_some_and(|drag| drag.started),
+        "the rebuild kept the drag"
+    );
+    let panel = sidebar_windows(hwnd).1;
+    let dest = row_point(hwnd, id, &RowKind::Folder("dest".into()));
+    mouse(panel, WM_MOUSEMOVE, MK_LBUTTON, dest);
+    mouse(panel, WM_LBUTTONUP, 0, dest);
+    let folder = scratch.folder();
+    assert!(folder.join("dest/a.md").exists() && folder.join("dest/c.md").exists());
+    assert!(!folder.join("work/a.md").exists() && !folder.join("c.md").exists());
+}

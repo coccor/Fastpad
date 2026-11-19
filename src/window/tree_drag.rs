@@ -106,7 +106,8 @@ impl Drag {
     /// Whether `folder`, of the notebook at `root`, takes this drag: a row copied by
     /// `tree_copy`'s rules, a row from another notebook anywhere, a row in its own notebook by
     /// `accepts_here`, and a tab or files by `source_accepts`. A group goes the same way: copied
-    /// when any of its items copies, anywhere in another notebook, by `rows_accept` in its own.
+    /// where every one of its items copies, anywhere in another notebook, by `rows_accept` in
+    /// its own.
     pub(crate) fn takes(&self, root: &Path, folder: &Path) -> bool {
         match &self.source {
             DragSource::Row(kind) if self.copy => self.row_path.as_ref().is_some_and(|path| {
@@ -114,7 +115,10 @@ impl Drag {
             }),
             DragSource::Row(kind) if self.cross => draggable(kind),
             DragSource::Rows(_) if self.copy => {
-                tree_copy::any_accepted(&self.group_paths, root, folder)
+                !self.group_paths.is_empty()
+                    && self.group_paths.iter().all(|path| {
+                        tree_copy::any_accepted(std::slice::from_ref(path), root, folder)
+                    })
             }
             DragSource::Rows(items) if self.cross => items.iter().all(draggable),
             source => source_accepts(source, root, folder),
@@ -516,15 +520,16 @@ mod tests {
         // Another notebook's folders all take it.
         drag.cross = true;
         assert!(drag.takes(Path::new(r"C:\B"), Path::new(r"work\inner")));
-        // A copy takes any folder where one of its items copies.
+        // A copy takes only a folder where every one of its items copies.
         drag.cross = false;
         drag.copy = true;
         drag.group_paths = vec![PathBuf::from(r"C:\A\work"), PathBuf::from(r"C:\A\a.md")];
         assert!(!drag.takes(root, Path::new("")), "both are already there");
         assert!(
-            drag.takes(root, Path::new(r"work\inner")),
-            "a.md copies there, though work cannot"
+            !drag.takes(root, Path::new(r"work\inner")),
+            "a.md copies there, but work cannot go inside itself"
         );
+        assert!(drag.takes(root, Path::new("other")));
         assert!(
             Drag::armed(DragSource::Rows(vec![note("a.md"), RowKind::Draft]), 0, 0).is_none(),
             "the draft row cannot be dragged"

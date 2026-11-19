@@ -151,6 +151,25 @@ fn listed_selection(hwnd: HWND) -> Option<Vec<RowKind>> {
     .flatten() else {
         return Some(Vec::new());
     };
+    listed_of(hwnd, id, items)
+}
+
+/// The rows a started group drag carries that the library of their notebook still lists, which
+/// includes those a collapsed folder hides; `None` without a group drag, or while that library
+/// is not there to ask.
+fn listed_group(hwnd: HWND) -> Option<Vec<RowKind>> {
+    let (id, items) = with_view(hwnd, |view| match &view.drag.as_ref()?.source {
+        DragSource::Rows(items) => Some((view.drag_notebook?, items.clone())),
+        _ => None,
+    })
+    .flatten()?;
+    listed_of(hwnd, id, items)
+}
+
+/// `items` of the notebook `id` that its library still lists. `None` when the notebook is open
+/// but its library is not there to ask (loading, reloading). A notebook no longer open lists
+/// nothing.
+fn listed_of(hwnd: HWND, id: NotebookId, items: Vec<RowKind>) -> Option<Vec<RowKind>> {
     if !library_host::notebooks(hwnd)
         .iter()
         .any(|(open, _)| *open == id)
@@ -176,6 +195,7 @@ pub(crate) fn rebuild(hwnd: HWND) {
     // The ticked rows the library still lists, which includes those a collapsed folder hides.
     // Read before the view is borrowed: each call borrows the App on its own.
     let listed = listed_selection(hwnd);
+    let group_listed = listed_group(hwnd);
     let lost = with_view(hwnd, |view| {
         // The drag's notebook now at another folder (its slot reused for another notebook): a
         // row that happens to share a relative path there is not the same row.
@@ -201,9 +221,16 @@ pub(crate) fn rebuild(hwnd: HWND) {
             {
                 return true;
             }
-            // A group ends as one row does, when any of its rows went.
+            // A group ends as one row does, when any of its rows went. A row a collapsed folder
+            // hides is still there while the library lists it (or cannot be asked yet).
+            let present = |kind: &RowKind| {
+                find(kind).is_some()
+                    || group_listed
+                        .as_ref()
+                        .is_none_or(|listed| listed.contains(kind))
+            };
             if let DragSource::Rows(items) = &drag.source
-                && (moved || items.iter().any(|kind| find(kind).is_none()))
+                && (moved || !items.iter().all(present))
             {
                 return true;
             }
