@@ -139,16 +139,24 @@ pub(super) fn snapshot(hwnd: HWND) -> Snapshot {
     }
 }
 
-/// The multi-selection's rows that the library of their notebook still lists.
-fn listed_selection(hwnd: HWND) -> Vec<RowKind> {
+/// The multi-selection's rows that the library of their notebook still lists. `None` when the
+/// notebook is open but its library is not there to ask (loading, reloading): the selection
+/// stays as it is until the next rebuild. A notebook no longer open lists nothing.
+fn listed_selection(hwnd: HWND) -> Option<Vec<RowKind>> {
     let Some((id, items)) = with_view(hwnd, |view| {
         view.multi
             .notebook()
             .map(|id| (id, view.multi.items().to_vec()))
     })
     .flatten() else {
-        return Vec::new();
+        return Some(Vec::new());
     };
+    if !library_host::notebooks(hwnd)
+        .iter()
+        .any(|(open, _)| *open == id)
+    {
+        return Some(Vec::new());
+    }
     library_host::with_notebook(hwnd, id, |state| {
         items
             .into_iter()
@@ -158,7 +166,6 @@ fn listed_selection(hwnd: HWND) -> Vec<RowKind> {
             })
             .collect()
     })
-    .unwrap_or_default()
 }
 
 /// Rebuilds the rows from the library, the tabs and the notebook lists, keeping the selection
@@ -173,7 +180,7 @@ pub(crate) fn rebuild(hwnd: HWND) {
         // The drag's notebook now at another folder (its slot reused for another notebook): a
         // row that happens to share a relative path there is not the same row.
         let folder_before = view.drag_notebook.and_then(|id| view.notebook_folder(id));
-        view.apply(snapshot, names, &listed);
+        view.apply(snapshot, names, listed.as_deref());
         view.invalidate();
         let folder_after = view.drag_notebook.and_then(|id| view.notebook_folder(id));
         let moved = folder_before.is_some_and(|before| {

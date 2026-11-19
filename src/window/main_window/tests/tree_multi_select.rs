@@ -84,3 +84,36 @@ fn a_rebuild_drops_a_selected_note_deleted_outside_fastpad() {
         Some((first_id(window.hwnd), vec![a, c]))
     );
 }
+
+#[test]
+fn a_rebuild_keeps_selected_notes_a_collapsed_folder_hides() {
+    // Break caught: a rebuild that treats rows missing from the view as gone, so collapsing a
+    // folder silently drops the notes ticked inside it.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("multi-collapse");
+    std::fs::create_dir_all(scratch.folder().join("x")).unwrap();
+    scratch.note("x/a.md", "a");
+    scratch.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    scratch.install(window.hwnd);
+    crate::window::library_host::set_expanded(window.hwnd, std::path::Path::new("x"), true);
+    crate::window::side_panel::show_view(window.hwnd, crate::config::SidebarView::Notebook, false);
+    crate::window::notebook_view::rebuild(window.hwnd);
+    let (a, b) = (
+        RowKind::Note(std::path::PathBuf::from("x").join("a.md")),
+        RowKind::Note("b.md".into()),
+    );
+    tick(window.hwnd, &[a.clone(), b.clone()]);
+    crate::window::library_host::set_expanded(window.hwnd, std::path::Path::new("x"), false);
+    crate::window::notebook_view::rebuild(window.hwnd);
+    assert!(
+        !view_rows(window.hwnd).iter().any(|(_, kind)| *kind == a),
+        "the folder hides the note"
+    );
+    assert_eq!(
+        crate::window::notebook_view::selected_items(window.hwnd),
+        Some((first_id(window.hwnd), vec![a, b]))
+    );
+}

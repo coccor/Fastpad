@@ -828,7 +828,7 @@ impl NotebookView {
         &mut self,
         snapshot: Snapshot,
         names: Vec<(String, Option<String>)>,
-        listed: &[RowKind],
+        listed: Option<&[RowKind]>,
     ) {
         let reset = snapshot.mode != self.mode;
         if reset {
@@ -894,10 +894,12 @@ impl NotebookView {
         };
         self.list.set_count(count);
         // Ticked rows that went away (deleted outside FastPad) leave the selection; those only
-        // hidden under a collapsed folder stay.
-        let keys = self.row_keys();
-        self.multi
-            .retain_present(&keys, |kind| listed.contains(kind));
+        // hidden under a collapsed folder stay, and all stay while the library can't be asked.
+        if let Some(listed) = listed {
+            let keys = self.row_keys();
+            self.multi
+                .retain_present(&keys, |kind| listed.contains(kind));
+        }
         // Measured in the new mode's list area.
         let height = self.list_height();
         if self.mode == Mode::Tree {
