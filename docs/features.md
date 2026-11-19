@@ -82,7 +82,7 @@ Files larger than 10 MB pause live updates; click the bar at the top of the prev
 
 ## Notes and notebooks
 
-<img src="images/notebook.png" alt="The notebook sidebar with folders and notes, and a note open in the editor" width="800">
+<img src="images/notebook.png" alt="Two notebooks in the sidebar, and a note with front matter and a Mermaid diagram open in Live view" width="800">
 
 Open any folder and it becomes a notebook: a tree in the sidebar, folders as they are on disk,
 pinned notes first. Notes are plain files, so nothing is locked in. **File → New notebook…** names
@@ -112,6 +112,9 @@ skipped with a notice but stays remembered until its drive returns.
 
 - **Write fast.** New notes are named inline and save themselves once they're in the notebook.
   Create, rename, move (drag and drop) and delete notes and folders right in the tree.
+- **Work on several at once.** `Ctrl`+click or `Shift`+click notes and folders of one notebook (or
+  `Shift`+arrows, `Ctrl+A`), then drag the group, press `Delete`, or use **Move to notebook…** on all
+  of it with one confirmation.
 - **Find anything.** Search and replace across every note, with case, whole-word and regex
   options, and jump to any note by typing part of its name. Nothing is indexed; results stream in.
 - **Open Editors** lists every open tab above the tree. Drag files in from Explorer or from Open
@@ -263,7 +266,7 @@ FastPad window you already have open, not in a new window.
 
 ## Split editors
 
-<img src="images/split-editors.png" alt="Four editor groups in a 2x2 grid showing Rust, Markdown, Python and JSON" width="800">
+<img src="images/split-editors.png" alt="Four editor groups in a 2x2 grid showing Rust, a FastDraw diagram, Python and JSON" width="800">
 
 Put files side by side in any grid of rows and columns. Drag a tab onto another group to move it,
 or onto an editor's edge to split it. Each group has its own tabs, and the layout comes back with
@@ -271,7 +274,7 @@ your session.
 
 ## Images next to your notes
 
-<img src="images/image-preview.png" alt="An SVG open as text with its rendered preview beside it, and images in the notebook tree" width="800">
+<img src="images/image-preview.png" alt="An SVG open as text with its rendered preview beside it, and the notebook tree" width="800">
 
 PNG, JPEG, GIF, WebP and more open in an image tab you can zoom and pan. SVGs open as text, with
 their rendered preview beside the source. The notebook lists images next to your notes.
@@ -283,6 +286,8 @@ their rendered preview beside the source. The notebook lists images next to your
   and the status bar act on the preview, and in Split on whichever side has the focus.
 
 ## FastDraw diagrams
+
+<img src="images/fastdraw.png" alt="A FastDraw diagram in Split view: its text on the left, the drawing on the right" width="800">
 
 A `.fdraw` file is a diagram written as text. It opens as the **FastDraw** language with the same
 Source / Split / Preview control as Markdown.
@@ -320,7 +325,7 @@ bottom of the sidebar) lists every setting, and changes apply as you make them.
 
 ## Themes that match your desk
 
-<img src="images/themes.png" alt="FastPad in light, dark and Catppuccin Mocha themes" width="800">
+<img src="images/themes.png" alt="FastPad in the Light, Dark, Catppuccin Mocha and Paper themes" width="800">
 
 Light, dark, or **System** to follow Windows as it switches. Plus all four
 [Catppuccin](https://catppuccin.com/) flavors (Latte, Frappé, Macchiato, Mocha), or plain
