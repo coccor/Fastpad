@@ -223,17 +223,9 @@ pub(crate) fn delete_folder_of(hwnd: HWND, notebook: NotebookId, relative: &Path
         }
         Err(None) => return,
     }
-    crate::window::side_panel::with_accessible_events(hwnd, || {
-        crate::window::side_panel::refresh(hwnd);
-        // The row that took the folder's place: the next one after its subtree, or the previous
-        // at the end; by index only when that row went too.
-        if let Some((index, kind)) = place
-            && !kind
-                .is_some_and(|(id, kind)| crate::window::notebook_view::select_row(hwnd, id, &kind))
-        {
-            crate::window::notebook_view::select_index(hwnd, index);
-        }
-    });
+    // The row that took the folder's place: the next one after its subtree, or the previous at
+    // the end.
+    crate::window::notebook_view::refresh_and_select_place(hwnd, place);
 }
 
 /// `delete_folder_of` without its question or the view's refresh: recycles the folder, closes

@@ -480,31 +480,27 @@ pub(crate) fn delete_items(hwnd: HWND, notebook: NotebookId, items: &[RowKind]) 
     // The row that takes the first item's place, remembered by what it shows: closing the tabs
     // can expand other folders above it and shift the indexes.
     let place = crate::window::notebook_view::row_in_place_of(hwnd, notebook, first);
+    let Some(identity) = (unsafe { window_identity(hwnd) }) else {
+        return;
+    };
     let mut failed = Vec::new();
     for kind in &items {
+        // The list holds notes and folders only (filtered above).
         let result = match kind {
             RowKind::Folder(relative) => perform_delete_folder(hwnd, notebook, relative),
-            _ => match absolute(kind) {
-                Some(path) => perform_delete_note(hwnd, &path),
-                None => continue,
-            },
+            RowKind::Note(relative) => perform_delete_note(hwnd, &root.join(relative)),
+            _ => continue,
         };
         match result {
             Ok(()) => {}
             Err(Some(notice)) => failed.push(notice),
+            // Nothing was tried for this item; the rest still go unless the window went away.
+            Err(None) if identity.is_live_for(hwnd) => {}
             Err(None) => return,
         }
     }
     crate::window::notebook_view::clear_selection(hwnd);
-    crate::window::side_panel::with_accessible_events(hwnd, || {
-        crate::window::side_panel::refresh(hwnd);
-        if let Some((index, kind)) = place
-            && !kind
-                .is_some_and(|(id, kind)| crate::window::notebook_view::select_row(hwnd, id, &kind))
-        {
-            crate::window::notebook_view::select_index(hwnd, index);
-        }
-    });
+    crate::window::notebook_view::refresh_and_select_place(hwnd, place);
     if !failed.is_empty() {
         push_notice(
             hwnd,

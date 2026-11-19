@@ -497,6 +497,23 @@ pub(crate) fn row_in_place_of(
     .flatten()
 }
 
+/// Refreshes the sidebar after rows went, then selects the row that took their place
+/// (`row_in_place_of`, taken before they went): by what it shows, or by index only when that
+/// row went too.
+pub(crate) fn refresh_and_select_place(
+    hwnd: HWND,
+    place: Option<(usize, Option<(NotebookId, RowKind)>)>,
+) {
+    crate::window::side_panel::with_accessible_events(hwnd, || {
+        crate::window::side_panel::refresh(hwnd);
+        if let Some((index, kind)) = place
+            && !kind.is_some_and(|(id, kind)| select_row(hwnd, id, &kind))
+        {
+            select_index(hwnd, index);
+        }
+    });
+}
+
 /// Selects row `index` (the last row when past the end) and scrolls it into view.
 pub(crate) fn select_index(hwnd: HWND, index: usize) {
     with_view(hwnd, |view| {
