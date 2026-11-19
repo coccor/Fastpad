@@ -1016,6 +1016,13 @@ pub(crate) fn key_down_with(hwnd: HWND, key: u16, modifiers: Modifiers) -> bool 
             true
         }
         VK_F2 | VK_DELETE => {
+            // Del on a multi-selection takes the whole group; F2 renames the cursor row alone.
+            if key == VK_DELETE
+                && let Some((id, items)) = selected_items(hwnd)
+            {
+                crate::window::library_host::delete_items(hwnd, id, &items);
+                return true;
+            }
             let Some((id, kind)) = with_view(hwnd, |view| match view.target(selected) {
                 Target::Row(id, row) => Some((id, row.kind)),
                 _ => None,

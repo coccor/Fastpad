@@ -215,30 +215,61 @@ pub(crate) fn delete_folder_of(hwnd: HWND, notebook: NotebookId, relative: &Path
         notebook,
         &RowKind::Folder(relative.to_path_buf()),
     );
+    match perform_delete_folder(hwnd, notebook, relative) {
+        Ok(()) => {}
+        Err(Some(notice)) => {
+            push_notice(hwnd, notice);
+            return;
+        }
+        Err(None) => return,
+    }
+    crate::window::side_panel::with_accessible_events(hwnd, || {
+        crate::window::side_panel::refresh(hwnd);
+        // The row that took the folder's place: the next one after its subtree, or the previous
+        // at the end; by index only when that row went too.
+        if let Some((index, kind)) = place
+            && !kind
+                .is_some_and(|(id, kind)| crate::window::notebook_view::select_row(hwnd, id, &kind))
+        {
+            crate::window::notebook_view::select_index(hwnd, index);
+        }
+    });
+}
+
+/// `delete_folder_of` without its question or the view's refresh: recycles the folder, closes
+/// the tabs under it without asking and drops its notes from the notebook `notebook`. `Err`
+/// holds the notice to show, `None` when nothing was tried or the window went away meanwhile.
+pub(super) fn perform_delete_folder(
+    hwnd: HWND,
+    notebook: NotebookId,
+    relative: &Path,
+) -> Result<(), Option<String>> {
+    let Some(root) = notebook_folder(hwnd, notebook) else {
+        return Err(None);
+    };
+    if !library::tree::is_plain_relative_folder(relative) {
+        return Err(None);
+    }
+    let absolute = root.join(relative);
+    let tabs = tabs_under(hwnd, &absolute);
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
-        return;
+        return Err(None);
     };
     // The shell may show its own modal warning (a permanent delete), owned by this window.
     let recycled = crate::platform::files::recycle_folder(hwnd, &absolute);
     if !identity.is_live_for(hwnd) {
-        return;
+        return Err(None);
     }
     if let Err(error) = recycled {
-        push_notice(
-            hwnd,
-            format!("FastPad could not delete {}: {error}", absolute.display()),
-        );
-        return;
+        return Err(Some(format!(
+            "FastPad could not delete {}: {error}",
+            absolute.display()
+        )));
     }
-    // Each close activates the tab it closes, which autosaves the tab being left; a doomed tab
-    // left that way has no file any more and would report it changed on disk.
-    if let Some(mut app) = unsafe { app_ptr(hwnd) } {
-        let app = unsafe { app.as_mut() };
-        for (id, _, _) in &tabs {
-            if let Some(document) = app.tabs.document_mut(*id) {
-                document.autosave_paused = true;
-            }
-        }
+    // Each close activates the tab it closes, which autosaves and checks the tabs involved; a
+    // doomed tab has no file any more and would report it changed or deleted on disk.
+    for (id, _, _) in &tabs {
+        mark_recycled(hwnd, *id);
     }
     for (id, _, _) in tabs {
         crate::window::main_window::close_document_without_prompt(hwnd, id);
@@ -256,15 +287,5 @@ pub(crate) fn delete_folder_of(hwnd: HWND, notebook: NotebookId, relative: &Path
     );
     schedule_write(hwnd);
     close_stale_name_box(hwnd);
-    crate::window::side_panel::with_accessible_events(hwnd, || {
-        crate::window::side_panel::refresh(hwnd);
-        // The row that took the folder's place: the next one after its subtree, or the previous
-        // at the end; by index only when that row went too.
-        if let Some((index, kind)) = place
-            && !kind
-                .is_some_and(|(id, kind)| crate::window::notebook_view::select_row(hwnd, id, &kind))
-        {
-            crate::window::notebook_view::select_index(hwnd, index);
-        }
-    });
+    Ok(())
 }

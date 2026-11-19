@@ -86,6 +86,7 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
                 Some(CommandId::NoteRevealInExplorer) => {
                     crate::window::library_host::reveal(hwnd, &path)
                 }
+                Some(CommandId::NoteDelete) if delete_group(hwnd, id, &row.kind) => {}
                 // The row's own notebook must be ready, not the default one.
                 Some(CommandId::NoteDelete)
                     if crate::window::library_host::ready_library_of(hwnd, Some(id)) =>
@@ -133,6 +134,7 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
                 Some(CommandId::NoteRevealInExplorer) => {
                     crate::window::library_host::reveal(hwnd, &path)
                 }
+                Some(CommandId::NoteDelete) if delete_group(hwnd, id, &row.kind) => {}
                 Some(CommandId::NoteDelete)
                     if crate::window::library_host::ready_library_of(hwnd, Some(id)) =>
                 {
@@ -144,6 +146,18 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
         RowKind::Root => root_menu(hwnd, id, Some(point)),
         RowKind::Draft | RowKind::Placeholder(_) => {}
     }
+}
+
+/// Delete… on the row showing `kind` of the notebook `id` while it is part of a
+/// multi-selection: deletes the whole group (tree multi-select spec, "Delete"). False, doing
+/// nothing, when the row is not in one.
+fn delete_group(hwnd: HWND, id: NotebookId, kind: &RowKind) -> bool {
+    let in_group = with_view(hwnd, |view| view.multi.contains(id, kind)).unwrap_or(false);
+    let Some((group, items)) = selected_items(hwnd).filter(|_| in_group) else {
+        return false;
+    };
+    crate::window::library_host::delete_items(hwnd, group, &items);
+    true
 }
 
 /// `WM_CONTEXTMENU`: from a right-click (screen coordinates) or from Shift+F10 or the

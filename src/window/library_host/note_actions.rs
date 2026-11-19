@@ -335,14 +335,14 @@ pub(crate) fn delete_file(hwnd: HWND, path: &Path) {
     {
         return;
     }
-    let tab = unsafe { app_ptr(hwnd) }.and_then(|app| {
+    let dirty = unsafe { app_ptr(hwnd) }.and_then(|app| {
         let tabs = &unsafe { app.as_ref() }.tabs;
         let id = tabs.find_stored_path(path)?;
-        Some((id, tabs.document(id)?.dirty))
+        Some(tabs.document(id)?.dirty)
     });
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     // The tab's unsaved edits go with the file: they are not autosaved first.
-    let question = if tab.is_some_and(|(_, dirty)| dirty) {
+    let question = if dirty == Some(true) {
         format!("Move \u{201c}{name}\u{201d} to the Recycle Bin and discard unsaved changes?")
     } else {
         format!("Move \u{201c}{name}\u{201d} to the Recycle Bin?")
@@ -350,20 +350,30 @@ pub(crate) fn delete_file(hwnd: HWND, path: &Path) {
     if !confirmed(hwnd, &question, "Delete") {
         return;
     }
+    match perform_delete_note(hwnd, path) {
+        Ok(()) => crate::window::side_panel::refresh(hwnd),
+        Err(Some(notice)) => push_notice(hwnd, notice),
+        Err(None) => {}
+    }
+}
+
+/// `delete_file` without its question or the view's refresh: recycles `path`, flags its record
+/// deleted and closes its tab without asking. `Err` holds the notice to show, `None` when the
+/// window went away meanwhile.
+fn perform_delete_note(hwnd: HWND, path: &Path) -> Result<(), Option<String>> {
     let Some(identity) = (unsafe { window_identity(hwnd) }) else {
-        return;
+        return Err(None);
     };
     // The shell may show its own modal warning (a permanent delete), owned by this window.
     let recycled = crate::platform::files::recycle(hwnd, path);
     if !identity.is_live_for(hwnd) {
-        return;
+        return Err(None);
     }
     if let Err(error) = recycled {
-        push_notice(
-            hwnd,
-            format!("FastPad could not delete {}: {error}", path.display()),
-        );
-        return;
+        return Err(Some(format!(
+            "FastPad could not delete {}: {error}",
+            path.display()
+        )));
     }
     // The record is the one in the notebook that owns the file (multi-root notebooks spec §5.2).
     if let Some((owner, _)) = note_root(hwnd, path) {
@@ -386,8 +396,119 @@ pub(crate) fn delete_file(hwnd: HWND, path: &Path) {
         }
         with_notebook(hwnd, owner, |state| state.remove_note(path));
     }
-    if let Some((id, _)) = tab {
+    let tab = unsafe { app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.tabs.find_stored_path(path));
+    if let Some(id) = tab {
+        // Its close activates it: the check that runs then knows the file is gone on purpose.
+        mark_recycled(hwnd, id);
         crate::window::main_window::close_document_without_prompt(hwnd, id);
     }
-    crate::window::side_panel::refresh(hwnd);
+    Ok(())
+}
+
+/// The one question of a group delete of `items` rows, `dirty` of the open tabs they take
+/// having unsaved changes (tree multi-select spec, "Delete").
+pub(crate) fn delete_items_question(items: usize, dirty: usize) -> String {
+    match dirty {
+        0 => format!("Move {items} items to the Recycle Bin?"),
+        1 => format!(
+            "Move {items} items to the Recycle Bin and discard unsaved changes in 1 open tab?"
+        ),
+        _ => format!(
+            "Move {items} items to the Recycle Bin and discard unsaved changes in {dirty} open tabs?"
+        ),
+    }
+}
+
+/// Del or Delete… on a multi-selection (tree multi-select spec, "Delete"): one question for the
+/// group of the notebook `notebook`, then each row goes as `delete_file` or `delete_folder_of`
+/// sends it, and one that cannot is skipped. The view refreshes once, the selection is dropped
+/// and the cursor lands on the row that took the first item's place; the failures are one
+/// notice. `items` are the effective selection, so a folder is not listed along with what is
+/// inside it.
+pub(crate) fn delete_items(hwnd: HWND, notebook: NotebookId, items: &[RowKind]) {
+    let Some(root) = notebook_folder(hwnd, notebook) else {
+        return;
+    };
+    if !ready_library_of(hwnd, Some(notebook)) {
+        return;
+    }
+    // Defence in depth: an empty or escaping folder path would recycle the notebook root or a
+    // folder outside it.
+    let items: Vec<&RowKind> = items
+        .iter()
+        .filter(|kind| match kind {
+            RowKind::Note(_) => true,
+            RowKind::Folder(relative) => library::tree::is_plain_relative_folder(relative),
+            _ => false,
+        })
+        .collect();
+    let absolute = |kind: &RowKind| match kind {
+        RowKind::Note(relative) | RowKind::Folder(relative) => Some(root.join(relative)),
+        _ => None,
+    };
+    if items.iter().any(|kind| {
+        absolute(kind)
+            .is_some_and(|path| crate::window::cross_move_host::refuse_item_if_moving(hwnd, &path))
+    }) {
+        return;
+    }
+    let Some(first) = items.first() else {
+        return;
+    };
+    let dirty: usize = items
+        .iter()
+        .filter_map(|kind| Some((kind, absolute(kind)?)))
+        .map(|(kind, path)| match kind {
+            RowKind::Folder(_) => tabs_under(hwnd, &path)
+                .iter()
+                .filter(|(_, _, dirty)| *dirty)
+                .count(),
+            _ => unsafe { app_ptr(hwnd) }.map_or(0, |app| {
+                let tabs = &unsafe { app.as_ref() }.tabs;
+                usize::from(
+                    tabs.find_stored_path(&path)
+                        .and_then(|id| tabs.document(id))
+                        .is_some_and(|document| document.dirty),
+                )
+            }),
+        })
+        .sum();
+    if !confirmed(hwnd, &delete_items_question(items.len(), dirty), "Delete") {
+        return;
+    }
+    // The row that takes the first item's place, remembered by what it shows: closing the tabs
+    // can expand other folders above it and shift the indexes.
+    let place = crate::window::notebook_view::row_in_place_of(hwnd, notebook, first);
+    let mut failed = Vec::new();
+    for kind in &items {
+        let result = match kind {
+            RowKind::Folder(relative) => perform_delete_folder(hwnd, notebook, relative),
+            _ => match absolute(kind) {
+                Some(path) => perform_delete_note(hwnd, &path),
+                None => continue,
+            },
+        };
+        match result {
+            Ok(()) => {}
+            Err(Some(notice)) => failed.push(notice),
+            Err(None) => return,
+        }
+    }
+    crate::window::notebook_view::clear_selection(hwnd);
+    crate::window::side_panel::with_accessible_events(hwnd, || {
+        crate::window::side_panel::refresh(hwnd);
+        if let Some((index, kind)) = place
+            && !kind
+                .is_some_and(|(id, kind)| crate::window::notebook_view::select_row(hwnd, id, &kind))
+        {
+            crate::window::notebook_view::select_index(hwnd, index);
+        }
+    });
+    if !failed.is_empty() {
+        push_notice(
+            hwnd,
+            crate::window::tree_move::group_notice(&failed, items.len(), "deleted"),
+        );
+    }
 }

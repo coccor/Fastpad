@@ -966,3 +966,215 @@ fn a_group_drag_with_a_row_a_collapsed_folder_hides_survives_a_rebuild() {
     assert!(folder.join("dest/a.md").exists() && folder.join("dest/c.md").exists());
     assert!(!folder.join("work/a.md").exists() && !folder.join("c.md").exists());
 }
+
+#[test]
+fn del_on_a_selection_asks_once_and_recycles_every_item() {
+    // Break caught: Del on a group asking once per item (the second, unanswered, question
+    // panics), recycling only the cursor row, leaving the ticks behind or the cursor nowhere.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_DELETE;
+    let _scintilla = load_native_scintilla();
+    let (scratch, window, _editor) =
+        group_window("multi-delete", &["a.md", "b.md", "c.md"], &["x.md"]);
+    let hwnd = window.hwnd;
+    let id = first_id(hwnd);
+    let (work, a, b) = (RowKind::Folder("work".into()), note("a.md"), note("b.md"));
+    click_row(hwnd, &work, MK_CONTROL);
+    click_row(hwnd, &a, MK_CONTROL);
+    click_row(hwnd, &b, MK_CONTROL);
+    assert_eq!(
+        crate::window::notebook_view::selected_items(hwnd),
+        Some((id, vec![work, a, b]))
+    );
+    app_mut(hwnd).notifications.dismiss_all();
+    crate::window::modal::take_last_confirm();
+    crate::window::modal::answer_next_confirm(|_| true);
+    assert!(crate::window::notebook_view::key_down(hwnd, VK_DELETE));
+    assert_eq!(
+        crate::window::modal::take_last_confirm().as_deref(),
+        Some("Move 3 items to the Recycle Bin?")
+    );
+    assert_eq!(
+        crate::window::modal::take_last_confirm_action().as_deref(),
+        Some("Delete")
+    );
+    let folder = scratch.folder();
+    assert!(!folder.join("work").exists());
+    assert!(!folder.join("a.md").exists() && !folder.join("b.md").exists());
+    assert!(folder.join("c.md").exists());
+    assert_eq!(crate::window::notebook_view::selected_items(hwnd), None);
+    assert_eq!(
+        view_rows(hwnd)
+            .into_iter()
+            .map(|(_, kind)| kind)
+            .filter(|kind| *kind != RowKind::Root)
+            .collect::<Vec<_>>(),
+        vec![note("c.md")]
+    );
+    assert_eq!(selected_row_of(hwnd), Some((id, note("c.md"))));
+    assert!(notices(hwnd).is_empty(), "{:?}", notices(hwnd));
+}
+
+#[test]
+fn a_group_delete_with_a_dirty_tab_says_so_and_closes_it_unsaved() {
+    // Break caught (Review Focus 4): a group delete that drops unsaved edits without a word,
+    // counts only the notes' tabs and not those under a selected folder, prompts to save each
+    // tab it closes, or leaves a tab on a recycled file.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_DELETE;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("multi-delete-dirty");
+    std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
+    let a = scratch.note("a.md", "a");
+    scratch.note("b.md", "b");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    let hwnd = window.hwnd;
+    let x = open_note(&window, &scratch, r"work\x.md", "x");
+    execute_command(hwnd, CommandId::ToggleFolderAutosave);
+    editor.set_text("unsaved x").unwrap();
+    super::super::open_path(hwnd, &a).unwrap();
+    pump_posted_messages(hwnd);
+    editor.set_text("unsaved a").unwrap();
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, false);
+    crate::window::notebook_view::rebuild(hwnd);
+    let (work, a_row) = (RowKind::Folder("work".into()), note("a.md"));
+    tick(hwnd, &[work, a_row]);
+    app_mut(hwnd).notifications.dismiss_all();
+    crate::window::modal::take_last_confirm();
+    crate::window::modal::answer_next_confirm(|_| true);
+    assert!(crate::window::notebook_view::key_down(hwnd, VK_DELETE));
+    assert_eq!(
+        crate::window::modal::take_last_confirm().as_deref(),
+        Some("Move 2 items to the Recycle Bin and discard unsaved changes in 2 open tabs?")
+    );
+    assert!(!x.exists() && !a.exists());
+    assert!(scratch.folder().join("b.md").exists());
+    assert!(
+        !opened(hwnd, &x) && !opened(hwnd, &a),
+        "{:?}",
+        tab_paths(hwnd)
+    );
+    assert!(notices(hwnd).is_empty(), "{:?}", notices(hwnd));
+}
+
+#[test]
+fn the_group_delete_question_counts_one_dirty_tab_in_the_singular() {
+    // Break caught: "1 open tabs", or the dirty clause shown when no tab is dirty.
+    use crate::window::library_host::delete_items_question;
+    assert_eq!(
+        delete_items_question(2, 1),
+        "Move 2 items to the Recycle Bin and discard unsaved changes in 1 open tab?"
+    );
+    assert_eq!(
+        delete_items_question(5, 0),
+        "Move 5 items to the Recycle Bin?"
+    );
+}
+
+#[test]
+fn declining_the_group_delete_changes_nothing() {
+    // Break caught: a Cancel that still recycles some of the group, or drops its ticks.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_DELETE;
+    let _scintilla = load_native_scintilla();
+    let (scratch, window, _editor) = notes_window("multi-delete-no", &["a.md", "b.md", "c.md"]);
+    let hwnd = window.hwnd;
+    let id = first_id(hwnd);
+    let (a, c) = (note("a.md"), note("c.md"));
+    click_row(hwnd, &a, 0);
+    click_row(hwnd, &c, MK_CONTROL);
+    crate::window::modal::take_last_confirm();
+    crate::window::modal::answer_next_confirm(|_| false);
+    assert!(crate::window::notebook_view::key_down(hwnd, VK_DELETE));
+    assert_eq!(
+        crate::window::modal::take_last_confirm().as_deref(),
+        Some("Move 2 items to the Recycle Bin?")
+    );
+    let folder = scratch.folder();
+    assert!(folder.join("a.md").exists() && folder.join("c.md").exists());
+    assert_eq!(
+        crate::window::notebook_view::selected_items(hwnd),
+        Some((id, vec![a, c]))
+    );
+}
+
+#[test]
+fn a_group_delete_that_fails_for_one_item_deletes_the_rest_and_says_so_once() {
+    // Break caught: one failure abandoning the rest of the group, or one notice per failure
+    // instead of a single summary.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_DELETE;
+    let _scintilla = load_native_scintilla();
+    let (scratch, window, _editor) = notes_window("multi-delete-fail", &["a.md", "b.md", "c.md"]);
+    let hwnd = window.hwnd;
+    let (a, b, c) = (note("a.md"), note("b.md"), note("c.md"));
+    click_row(hwnd, &a, 0);
+    click_row(hwnd, &b, MK_CONTROL);
+    click_row(hwnd, &c, MK_CONTROL);
+    // Gone from disk but still listed: its recycle fails.
+    let gone = scratch.folder().join("b.md");
+    std::fs::remove_file(&gone).unwrap();
+    app_mut(hwnd).notifications.dismiss_all();
+    crate::window::modal::answer_next_confirm(|_| true);
+    assert!(crate::window::notebook_view::key_down(hwnd, VK_DELETE));
+    let folder = scratch.folder();
+    assert!(!folder.join("a.md").exists() && !folder.join("c.md").exists());
+    let error = crate::FastPadError::Invariant("the file to delete does not exist");
+    assert_eq!(
+        notices(hwnd),
+        vec![format!(
+            "1 of 3 items were not deleted:\nFastPad could not delete {}: {error}",
+            gone.display()
+        )]
+    );
+    assert_eq!(crate::window::notebook_view::selected_items(hwnd), None);
+}
+
+#[test]
+fn delete_from_the_menu_of_a_ticked_row_deletes_the_group_and_of_another_row_just_it() {
+    // Break caught: the menu's Delete… on a ticked row recycling only that row, or the menu
+    // opened from the keyboard on a row outside the group recycling the group.
+    use crate::window::commands::CommandId;
+    let _scintilla = load_native_scintilla();
+    let (scratch, window, _editor) = notes_window(
+        "multi-delete-menu",
+        &["a.md", "b.md", "c.md", "d.md", "e.md"],
+    );
+    let hwnd = window.hwnd;
+    let (a, b, c) = (note("a.md"), note("b.md"), note("c.md"));
+    let menu_delete = |kind: &RowKind| {
+        crate::window::menus::answer_next_popup_menu(|_| Some(CommandId::NoteDelete));
+        crate::window::notebook_view::open_context_menu(hwnd, row_of(hwnd, kind), None);
+    };
+    click_row(hwnd, &a, 0);
+    click_row(hwnd, &b, MK_CONTROL);
+    crate::window::modal::take_last_confirm();
+    crate::window::modal::answer_next_confirm(|_| true);
+    menu_delete(&a);
+    assert_eq!(
+        crate::window::modal::take_last_confirm().as_deref(),
+        Some("Move 2 items to the Recycle Bin?")
+    );
+    let folder = scratch.folder();
+    assert!(!folder.join("a.md").exists() && !folder.join("b.md").exists());
+
+    // c, d and e ticked, then the cursor row e untoggled: the group c, d stays, and the menu
+    // opened on e asks about e alone.
+    let (d, e) = (note("d.md"), note("e.md"));
+    click_row(hwnd, &c, 0);
+    click_row(hwnd, &d, MK_CONTROL);
+    click_row(hwnd, &e, MK_CONTROL);
+    key_with(
+        hwnd,
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_SPACE,
+        CTRL,
+    );
+    assert_eq!(
+        crate::window::notebook_view::selected_items(hwnd),
+        Some((first_id(hwnd), vec![c, d]))
+    );
+    crate::window::modal::answer_next_confirm(|_| false);
+    menu_delete(&e);
+    assert_eq!(
+        crate::window::modal::take_last_confirm().as_deref(),
+        Some("Move \u{201c}e.md\u{201d} to the Recycle Bin?")
+    );
+}

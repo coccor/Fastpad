@@ -778,3 +778,32 @@ fn move_to_notebook_lists_open_notebooks_first_and_updates_an_open_destination()
     assert_eq!(listed(ab.b_id), Some(true), "listed in B without a rescan");
     assert_eq!(listed(ab.a_id), Some(false));
 }
+
+#[test]
+fn deleting_a_note_with_unsaved_edits_in_a_background_tab_says_nothing_more() {
+    // Break caught: closing the deleted note's tab activates it, and the check that runs then
+    // reports "was deleted on disk while you had unsaved edits" for a delete the user just
+    // confirmed.
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("delete-background-dirty");
+    let a = scratch.note("a.md", "a");
+    let window = ProductionWindow::new(make_app());
+    let editor = install_test_editor(&window);
+    ensure_sidebar(window.hwnd);
+    let hwnd = window.hwnd;
+    let x = open_note(&window, &scratch, "x.md", "x");
+    execute_command(hwnd, CommandId::ToggleFolderAutosave);
+    editor.set_text("unsaved x").unwrap();
+    super::super::open_path(hwnd, &a).unwrap();
+    pump_posted_messages(hwnd);
+    app_mut(hwnd).notifications.dismiss_all();
+    crate::window::modal::answer_next_confirm(|_| true);
+    crate::window::library_host::delete_file(hwnd, &x);
+    assert!(!x.exists());
+    assert!(
+        tab_paths(hwnd)
+            .iter()
+            .all(|path| path.as_deref() != Some(x.as_path()))
+    );
+    assert!(notices(hwnd).is_empty(), "{:?}", notices(hwnd));
+}

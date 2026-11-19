@@ -199,11 +199,12 @@ pub(crate) fn drop_into_of(
     }
 }
 
-/// The notice for a group move that left `failed` of `total` items where they were: one line
-/// per failure, each the text the one-item drop would have shown.
-fn group_notice(failed: &[String], total: usize) -> String {
+/// The notice for a group action that left `failed` of `total` items as they were (`verb` is
+/// "moved" or "deleted"): one line per failure, each the text the one-item action would have
+/// shown.
+pub(crate) fn group_notice(failed: &[String], total: usize, verb: &str) -> String {
     format!(
-        "{} of {total} items were not moved:\n{}",
+        "{} of {total} items were not {verb}:\n{}",
         failed.len(),
         failed.join("\n")
     )
@@ -236,7 +237,7 @@ pub(crate) fn drop_many_into_of(
         }
     });
     if !failed.is_empty() {
-        push_notice(hwnd, group_notice(&failed, items.len()));
+        push_notice(hwnd, group_notice(&failed, items.len(), "moved"));
     }
 }
 

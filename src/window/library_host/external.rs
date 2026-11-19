@@ -150,6 +150,18 @@ fn take_disk_text(hwnd: HWND, id: DocumentId, file: &LoadedFile, stamp: Option<D
     true
 }
 
+/// Marks tab `id`, whose file FastPad itself just sent to the Recycle Bin, as deleted on disk
+/// with its autosave paused, before the tab is closed. Each close activates the tab it closes:
+/// the check that runs then stays quiet instead of reporting unsaved edits on a deleted file,
+/// and the tab being left is not autosaved onto a file that is gone.
+pub(crate) fn mark_recycled(hwnd: HWND, id: DocumentId) {
+    update(hwnd, id, |document| {
+        document.conflict = Some(ConflictKind::Deleted);
+        document.deleted_on_disk = true;
+        document.autosave_paused = true;
+    });
+}
+
 fn raise_conflict(hwnd: HWND, id: DocumentId, path: &std::path::Path, kind: ConflictKind) {
     let mut already = false;
     update(hwnd, id, |document| {

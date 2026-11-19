@@ -320,10 +320,6 @@ fn row_ticked(multi: &TreeSelection, rows: &[ViewRow], index: usize) -> bool {
 
 /// The multi-selection's effective group (its notebook and rows, not those inside another
 /// selected folder), when two or more rows are ticked.
-#[allow(
-    dead_code,
-    reason = "the tree's multi-select commands read it in a later task"
-)]
 pub(crate) fn selected_items(hwnd: HWND) -> Option<(NotebookId, Vec<RowKind>)> {
     rebuild::with_view(hwnd, |view| {
         let id = view.multi.notebook().filter(|_| view.multi.is_multi())?;
