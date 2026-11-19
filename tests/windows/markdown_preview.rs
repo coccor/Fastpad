@@ -249,6 +249,7 @@ fn zoom_in_a_markdown_preview_zooms_the_preview_and_split_follows_the_focus() {
 fn ctrl_shift_v_cycles_source_split_preview_live() {
     let _scintilla = support::win32::WindowHarness::new().unwrap();
     let main = TestMain::new();
+    main.with_app(|app| app.settings.markdown_view = ViewMode::Source);
     main.make_markdown("text\n");
     for expected in [
         ViewMode::Split,
@@ -1089,7 +1090,13 @@ fn launching_with_a_markdown_file_loads_no_preview_graphics_library() {
         TempRoot(std::env::temp_dir().join(format!("fastpad-startup-{}", std::process::id())));
     let root = &root.0;
     let local_app_data = root.join("LocalAppData");
-    std::fs::create_dir_all(&local_app_data).unwrap();
+    std::fs::create_dir_all(local_app_data.join("FastPad")).unwrap();
+    // A Markdown tab opening in Source must not load the preview's graphics libraries.
+    std::fs::write(
+        local_app_data.join("FastPad").join("fastpad.ini"),
+        "markdown_view=source\n",
+    )
+    .unwrap();
     let path = root.join("startup.md");
     std::fs::write(&path, "# Title\n\nBody with a [link](https://x.dev).\n").unwrap();
     let mut process = FastPadProcess::spawn_with_local_app_data(

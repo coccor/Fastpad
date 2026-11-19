@@ -1395,9 +1395,9 @@ mod tests {
     }
 
     #[test]
-    fn markdown_view_parses_its_four_tokens_and_defaults_to_source() {
+    fn markdown_view_parses_its_four_tokens_and_defaults_to_preview() {
         let mut settings = default_settings();
-        assert_eq!(settings.markdown_view, ViewMode::Source);
+        assert_eq!(settings.markdown_view, ViewMode::Preview);
         let delta = parse(
             "markdown_view=Split
 ",
@@ -1413,12 +1413,12 @@ mod tests {
         // Break caught: `svg_view=live` accepted for a tab that cannot show Live, or the key
         // touching `markdown_view`.
         let mut settings = default_settings();
-        assert_eq!(settings.svg_view, ViewMode::Source);
-        let delta = parse("svg_view=Preview\n");
+        assert_eq!(settings.svg_view, ViewMode::Preview);
+        let delta = parse("svg_view=Split\n");
         assert!(delta.warnings.is_empty(), "{:?}", delta.warnings);
         settings.apply_delta(&delta);
-        assert_eq!(settings.svg_view, ViewMode::Preview);
-        assert_eq!(settings.markdown_view, ViewMode::Source);
+        assert_eq!(settings.svg_view, ViewMode::Split);
+        assert_eq!(settings.markdown_view, ViewMode::Preview);
         let live = parse("svg_view=live\n");
         assert_eq!(live.svg_view, None);
         assert_eq!(live.warnings.len(), 1);

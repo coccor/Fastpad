@@ -1022,6 +1022,8 @@ fn replacing_in_the_notebook_writes_the_closed_notes_and_changes_the_open_tab() 
     let _dpi = DpiContext::per_monitor_v2();
     let _com = ComApartment::initialize();
     let data = Scratch::new("text-replace");
+    // a's tab opens in Source, so its editor holds the focus and edits.
+    std::fs::write(data.data().join("fastpad.ini"), "markdown_view=source\n").unwrap();
     let a = data.note("a.md", "alpha invoice\r\n");
     let b = data.note("b.md", "invoice\ninvoice\n");
     let c = data.note("c.md", "nothing to see");

@@ -966,7 +966,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Source", "Split", "Preview", "Live"]
         );
-        assert_eq!(view.selected_segment(Row::MarkdownView), Some(0));
+        assert_eq!(view.selected_segment(Row::MarkdownView), Some(2));
         view.settings.markdown_view = ViewMode::Split;
         assert_eq!(view.selected_segment(Row::MarkdownView), Some(1));
         assert_eq!(
@@ -987,11 +987,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Source", "Split", "Preview"]
         );
-        assert_eq!(view.selected_segment(Row::SvgView), Some(0));
-        view.settings.markdown_view = ViewMode::Split;
-        assert_eq!(view.selected_segment(Row::SvgView), Some(0));
-        view.settings.svg_view = ViewMode::Preview;
         assert_eq!(view.selected_segment(Row::SvgView), Some(2));
+        view.settings.markdown_view = ViewMode::Split;
+        assert_eq!(view.selected_segment(Row::SvgView), Some(2));
+        view.settings.svg_view = ViewMode::Source;
+        assert_eq!(view.selected_segment(Row::SvgView), Some(0));
         assert_eq!(
             view.segment_action(Row::SvgView, 1),
             Some(SettingsAction::SetSvgView(ViewMode::Split))
