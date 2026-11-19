@@ -18,8 +18,8 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM}
 use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_DELETE, VK_F2, VK_LEFT,
-    VK_RETURN, VK_RIGHT,
+    GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_DELETE, VK_F2,
+    VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, WM_CAPTURECHANGED, WM_CHAR, WM_CONTEXTMENU, WM_KEYDOWN, WM_KEYUP,
@@ -850,12 +850,49 @@ pub(crate) fn second_button(hwnd: HWND) {
     }
 }
 
-/// The panel's keys (spec §10, open editors spec §3.5): the arrows run one selection through
-/// the header rows, the Open Editors rows and the tree. Returns false for keys it leaves to the
-/// panel.
+/// The modifier keys held with a key press.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Modifiers {
+    pub shift: bool,
+    pub ctrl: bool,
+}
+
+/// A tree key with Shift and Ctrl as the keyboard has them now.
 pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
+    let held = |key| unsafe { GetKeyState(i32::from(key)) } < 0;
+    let modifiers = Modifiers {
+        shift: held(VK_SHIFT),
+        ctrl: held(VK_CONTROL),
+    };
+    key_down_with(hwnd, key, modifiers)
+}
+
+/// Shift+list key: the selection runs from its anchor to the cursor row the key just moved to.
+/// `before` is the tree row the cursor was on.
+fn extend_selection(view: &mut NotebookView, before: Option<usize>) {
+    if view.cursor != Cursor::Tree {
+        return;
+    }
+    let Some(to) = view.list.selected else { return };
+    let Some(id) = view.rows.get(to).map(|row| row.notebook) else {
+        return;
+    };
+    let rows = view.row_keys();
+    view.multi.select_range(&rows, id, to, before);
+}
+
+/// The panel's keys (spec §10, open editors spec §3.5): the arrows run one selection through
+/// the header rows, the Open Editors rows and the tree. With Shift they extend the tree's
+/// multi-selection; without it they drop that selection. Ctrl+Space ticks the cursor row and
+/// Ctrl+A every note and folder of its notebook. Returns false for keys it leaves to the panel.
+pub(crate) fn key_down_with(hwnd: HWND, key: u16, modifiers: Modifiers) -> bool {
     if let Some(list_key) = ListKey::from_virtual_key(u32::from(key)) {
         with_view(hwnd, |view| {
+            let in_tree = view.cursor == Cursor::Tree;
+            let before = view.list.selected;
+            if in_tree && !modifiers.shift {
+                view.multi.clear();
+            }
             let shape = view.shape();
             // A list with nothing selected yet moves as one list does: the first Up or Down
             // selects a row in view.
@@ -866,6 +903,9 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
             if own_list {
                 let height = view.list_height();
                 view.list.move_selection(list_key, height);
+                if in_tree && modifiers.shift {
+                    extend_selection(view, before);
+                }
                 view.invalidate();
                 return;
             }
@@ -912,6 +952,9 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
                     }
                 }
             }
+            if in_tree && modifiers.shift {
+                extend_selection(view, before);
+            }
             view.invalidate();
         });
         return true;
@@ -925,6 +968,31 @@ pub(crate) fn key_down(hwnd: HWND, key: u16) -> bool {
         return matches!(key, VK_RETURN | VK_LEFT | VK_RIGHT | VK_F2 | VK_DELETE);
     };
     match key {
+        VK_SPACE if modifiers.ctrl => {
+            with_view(hwnd, |view| {
+                let Some(row) = view.rows.get(selected).filter(|_| view.mode == Mode::Tree) else {
+                    return;
+                };
+                let (id, kind) = (row.notebook, row.kind.clone());
+                let rows = view.row_keys();
+                let cursor = rows.get(selected).cloned();
+                view.multi.toggle(&rows, id, &kind, cursor);
+                view.invalidate();
+            });
+            true
+        }
+        key if key == u16::from(b'A') && modifiers.ctrl => {
+            with_view(hwnd, |view| {
+                let Some(row) = view.rows.get(selected).filter(|_| view.mode == Mode::Tree) else {
+                    return;
+                };
+                let id = row.notebook;
+                let rows = view.row_keys();
+                view.multi.select_all(&rows, id);
+                view.invalidate();
+            });
+            true
+        }
         // Enter opens a normal tab: the preview tab is the mouse's (spec §6.4).
         VK_RETURN => {
             activate(hwnd, selected, Activation::Permanent);

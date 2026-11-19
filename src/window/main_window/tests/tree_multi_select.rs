@@ -495,3 +495,119 @@ fn a_cancelled_drag_from_the_selection_neither_collapses_nor_untoggles_it() {
         "a stays ticked"
     );
 }
+
+use crate::window::notebook_view::Modifiers;
+
+const SHIFT: Modifiers = Modifiers {
+    shift: true,
+    ctrl: false,
+};
+const CTRL: Modifiers = Modifiers {
+    shift: false,
+    ctrl: true,
+};
+
+fn key_with(hwnd: HWND, key: u16, modifiers: Modifiers) -> bool {
+    crate::window::notebook_view::key_down_with(hwnd, key, modifiers)
+}
+
+#[test]
+fn shift_down_extends_and_a_plain_down_clears() {
+    // Break caught: Shift+Arrow that only moves the cursor, a range that restarts at each step
+    // instead of keeping its anchor, or a plain arrow that leaves the group ticked.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_UP};
+    let _scintilla = load_native_scintilla();
+    let (_scratch, window, _editor) =
+        notes_window("multi-shift-down", &["a.md", "b.md", "c.md", "d.md"]);
+    let hwnd = window.hwnd;
+    let id = first_id(hwnd);
+    let (a, b, c) = (note("a.md"), note("b.md"), note("c.md"));
+    click_row(hwnd, &a, 0);
+    key_with(hwnd, VK_DOWN, SHIFT);
+    assert_eq!(
+        crate::window::notebook_view::selected_items(hwnd),
+        Some((id, vec![a.clone(), b.clone()]))
+    );
+    key_with(hwnd, VK_DOWN, SHIFT);
+    assert_eq!(
+        crate::window::notebook_view::selected_items(hwnd),
+        Some((id, vec![a.clone(), b.clone(), c.clone()]))
+    );
+    assert_eq!(selected_row_of(hwnd), Some((id, c.clone())));
+    // Shift+Up shrinks the range back toward the anchor.
+    key_with(hwnd, VK_UP, SHIFT);
+    assert_eq!(
+        crate::window::notebook_view::selected_items(hwnd),
+        Some((id, vec![a, b.clone()]))
+    );
+    // A plain arrow drops the group and moves the cursor as today.
+    key_with(hwnd, VK_DOWN, Modifiers::default());
+    assert_eq!(crate::window::notebook_view::selected_items(hwnd), None);
+    assert_eq!(selected_row_of(hwnd), Some((id, c)));
+}
+
+#[test]
+fn ctrl_space_toggles_and_ctrl_a_selects_the_notebooks_notes_and_folders() {
+    // Break caught: Ctrl+Space that moves or opens instead of ticking the cursor row, or Ctrl+A
+    // that takes the root row, other notebooks' rows or rows of the wrong kind.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_SPACE, VK_UP};
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("multi-ctrl-space");
+    std::fs::create_dir_all(scratch.folder().join("x")).unwrap();
+    scratch.note("x/c.md", "c");
+    scratch.note("a.md", "a");
+    scratch.note("b.md", "b");
+    let (window, _editor) = notebook_window(&scratch);
+    let hwnd = window.hwnd;
+    let id = first_id(hwnd);
+    let (a, b) = (note("a.md"), note("b.md"));
+    click_row(hwnd, &a, 0);
+    click_row(hwnd, &b, MK_CONTROL);
+    assert_eq!(
+        crate::window::notebook_view::selected_items(hwnd),
+        Some((id, vec![a.clone(), b.clone()]))
+    );
+    // Ctrl+Space on the cursor row (b) takes it out, leaving a lone note: no selection.
+    key_with(hwnd, VK_SPACE, CTRL);
+    assert_eq!(crate::window::notebook_view::selected_items(hwnd), None);
+    assert_eq!(selected_row_of(hwnd), Some((id, b.clone())));
+    // A Ctrl+arrow moves nothing into the selection.
+    key_with(hwnd, VK_UP, CTRL);
+    assert_eq!(crate::window::notebook_view::selected_items(hwnd), None);
+
+    key_with(hwnd, b'A' as u16, CTRL);
+    let expected: Vec<RowKind> = view_rows(hwnd)
+        .into_iter()
+        .map(|(_, kind)| kind)
+        .filter(|kind| *kind != RowKind::Root)
+        .collect();
+    assert!(expected.contains(&RowKind::Folder("x".into())));
+    assert_eq!(
+        crate::window::notebook_view::selected_items(hwnd),
+        Some((id, expected))
+    );
+}
+
+#[test]
+fn f2_on_a_selection_renames_the_cursor_row_only() {
+    // Break caught: F2 with a group ticked renaming the wrong row, or dropping the group before
+    // the rename starts.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F2;
+    let _scintilla = load_native_scintilla();
+    let (_scratch, window, _editor) = notes_window("multi-f2", &["a.md", "b.md", "c.md"]);
+    let hwnd = window.hwnd;
+    let id = first_id(hwnd);
+    let (a, c) = (note("a.md"), note("c.md"));
+    click_row(hwnd, &a, 0);
+    click_row(hwnd, &c, MK_CONTROL);
+    assert!(key_with(hwnd, VK_F2, Modifiers::default()));
+    assert_eq!(selected_row_of(hwnd), Some((id, c.clone())));
+    assert!(
+        crate::window::inline_name::is_open(hwnd),
+        "the rename edit opened"
+    );
+    assert_eq!(
+        crate::window::notebook_view::selected_items(hwnd),
+        Some((id, vec![a, c]))
+    );
+}

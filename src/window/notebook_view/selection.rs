@@ -128,7 +128,6 @@ impl TreeSelection {
     }
 
     /// Ctrl+A: every selectable row of notebook `id` that is shown.
-    #[allow(dead_code, reason = "the tree's Ctrl+A is wired in a later task")]
     pub(crate) fn select_all(&mut self, rows: &[(NotebookId, RowKind)], id: NotebookId) {
         self.items = rows
             .iter()
