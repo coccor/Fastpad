@@ -203,14 +203,9 @@ pub(crate) fn drop_into_of(
 /// per failure, each the text the one-item drop would have shown.
 fn group_notice(failed: &[String], total: usize) -> String {
     format!(
-        "{} of {} items were not moved:
-{}",
+        "{} of {total} items were not moved:\n{}",
         failed.len(),
-        total,
-        failed.join(
-            "
-"
-        )
+        failed.join("\n")
     )
 }
 

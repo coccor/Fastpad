@@ -724,5 +724,13 @@ fn a_folder_and_a_note_inside_it_move_once_with_the_folder() {
     crate::window::tree_move::drop_many_into_of(hwnd, id, &items, std::path::Path::new("work"));
     assert!(scratch.folder().join("work/x/n.md").exists());
     assert!(!scratch.folder().join("x").exists());
+    assert_eq!(crate::window::notebook_view::selected_items(hwnd), None);
+    assert_eq!(
+        selected_row_of(hwnd),
+        Some((
+            id,
+            RowKind::Folder(std::path::PathBuf::from("work").join("x"))
+        ))
+    );
     assert!(notices(hwnd).is_empty(), "{:?}", notices(hwnd));
 }
