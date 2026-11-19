@@ -26,7 +26,8 @@ impl NotebookView {
 
 /// Row `index`'s context menu (spec §6.6), at `at` (main-window client coordinates) or under
 /// the row when opened from the keyboard. The chosen entry acts on that row, not the active
-/// tab. "Open in new tab" is `CommandId::Open` and "New note here" is `CommandId::NoteNew` here.
+/// tab, or on the whole multi-selection when the row is part of one. "Open in new tab" is
+/// `CommandId::Open` and "New note here" is `CommandId::NoteNew` here.
 pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
     let Some((target, point)) = with_view(hwnd, |view| {
         if view.mode != Mode::Tree {
@@ -44,6 +45,10 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
     let Target::Row(id, row) = target else {
         return;
     };
+    if let Some((group, items)) = group_of(hwnd, id, &row.kind) {
+        group_menu(hwnd, group, items, point);
+        return;
+    }
     let Some(root) = crate::window::library_host::notebook_folder(hwnd, id) else {
         return;
     };
@@ -86,7 +91,6 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
                 Some(CommandId::NoteRevealInExplorer) => {
                     crate::window::library_host::reveal(hwnd, &path)
                 }
-                Some(CommandId::NoteDelete) if delete_group(hwnd, id, &row.kind) => {}
                 // The row's own notebook must be ready, not the default one.
                 Some(CommandId::NoteDelete)
                     if crate::window::library_host::ready_library_of(hwnd, Some(id)) =>
@@ -134,7 +138,6 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
                 Some(CommandId::NoteRevealInExplorer) => {
                     crate::window::library_host::reveal(hwnd, &path)
                 }
-                Some(CommandId::NoteDelete) if delete_group(hwnd, id, &row.kind) => {}
                 Some(CommandId::NoteDelete)
                     if crate::window::library_host::ready_library_of(hwnd, Some(id)) =>
                 {
@@ -148,16 +151,31 @@ pub(crate) fn open_context_menu(hwnd: HWND, index: usize, at: Option<POINT>) {
     }
 }
 
-/// Delete… on the row showing `kind` of the notebook `id` while it is part of a
-/// multi-selection: deletes the whole group (tree multi-select spec, "Delete"). False, doing
-/// nothing, when the row is not in one.
-fn delete_group(hwnd: HWND, id: NotebookId, kind: &RowKind) -> bool {
+/// The multi-selection's effective group (its notebook and rows) when the row showing `kind` of
+/// the notebook `id` is part of it; `None` for a row outside it, or with no multi-selection.
+fn group_of(hwnd: HWND, id: NotebookId, kind: &RowKind) -> Option<(NotebookId, Vec<RowKind>)> {
     let in_group = with_view(hwnd, |view| view.multi.contains(id, kind)).unwrap_or(false);
-    let Some((group, items)) = selected_items(hwnd).filter(|_| in_group) else {
-        return false;
-    };
-    crate::window::library_host::delete_items(hwnd, group, &items);
-    true
+    selected_items(hwnd).filter(|_| in_group)
+}
+
+/// The context menu of a row in a multi-selection, at `point` (tree multi-select spec,
+/// "Non-goals"): only Move to notebook… and Delete…, each on the whole group `items` of the
+/// notebook `notebook`.
+fn group_menu(hwnd: HWND, notebook: NotebookId, items: Vec<RowKind>, point: POINT) {
+    let entries = [
+        MenuEntry::command("Move to notebook...", CommandId::NoteMoveToNotebook),
+        MenuEntry::Separator,
+        MenuEntry::local("Delete...\tDel", CommandId::NoteDelete),
+    ];
+    match crate::window::menus::track_popup(hwnd, &entries, point) {
+        Some(CommandId::NoteMoveToNotebook) => {
+            crate::window::library_host::move_items_to_notebook(hwnd, notebook, items);
+        }
+        Some(CommandId::NoteDelete) => {
+            crate::window::library_host::delete_items(hwnd, notebook, &items);
+        }
+        _ => {}
+    }
 }
 
 /// `WM_CONTEXTMENU`: from a right-click (screen coordinates) or from Shift+F10 or the

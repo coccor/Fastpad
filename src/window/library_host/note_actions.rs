@@ -62,7 +62,7 @@ pub(crate) fn move_to_notebook(hwnd: HWND, path: &Path) {
         );
         return;
     };
-    show_move_picker(hwnd, path, &source.1);
+    show_move_picker(hwnd, vec![path.to_path_buf()], &source.1);
 }
 
 /// Move to notebook… on the folder `relative` of the notebook `id` (multi-root move spec §3.4).
@@ -73,32 +73,56 @@ pub(crate) fn move_folder_to_notebook(hwnd: HWND, id: NotebookId, relative: &Pat
     if !library::tree::is_plain_relative_folder(relative) {
         return;
     }
-    show_move_picker(hwnd, &root.join(relative), &root);
+    show_move_picker(hwnd, vec![root.join(relative)], &root);
 }
 
-/// Step 1 of Move to notebook…: the other notebooks for `path` (absolute), of the notebook at
-/// `source`.
-fn show_move_picker(hwnd: HWND, path: &Path, source: &Path) {
-    if crate::window::cross_move_host::refuse_item_if_moving(hwnd, path) {
+/// Move to notebook… on a multi-selection (tree multi-select spec, "Move to notebook…"): `items`,
+/// the effective group of the notebook `id`, go through one picker and one move.
+pub(crate) fn move_items_to_notebook(hwnd: HWND, id: NotebookId, items: Vec<RowKind>) {
+    let Some(root) = notebook_folder(hwnd, id) else {
+        return;
+    };
+    let paths: Vec<PathBuf> = items
+        .iter()
+        .filter_map(|kind| match kind {
+            RowKind::Note(relative) => Some(root.join(relative)),
+            RowKind::Folder(relative) if library::tree::is_plain_relative_folder(relative) => {
+                Some(root.join(relative))
+            }
+            _ => None,
+        })
+        .collect();
+    if !paths.is_empty() {
+        show_move_picker(hwnd, paths, &root);
+    }
+}
+
+/// Step 1 of Move to notebook…: the other notebooks for `items` (absolute, all of the notebook
+/// at `source`).
+fn show_move_picker(hwnd: HWND, items: Vec<PathBuf>, source: &Path) {
+    if items
+        .iter()
+        .any(|item| crate::window::cross_move_host::refuse_item_if_moving(hwnd, item))
+    {
         return;
     }
     let destinations = move_destinations(hwnd, source);
-    let mut items: Vec<String> = library::local::display_names(&destinations)
+    let mut rows: Vec<String> = library::local::display_names(&destinations)
         .into_iter()
         .map(|(name, hint)| match hint {
             Some(hint) => format!("{name} ({hint})"),
             None => name,
         })
         .collect();
-    items.push("Browse…".to_owned());
+    rows.push("Browse…".to_owned());
     host(hwnd, |host| {
-        host.shown_move = Some((path.to_path_buf(), destinations));
+        host.shown_move = Some((items, destinations));
     });
     crate::window::main_window::open_picker(
         hwnd,
         Picker {
             kind: PickerKind::MoveToNotebook,
-            items,
+            items: rows,
             create: None,
             initial: None,
         },
@@ -129,32 +153,32 @@ pub(crate) fn report_rebind_failure(hwnd: HWND, old: &Path, new: &Path) {
     );
 }
 
-/// Move to notebook… chose the notebook `destination` for `item` (absolute, a note or a
-/// folder): an open notebook asks for a folder in it next (multi-root move spec §3.4); a folder
-/// inside an open notebook (from Browse…) is that folder; any other folder receives it at its
-/// root.
-pub(super) fn move_item_to_notebook(hwnd: HWND, item: &Path, destination: &Path) {
+/// Move to notebook… chose the notebook `destination` for `items` (absolute, notes and folders
+/// of one notebook): an open notebook asks for a folder in it next (multi-root move spec §3.4);
+/// a folder inside an open notebook (from Browse…) is that folder; any other folder receives
+/// them at its root.
+pub(super) fn move_items_to_notebook_at(hwnd: HWND, items: Vec<PathBuf>, destination: &Path) {
     let open = notebooks(hwnd)
         .into_iter()
         .find(|(_, folder)| library::model::same_path(folder, destination));
     if let Some((id, _)) = open {
         let folders = folder_choices(hwnd, id);
         let name = notebook_name(destination);
-        let mut items = vec![format!("{name} (root)")];
-        items.extend(
+        let mut rows = vec![format!("{name} (root)")];
+        rows.extend(
             folders
                 .iter()
                 .skip(1)
                 .map(|folder| folder.to_string_lossy().into_owned()),
         );
         host(hwnd, |host| {
-            host.shown_move_folders = Some((item.to_path_buf(), id, folders));
+            host.shown_move_folders = Some((items, id, folders));
         });
         crate::window::main_window::open_picker(
             hwnd,
             Picker {
                 kind: PickerKind::MoveToFolder,
-                items,
+                items: rows,
                 create: None,
                 initial: None,
             },
@@ -170,7 +194,7 @@ pub(super) fn move_item_to_notebook(hwnd: HWND, item: &Path, destination: &Path)
             root: destination.to_path_buf(),
         },
     };
-    move_item_to(hwnd, item, dest);
+    move_items_to(hwnd, &items, dest);
 }
 
 /// The folders of the open notebook `id` a move may go into: the root (empty) first, then
@@ -182,14 +206,24 @@ pub(super) fn folder_choices(hwnd: HWND, id: NotebookId) -> Vec<PathBuf> {
     std::iter::once(PathBuf::new()).chain(folders).collect()
 }
 
-/// Moves `item` (absolute) of its open notebook to `dest`, through the same planner, question
-/// and hand-off as a drag (multi-root move spec §3.4).
-pub(super) fn move_item_to(
+/// Moves `items` (absolute, of one open notebook) to `dest` in one `move_items` call, through
+/// the same planner, question and hand-off as a drag (multi-root move spec §3.4): all of them or
+/// none.
+pub(super) fn move_items_to(
     hwnd: HWND,
-    item: &Path,
+    items: &[PathBuf],
     dest: crate::window::cross_move_host::Destination,
 ) {
-    let Some((from, root)) = note_root(hwnd, item) else {
+    let Some(item) = items.first() else {
+        return;
+    };
+    let owner = note_root(hwnd, item);
+    // Every item must still be in that same notebook; one gone stops the move.
+    let Some((from, root)) = owner.filter(|(from, _)| {
+        items
+            .iter()
+            .all(|item| note_root(hwnd, item).is_some_and(|(id, _)| id == *from))
+    }) else {
         push_notice(
             hwnd,
             "Only notes in an open notebook can be moved to another notebook.".to_owned(),
@@ -199,23 +233,25 @@ pub(super) fn move_item_to(
     if let crate::window::cross_move_host::Destination::Open { id, .. } = &dest
         && *id == from
     {
-        push_notice(
-            hwnd,
-            format!(
-                "{} is already in {}.",
-                title::note_title(item),
-                notebook_name(&root)
-            ),
-        );
+        let what = match items {
+            [item] => format!("{} is", title::note_title(item)),
+            _ => format!("These {} items are", items.len()),
+        };
+        push_notice(hwnd, format!("{what} already in {}.", notebook_name(&root)));
         return;
     }
-    let relative = library::record_path(&root, item);
-    let kind = if item.is_dir() {
-        RowKind::Folder(relative)
-    } else {
-        RowKind::Note(relative)
-    };
-    crate::window::cross_move_host::move_items(hwnd, from, vec![kind], dest);
+    let kinds = items
+        .iter()
+        .map(|item| {
+            let relative = library::record_path(&root, item);
+            if item.is_dir() {
+                RowKind::Folder(relative)
+            } else {
+                RowKind::Note(relative)
+            }
+        })
+        .collect();
+    crate::window::cross_move_host::move_items(hwnd, from, kinds, dest);
 }
 
 /// Writes the unsaved edits of `note`'s tab, if it has one, so they move with the file. A tab

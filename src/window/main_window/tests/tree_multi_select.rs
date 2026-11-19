@@ -1178,3 +1178,67 @@ fn delete_from_the_menu_of_a_ticked_row_deletes_the_group_and_of_another_row_jus
         Some("Move \u{201c}e.md\u{201d} to the Recycle Bin?")
     );
 }
+
+#[test]
+fn the_menu_on_a_selection_offers_only_move_and_delete() {
+    // Break caught: Rename, Pin, Open or Reveal offered on a group (each would act on one row
+    // only), or a row outside the selection losing its own full menu.
+    let _scintilla = load_native_scintilla();
+    let (_scratch, window, _editor) = notes_window("multi-menu", &["a.md", "b.md", "c.md"]);
+    let hwnd = window.hwnd;
+    let (a, b, c) = (note("a.md"), note("b.md"), note("c.md"));
+    click_row(hwnd, &a, 0);
+    click_row(hwnd, &b, MK_CONTROL);
+    let labels = |kind: &RowKind| {
+        crate::window::menus::answer_next_popup_menu(|_| None);
+        crate::window::notebook_view::open_context_menu(hwnd, row_of(hwnd, kind), None);
+        crate::window::menus::last_popup_entries()
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(labels(&b), ["Move to notebook...", "Delete..."]);
+    assert!(crate::window::notebook_view::selected_items(hwnd).is_some());
+    assert_eq!(labels(&c)[0], "Open in new tab");
+}
+
+/// The open picker's rows.
+fn picker_rows(hwnd: HWND) -> Vec<String> {
+    with_command_palette(hwnd, |p| p.picker().map(|picker| picker.items.clone()))
+        .flatten()
+        .unwrap_or_default()
+}
+
+#[test]
+fn move_to_notebook_on_a_selection_moves_all_items_with_one_picker() {
+    // Break caught: the menu's Move to notebook… moving only the row it was opened on, or
+    // asking for a notebook and a folder once per item.
+    use crate::window::command_palette::{PickerChoice, PickerKind};
+    use crate::window::commands::CommandId;
+    let _scintilla = load_native_scintilla();
+    let ab = super::cross_move::two(
+        "multi-menu-move",
+        &[("a.md", "a"), (r"work\x.md", "x")],
+        &[(r"projects\keep.md", "")],
+    );
+    let hwnd = ab.window.hwnd;
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, false);
+    crate::window::notebook_view::rebuild(hwnd);
+    let (a, work) = (note("a.md"), RowKind::Folder("work".into()));
+    click_row_in(hwnd, ab.a_id, &a, 0);
+    click_row_in(hwnd, ab.a_id, &work, MK_CONTROL);
+
+    crate::window::menus::answer_next_popup_menu(|_| Some(CommandId::NoteMoveToNotebook));
+    crate::window::notebook_view::open_context_menu(hwnd, row_in(hwnd, ab.a_id, &a), None);
+    assert_eq!(picker_rows(hwnd)[0], "B");
+    crate::window::library_host::picked(hwnd, PickerKind::MoveToNotebook, PickerChoice::Item(0));
+    assert_eq!(picker_rows(hwnd), ["B (root)", "projects"]);
+    crate::window::library_host::picked(hwnd, PickerKind::MoveToFolder, PickerChoice::Item(1));
+
+    pump_until(hwnd, || {
+        ab.b.join(r"projects\a.md").exists() && ab.b.join(r"projects\work\x.md").exists()
+    });
+    assert!(!ab.a.join("a.md").exists() && !ab.a.join("work").exists());
+    assert!(app_mut(hwnd).library.shown_move.is_none());
+    assert!(app_mut(hwnd).library.shown_move_folders.is_none());
+}
