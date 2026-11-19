@@ -1075,10 +1075,13 @@ unsafe extern "system" fn panel_proc(
         {
             0
         }
-        // Esc anywhere in the panel returns to the editor (spec §10). The search box's own Esc
-        // is handled in its subclass.
+        // Esc anywhere in the panel returns to the editor (spec §10), once the tree's
+        // multi-selection is dropped: that takes an Esc of its own, and the focus stays (tree
+        // multi-select spec). The search box's own Esc is handled in its subclass.
         WM_KEYDOWN if wparam as u16 == VK_ESCAPE => {
-            return_focus_to_editor(main);
+            if !crate::window::notebook_view::clear_selection(main) {
+                return_focus_to_editor(main);
+            }
             0
         }
         WM_SETCURSOR if resizing(main) || pointer_over_grip(panel) => {

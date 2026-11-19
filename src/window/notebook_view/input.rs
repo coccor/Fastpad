@@ -9,6 +9,7 @@ use crate::window::menus::MenuEntry;
 use crate::window::panel_cursor::{self, Cursor};
 use crate::window::row_list::{self, ListKey};
 use crate::window::side_panel::point_of;
+use crate::window::sidebar_accessibility::{MK_CONTROL, MK_SHIFT};
 use crate::window::tooltip::Tooltip;
 use crate::window::tree_drag::DragSource;
 use std::path::{Path, PathBuf};
@@ -40,7 +41,7 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
         // The panel class has CS_DBLCLKS: the second press of a double-click comes as this.
         WM_LBUTTONDBLCLK => {
             let (x, y) = point_of(lparam);
-            double_click(hwnd, x, y);
+            double_click(hwnd, x, y, wparam);
             Some(0)
         }
         WM_MOUSELEAVE => {
@@ -57,7 +58,7 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
         }
         WM_LBUTTONDOWN => {
             let (x, y) = point_of(lparam);
-            left_down(hwnd, x, y);
+            left_down(hwnd, x, y, wparam);
             Some(0)
         }
         WM_MBUTTONDOWN => {
@@ -90,6 +91,7 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
             if drag_release(hwnd, x, y, wparam) {
                 return Some(0);
             }
+            release_press(hwnd);
             // Released after the borrow ends: ReleaseCapture sends WM_CAPTURECHANGED here.
             if with_view(hwnd, |view| view.thumb_grab.take().is_some()).unwrap_or(false) {
                 unsafe {
@@ -122,11 +124,25 @@ pub(crate) fn handle(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
             let (x, y) = point_of(lparam);
             let hit = hit_after_commit(hwnd, x, y);
             focus_panel_for(hwnd, hit.as_ref());
-            if let Some(Hit::Row { index, .. }) = hit {
-                with_view(hwnd, |view| {
-                    view.cursor = Cursor::Tree;
-                    view.select(index);
-                });
+            // A press inside the multi-selection keeps it, for its menu; anywhere else on the
+            // tree it goes (tree multi-select spec, "Interaction details").
+            match hit {
+                Some(Hit::Row { index, .. }) => {
+                    with_view(hwnd, |view| {
+                        if !in_multi(view, index) {
+                            view.multi.clear();
+                        }
+                        view.cursor = Cursor::Tree;
+                        view.select(index);
+                    });
+                }
+                Some(Hit::Root(_)) => {
+                    with_view(hwnd, |view| {
+                        view.multi.clear();
+                        view.invalidate();
+                    });
+                }
+                _ => {}
             }
             Some(0)
         }
@@ -341,10 +357,12 @@ pub(super) fn focus_panel_for(hwnd: HWND, hit: Option<&Hit>) {
     }
 }
 
-pub(super) fn left_down(hwnd: HWND, x: i32, y: i32) {
+/// `WM_LBUTTONDOWN` at `x`, `y`, with `buttons` (the message's `MK_` flags).
+pub(super) fn left_down(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) {
     // A drag armed by an earlier press whose release never came here. `cancel_drag` also ends
     // one that had started, label and all, though its capture should have ended it already.
     cancel_drag(hwnd);
+    drop_pending_press(hwnd);
     // A right press's cancel whose own release has not come yet: this press ends the wait, and
     // the capture kept for it (the release then opens the menu as any other would).
     drop_right_release_wait(hwnd);
@@ -414,6 +432,7 @@ pub(super) fn left_down(hwnd: HWND, x: i32, y: i32) {
         // A click on a root row, off its buttons, selects it and toggles its notebook.
         Hit::Root(id) => {
             with_view(hwnd, |view| {
+                view.multi.clear();
                 if let Some(index) = view_row_index(&view.rows, id, &RowKind::Root) {
                     view.select(index);
                 }
@@ -438,6 +457,9 @@ pub(super) fn left_down(hwnd: HWND, x: i32, y: i32) {
             }
         }
         Hit::Row { index, part } => {
+            if row_pressed(hwnd, index, part, buttons, x, y) {
+                return;
+            }
             with_view(hwnd, |view| view.select(index));
             // Read before the click acts: opening a note or toggling a folder can move rows.
             let source = (part == RowPart::Body)
@@ -457,6 +479,87 @@ pub(super) fn left_down(hwnd: HWND, x: i32, y: i32) {
         }
         Hit::Empty => {}
     }
+}
+
+/// Whether tree row `index` is one of two or more ticked rows.
+fn in_multi(view: &NotebookView, index: usize) -> bool {
+    view.multi.is_multi() && view.multi_contains_row(index)
+}
+
+/// A left press on tree row `index` that the multi-selection takes (tree multi-select spec,
+/// "Interaction details"): Ctrl toggles a note or folder in (or, on a ticked one, out at the
+/// release), Shift selects the range to it, and a plain press inside the selection waits for
+/// the release. None of them opens or toggles anything; each can start a drag. False leaves the
+/// press to the one-row click, after dropping any selection.
+fn row_pressed(hwnd: HWND, index: usize, part: RowPart, buttons: WPARAM, x: i32, y: i32) -> bool {
+    let taken = with_view(hwnd, |view| {
+        let row = view.rows.get(index).filter(|_| view.mode == Mode::Tree)?;
+        let (id, kind) = (row.notebook, row.kind.clone());
+        let (ctrl, shift) = (buttons & MK_CONTROL != 0, buttons & MK_SHIFT != 0);
+        if (ctrl || shift) && selection::selectable(&kind) {
+            let rows = view.row_keys();
+            let cursor = view.list.selected;
+            if shift {
+                view.multi.select_range(&rows, id, index, cursor);
+            } else if view.multi.contains(id, &kind) {
+                view.pending_toggle = Some(index);
+            } else {
+                let cursor = cursor.and_then(|at| rows.get(at).cloned());
+                view.multi.toggle(&rows, id, &kind, cursor);
+            }
+        } else if in_multi(view, index) {
+            view.pending_collapse = Some((index, part));
+        } else {
+            view.multi.clear();
+            return None;
+        }
+        view.select(index);
+        Some((id, kind))
+    })
+    .flatten();
+    let Some((id, kind)) = taken else {
+        return false;
+    };
+    // Until a group can be dragged, the drag carries the pressed row.
+    if part == RowPart::Body {
+        arm_drag(hwnd, Some(id), DragSource::Row(kind), x, y);
+    }
+    true
+}
+
+/// `WM_LBUTTONUP` with no drag under way: a plain press inside the multi-selection collapses
+/// it to its row and clicks that row now; a Ctrl+press on a ticked row takes it out now.
+fn release_press(hwnd: HWND) {
+    let Some((collapse, toggle)) = with_view(hwnd, |view| {
+        (view.pending_collapse.take(), view.pending_toggle.take())
+    }) else {
+        return;
+    };
+    if let Some(index) = toggle {
+        with_view(hwnd, |view| {
+            let rows = view.row_keys();
+            if let Some((id, kind)) = rows.get(index).cloned() {
+                view.multi.toggle(&rows, id, &kind, None);
+                view.invalidate();
+            }
+        });
+    }
+    if let Some((index, part)) = collapse {
+        with_view(hwnd, |view| {
+            view.multi.clear();
+            view.invalidate();
+        });
+        row_clicked(hwnd, index, part, false);
+    }
+}
+
+/// Forgets a press's deferred click or untoggle: a new press came, or the release went to
+/// another window.
+pub(super) fn drop_pending_press(hwnd: HWND) {
+    with_view(hwnd, |view| {
+        view.pending_collapse = None;
+        view.pending_toggle = None;
+    });
 }
 
 /// `WM_LBUTTONDBLCLK`: a row's second press opens it as a normal tab, which also promotes its
@@ -488,8 +591,12 @@ fn pinned_at(hwnd: HWND, index: usize) -> Option<(NotebookId, PathBuf)> {
     .flatten()
 }
 
-pub(super) fn double_click(hwnd: HWND, x: i32, y: i32) {
+pub(super) fn double_click(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) {
     match with_view(hwnd, |view| view.hit_test(x, y)) {
+        // With Ctrl or Shift held it is one more selecting press, and opens nothing.
+        Some(Hit::Row { .. }) if buttons & (MK_CONTROL | MK_SHIFT) != 0 => {
+            left_down(hwnd, x, y, buttons);
+        }
         Some(Hit::Row { index, part }) => row_clicked(hwnd, index, part, true),
         // The first press already toggled the root, as on a folder row.
         Some(Hit::Root(_)) => {}
@@ -498,7 +605,7 @@ pub(super) fn double_click(hwnd: HWND, x: i32, y: i32) {
                 open_pinned(hwnd, id, &path, Activation::Permanent);
             }
         }
-        Some(_) => left_down(hwnd, x, y),
+        Some(_) => left_down(hwnd, x, y, buttons),
         None => {}
     }
 }

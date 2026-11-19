@@ -332,6 +332,20 @@ pub(crate) fn selected_items(hwnd: HWND) -> Option<(NotebookId, Vec<RowKind>)> {
     .flatten()
 }
 
+/// Esc in the panel: drops a multi-selection, leaving the cursor row (tree multi-select spec,
+/// "Interaction details"). True when there was one to drop, so the focus stays in the tree.
+pub(crate) fn clear_selection(hwnd: HWND) -> bool {
+    rebuild::with_view(hwnd, |view| {
+        let multi = view.multi.is_multi();
+        if multi {
+            view.multi.clear();
+            view.invalidate();
+        }
+        multi
+    })
+    .unwrap_or(false)
+}
+
 /// The index of the row of notebook `id` that shows `kind`.
 pub(crate) fn view_row_index(rows: &[ViewRow], id: NotebookId, kind: &RowKind) -> Option<usize> {
     rows.iter()
@@ -614,6 +628,12 @@ pub(crate) struct NotebookView {
     /// The notes and folders ticked together in the tree (tree multi-select spec). The cursor row
     /// is `list.selected`, which stands for a single selection.
     pub(crate) multi: TreeSelection,
+    /// A plain press on a row inside the multi-selection, and the part it hit: its click waits
+    /// for the release, which collapses the selection to it unless a drag started first.
+    pending_collapse: Option<(usize, RowPart)>,
+    /// A Ctrl+press on a ticked row: it leaves the selection at the release, unless a drag
+    /// started first (a Ctrl+drag copies the group).
+    pending_toggle: Option<usize>,
     /// Full rebuilds so far, for the tests that check a tab switch skips one.
     #[cfg(test)]
     pub(crate) rebuilds: usize,
@@ -686,6 +706,8 @@ impl NotebookView {
             thumb_grab: None,
             drag: None,
             multi: TreeSelection::default(),
+            pending_collapse: None,
+            pending_toggle: None,
             drag_notebook: None,
             drop_notebook: None,
             eat_right_up: false,

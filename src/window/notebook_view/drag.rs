@@ -177,12 +177,14 @@ pub(super) fn drag_move(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) -> bool {
         return false;
     };
     if buttons & MK_LBUTTON == 0 {
-        // The release went elsewhere: a menu, a dialog, another window.
+        // The release went elsewhere: a menu, a dialog, another window. The press's deferred
+        // click goes with it.
         if started {
             cancel_drag(hwnd);
         } else {
             with_view(hwnd, |view| view.drag = None);
         }
+        drop_pending_press(hwnd);
         return started;
     }
     if !started {
@@ -194,6 +196,10 @@ pub(super) fn drag_move(hwnd: HWND, x: i32, y: i32, buttons: WPARAM) -> bool {
             if let Some(drag) = view.drag.as_mut() {
                 drag.started = true;
             }
+            // The press became a drag: its release neither collapses nor untoggles the
+            // selection (tree multi-select spec, "Interaction details").
+            view.pending_collapse = None;
+            view.pending_toggle = None;
             view.list.hover = None;
             view.hover = None;
             view.hover_pin = false;

@@ -1,9 +1,6 @@
 //! The Notebook tree's multi-selection: which note and folder rows are ticked, in one notebook.
 //! Pure state with no window, so the rules are testable on their own.
 
-// The click and key handling that toggles and ranges the selection is wired in later tasks.
-#![allow(dead_code)]
-
 use crate::library::tree::{RowKind, ancestors};
 use crate::window::library_host::NotebookId;
 
@@ -131,6 +128,7 @@ impl TreeSelection {
     }
 
     /// Ctrl+A: every selectable row of notebook `id` that is shown.
+    #[allow(dead_code, reason = "the tree's Ctrl+A is wired in a later task")]
     pub(crate) fn select_all(&mut self, rows: &[(NotebookId, RowKind)], id: NotebookId) {
         self.items = rows
             .iter()

@@ -1,6 +1,8 @@
 //! The Notebook tree's multi-selection on the view: what it paints, reports and keeps.
 
 use super::*;
+use crate::window::sidebar_accessibility::{MK_CONTROL, MK_LBUTTON, MK_SHIFT};
+use windows_sys::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDOWN, WM_LBUTTONUP};
 
 /// Ticks `kinds` (two or more) of the first notebook, the cursor on the first.
 fn tick(hwnd: HWND, kinds: &[RowKind]) {
@@ -116,4 +118,260 @@ fn a_rebuild_keeps_selected_notes_a_collapsed_folder_hides() {
         crate::window::notebook_view::selected_items(window.hwnd),
         Some((first_id(window.hwnd), vec![a, b]))
     );
+}
+
+/// Presses and releases the left button on the row showing `kind` of notebook `id`, with
+/// `buttons` (MK_CONTROL, MK_SHIFT) held.
+fn click_row_in(
+    hwnd: HWND,
+    id: crate::window::library_host::NotebookId,
+    kind: &RowKind,
+    buttons: usize,
+) {
+    let at = row_point(hwnd, id, kind);
+    let panel = sidebar_windows(hwnd).1;
+    mouse(panel, WM_LBUTTONDOWN, MK_LBUTTON | buttons, at);
+    mouse(panel, WM_LBUTTONUP, buttons, at);
+}
+
+/// `click_row_in` for the first open notebook.
+fn click_row(hwnd: HWND, kind: &RowKind, buttons: usize) {
+    click_row_in(hwnd, first_id(hwnd), kind, buttons);
+}
+
+/// The centre of the row showing `kind` of notebook `id`, as a mouse message's `lParam`.
+fn row_point(hwnd: HWND, id: crate::window::library_host::NotebookId, kind: &RowKind) -> LPARAM {
+    centre(
+        notebook_view(hwnd)
+            .row_rect_at(row_in(hwnd, id, kind))
+            .expect("the row is in view"),
+    )
+}
+
+/// Whether a tab shows `path`.
+fn opened(hwnd: HWND, path: &std::path::Path) -> bool {
+    tab_paths(hwnd)
+        .iter()
+        .flatten()
+        .any(|open| crate::library::model::same_path(open, path))
+}
+
+/// Notes `names` in a fresh notebook shown in the Notebook view.
+fn notes_window(
+    label: &str,
+    names: &[&str],
+) -> (LibraryScratch, ProductionWindow, crate::editor::Editor) {
+    let scratch = LibraryScratch::new(label);
+    for name in names {
+        scratch.note(name, name);
+    }
+    let (window, editor) = notebook_window(&scratch);
+    (scratch, window, editor)
+}
+
+fn note(name: &str) -> RowKind {
+    RowKind::Note(name.into())
+}
+
+#[test]
+fn ctrl_click_builds_a_selection_and_opens_nothing() {
+    // Break caught: a Ctrl+click that opens a preview tab as a plain click does, or that drops
+    // the row clicked before it; or a Ctrl+press on a ticked row taking it out at the press, so
+    // a Ctrl+drag of the group could not start from it.
+    let _scintilla = load_native_scintilla();
+    let (scratch, window, _editor) = notes_window("multi-ctrl", &["a.md", "b.md", "c.md"]);
+    let hwnd = window.hwnd;
+    let (a, c) = (note("a.md"), note("c.md"));
+    click_row(hwnd, &a, 0);
+    assert!(
+        opened(hwnd, &scratch.folder().join("a.md")),
+        "a plain click opens"
+    );
+    click_row(hwnd, &c, MK_CONTROL);
+    assert_eq!(
+        crate::window::notebook_view::selected_items(hwnd),
+        Some((first_id(hwnd), vec![a.clone(), c.clone()]))
+    );
+    assert!(
+        !opened(hwnd, &scratch.folder().join("c.md")),
+        "no tab for c"
+    );
+    assert_eq!(selected_row_of(hwnd), Some((first_id(hwnd), c.clone())));
+
+    // A Ctrl+press on a ticked row keeps it until the release.
+    let panel = sidebar_windows(hwnd).1;
+    let at = row_point(hwnd, first_id(hwnd), &a);
+    mouse(panel, WM_LBUTTONDOWN, MK_LBUTTON | MK_CONTROL, at);
+    assert_eq!(
+        crate::window::notebook_view::selected_items(hwnd),
+        Some((first_id(hwnd), vec![a.clone(), c.clone()]))
+    );
+    mouse(panel, WM_LBUTTONUP, MK_CONTROL, at);
+    assert_eq!(crate::window::notebook_view::selected_items(hwnd), None);
+}
+
+#[test]
+fn shift_click_selects_the_range_from_the_cursor() {
+    // Break caught: a range that starts anywhere but the row clicked before it, opens the row
+    // Shift+clicked, or moves its start with each Shift+click.
+    let _scintilla = load_native_scintilla();
+    let (scratch, window, _editor) = notes_window("multi-shift", &["a.md", "b.md", "c.md", "d.md"]);
+    let hwnd = window.hwnd;
+    let (a, b, c, d) = (note("a.md"), note("b.md"), note("c.md"), note("d.md"));
+    click_row(hwnd, &b, 0);
+    click_row(hwnd, &d, MK_SHIFT);
+    assert_eq!(
+        crate::window::notebook_view::selected_items(hwnd),
+        Some((first_id(hwnd), vec![b.clone(), c, d.clone()]))
+    );
+    assert!(
+        !opened(hwnd, &scratch.folder().join("d.md")),
+        "no tab for d"
+    );
+    assert_eq!(selected_row_of(hwnd), Some((first_id(hwnd), d)));
+    // The range still starts at b.
+    click_row(hwnd, &a, MK_SHIFT);
+    assert_eq!(
+        crate::window::notebook_view::selected_items(hwnd),
+        Some((first_id(hwnd), vec![a, b]))
+    );
+}
+
+#[test]
+fn a_plain_click_inside_the_selection_collapses_it_on_release_and_opens_the_note() {
+    // Break caught: a press inside the selection that drops it at once (so no group drag can
+    // start), opens the note on the press, or a release that leaves the group ticked.
+    let _scintilla = load_native_scintilla();
+    let (scratch, window, _editor) = notes_window("multi-inside", &["a.md", "b.md", "c.md"]);
+    let hwnd = window.hwnd;
+    let (a, c) = (note("a.md"), note("c.md"));
+    click_row(hwnd, &a, 0);
+    click_row(hwnd, &c, MK_CONTROL);
+    let panel = sidebar_windows(hwnd).1;
+    let at = row_point(hwnd, first_id(hwnd), &c);
+    mouse(panel, WM_LBUTTONDOWN, MK_LBUTTON, at);
+    assert_eq!(
+        crate::window::notebook_view::selected_items(hwnd),
+        Some((first_id(hwnd), vec![a, c.clone()])),
+        "the press keeps the group"
+    );
+    assert!(
+        !opened(hwnd, &scratch.folder().join("c.md")),
+        "nothing opens on the press"
+    );
+    assert!(notebook_view(hwnd).drag.is_some(), "the press arms a drag");
+    mouse(panel, WM_LBUTTONUP, 0, at);
+    assert_eq!(crate::window::notebook_view::selected_items(hwnd), None);
+    assert!(
+        opened(hwnd, &scratch.folder().join("c.md")),
+        "the release opens c"
+    );
+    assert_eq!(selected_row_of(hwnd), Some((first_id(hwnd), c)));
+}
+
+#[test]
+fn a_plain_click_outside_clears_the_selection() {
+    // Break caught: a plain click that leaves the old group ticked beside the new row.
+    let _scintilla = load_native_scintilla();
+    let (scratch, window, _editor) = notes_window("multi-outside", &["a.md", "b.md", "c.md"]);
+    let hwnd = window.hwnd;
+    let (a, b, c) = (note("a.md"), note("b.md"), note("c.md"));
+    click_row(hwnd, &a, 0);
+    click_row(hwnd, &b, MK_CONTROL);
+    click_row(hwnd, &c, 0);
+    assert_eq!(crate::window::notebook_view::selected_items(hwnd), None);
+    assert!(!notebook_view(hwnd).multi_contains_row(row_of(hwnd, &a)));
+    assert!(opened(hwnd, &scratch.folder().join("c.md")));
+    assert_eq!(selected_row_of(hwnd), Some((first_id(hwnd), c)));
+}
+
+#[test]
+fn ctrl_click_in_another_notebook_restarts_the_selection_there() {
+    // Break caught: a selection spanning two notebooks, or one whose old rows in A stay
+    // ticked, so Del would recycle notes of A along with the row clicked in B.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_DELETE;
+    let _scintilla = load_native_scintilla();
+    let ab = notebooks_a_and_b("multi-other-notebook", "a", "b");
+    let hwnd = ab.window.hwnd;
+    std::fs::write(ab.a.join("a2.md"), "a2").unwrap();
+    rescan_and_wait(hwnd);
+    crate::window::side_panel::show_view(hwnd, crate::config::SidebarView::Notebook, false);
+    crate::window::notebook_view::rebuild(hwnd);
+    let (a, a2, b) = (note("a.md"), note("a2.md"), note("b.md"));
+    click_row_in(hwnd, ab.a_id, &a, 0);
+    click_row_in(hwnd, ab.a_id, &a2, MK_CONTROL);
+    assert_eq!(
+        crate::window::notebook_view::selected_items(hwnd),
+        Some((ab.a_id, vec![a.clone(), a2.clone()]))
+    );
+    click_row_in(hwnd, ab.b_id, &b, MK_CONTROL);
+    assert_eq!(notebook_view(hwnd).multi.notebook(), Some(ab.b_id));
+    assert!(!notebook_view(hwnd).multi.contains(ab.a_id, &a));
+    assert!(!notebook_view(hwnd).multi.contains(ab.a_id, &a2));
+    assert_eq!(selected_row_of(hwnd), Some((ab.b_id, b)));
+
+    crate::window::modal::answer_next_confirm(|_| true);
+    crate::window::notebook_view::key_down(hwnd, VK_DELETE);
+    assert!(!ab.b.join("b.md").exists(), "b went to the Recycle Bin");
+    assert!(ab.a.join("a.md").exists());
+    assert!(ab.a.join("a2.md").exists());
+}
+
+#[test]
+fn escape_clears_the_selection_first_and_keeps_focus_then_returns_to_the_editor() {
+    // Break caught: Esc leaving the tree with the group still ticked, or needing a mouse click
+    // to drop a selection.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_SHOW, ShowWindow, WM_KEYDOWN};
+    let _scintilla = load_native_scintilla();
+    let (_scratch, window, _editor) = notes_window("multi-escape", &["a.md", "b.md"]);
+    let hwnd = window.hwnd;
+    unsafe { ShowWindow(hwnd, SW_SHOW) };
+    super::super::return_focus_to_editor(hwnd);
+    let editor = focused();
+    let panel = sidebar_windows(hwnd).1;
+    click_row(hwnd, &note("a.md"), 0);
+    click_row(hwnd, &note("b.md"), MK_CONTROL);
+    assert!(crate::window::notebook_view::selected_items(hwnd).is_some());
+    assert_eq!(focused(), panel);
+    let escape = || unsafe { SendMessageW(panel, WM_KEYDOWN, usize::from(VK_ESCAPE), 0) };
+    escape();
+    assert_eq!(crate::window::notebook_view::selected_items(hwnd), None);
+    assert_eq!(focused(), panel, "the first Esc keeps the tree focused");
+    escape();
+    assert_eq!(focused(), editor, "the second Esc returns to the editor");
+}
+
+#[test]
+fn a_right_click_inside_the_selection_keeps_it() {
+    // Break caught: a right press inside the group dropping it, so its menu could only ever
+    // act on one row; or one outside it leaving the group ticked.
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_RBUTTONDOWN;
+    const MK_RBUTTON: usize = 0x0002;
+    let _scintilla = load_native_scintilla();
+    let (_scratch, window, _editor) = notes_window("multi-right", &["a.md", "b.md", "c.md"]);
+    let hwnd = window.hwnd;
+    let (a, b, c) = (note("a.md"), note("b.md"), note("c.md"));
+    click_row(hwnd, &a, 0);
+    click_row(hwnd, &c, MK_CONTROL);
+    let panel = sidebar_windows(hwnd).1;
+    mouse(
+        panel,
+        WM_RBUTTONDOWN,
+        MK_RBUTTON,
+        row_point(hwnd, first_id(hwnd), &a),
+    );
+    assert_eq!(
+        crate::window::notebook_view::selected_items(hwnd),
+        Some((first_id(hwnd), vec![a.clone(), c]))
+    );
+    assert_eq!(selected_row_of(hwnd), Some((first_id(hwnd), a)));
+    mouse(
+        panel,
+        WM_RBUTTONDOWN,
+        MK_RBUTTON,
+        row_point(hwnd, first_id(hwnd), &b),
+    );
+    assert_eq!(crate::window::notebook_view::selected_items(hwnd), None);
+    assert_eq!(selected_row_of(hwnd), Some((first_id(hwnd), b)));
 }
