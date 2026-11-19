@@ -44,10 +44,11 @@ impl TreeSelection {
     }
 
     /// Ctrl+click on `kind`. The first toggle also takes the cursor row; a toggle in another
-    /// notebook starts over with just `kind`. Toggling a selected row takes it out, and a lone
+    /// notebook starts over with just `kind`. Items are kept in tree order, per `rows`. Toggling a selected row takes it out, and a lone
     /// leftover is no selection at all.
     pub(crate) fn toggle(
         &mut self,
+        rows: &[(NotebookId, RowKind)],
         id: NotebookId,
         kind: &RowKind,
         cursor: Option<(NotebookId, RowKind)>,
@@ -70,11 +71,18 @@ impl TreeSelection {
         if let Some(at) = self.items.iter().position(|item| item == kind) {
             self.items.remove(at);
             if self.items.len() < 2 {
-                self.items.clear();
+                self.clear();
+                return;
             }
         } else {
             self.items.push(kind.clone());
         }
+        // Items stay in tree order, whatever order they were clicked in.
+        self.items.sort_by_key(|item| {
+            rows.iter()
+                .position(|(rid, k)| *rid == id && k == item)
+                .unwrap_or(usize::MAX)
+        });
         self.anchor = Some(kind.clone());
     }
 
@@ -196,7 +204,7 @@ mod tests {
     #[test]
     fn a_first_ctrl_toggle_takes_the_cursor_row_too() {
         let mut selection = TreeSelection::default();
-        selection.toggle(NB, &note("b.md"), Some((NB, note("a.md"))));
+        selection.toggle(&[], NB, &note("b.md"), Some((NB, note("a.md"))));
         assert_eq!(selection.items, vec![note("a.md"), note("b.md")]);
         assert!(selection.is_multi());
         assert!(selection.contains(NB, &note("a.md")));
@@ -206,17 +214,19 @@ mod tests {
     #[test]
     fn toggling_a_selected_row_takes_it_out_and_one_left_is_no_selection() {
         let mut selection = TreeSelection::default();
-        selection.toggle(NB, &note("b.md"), Some((NB, note("a.md"))));
-        selection.toggle(NB, &note("b.md"), None);
+        selection.toggle(&[], NB, &note("b.md"), Some((NB, note("a.md"))));
+        selection.toggle(&[], NB, &note("b.md"), None);
         assert!(!selection.is_multi());
+        assert_eq!(selection.notebook(), None);
+        assert_eq!(selection.anchor, None);
         assert!(selection.items.is_empty());
     }
 
     #[test]
     fn a_toggle_in_another_notebook_restarts_there() {
         let mut selection = TreeSelection::default();
-        selection.toggle(NB, &note("b.md"), Some((NB, note("a.md"))));
-        selection.toggle(OTHER, &note("c.md"), Some((NB, note("a.md"))));
+        selection.toggle(&[], NB, &note("b.md"), Some((NB, note("a.md"))));
+        selection.toggle(&[], OTHER, &note("c.md"), Some((NB, note("a.md"))));
         assert_eq!(selection.items, vec![note("c.md")]);
         assert_eq!(selection.notebook(), Some(OTHER));
         assert!(!selection.contains(NB, &note("a.md")));
@@ -234,7 +244,7 @@ mod tests {
             (NB, note("c.md")),
         ];
         let mut selection = TreeSelection::default();
-        selection.toggle(NB, &folder("x"), None);
+        selection.toggle(&[], NB, &folder("x"), None);
         selection.select_range(&rows, NB, 4, None);
         assert_eq!(
             selection.items,
@@ -258,7 +268,7 @@ mod tests {
         let mut selection = TreeSelection::default();
         selection.select_all(&rows, NB);
         assert_eq!(selection.items, vec![note("a.md"), note("b.md")]);
-        selection.toggle(NB, &RowKind::Root, None);
+        selection.toggle(&[], NB, &RowKind::Root, None);
         assert_eq!(selection.items, vec![note("a.md"), note("b.md")]);
         assert!(!selectable(&RowKind::Draft));
         assert!(!selectable(&RowKind::Root));
@@ -268,13 +278,22 @@ mod tests {
     fn retain_drops_items_that_are_gone_but_keeps_hidden_ones() {
         let rows = vec![(NB, RowKind::Root), (NB, note("a.md"))];
         let mut selection = TreeSelection::default();
-        selection.toggle(NB, &note("hidden.md"), Some((NB, note("a.md"))));
-        selection.toggle(NB, &note("gone.md"), None);
+        selection.toggle(&[], NB, &note("hidden.md"), Some((NB, note("a.md"))));
+        selection.toggle(&[], NB, &note("gone.md"), None);
         selection.retain_present(&rows, |kind| *kind == note("hidden.md"));
         assert_eq!(selection.items, vec![note("a.md"), note("hidden.md")]);
         selection.retain_present(&rows, |_| false);
         assert!(selection.items.is_empty());
         assert_eq!(selection.notebook(), None);
+    }
+
+    #[test]
+    fn items_stay_in_tree_order_whatever_the_click_order() {
+        let rows = vec![(NB, RowKind::Root), (NB, note("a.md")), (NB, note("b.md"))];
+        let mut selection = TreeSelection::default();
+        selection.toggle(&rows, NB, &note("b.md"), None);
+        selection.toggle(&rows, NB, &note("a.md"), None);
+        assert_eq!(selection.effective(), vec![note("a.md"), note("b.md")]);
     }
 
     #[test]
