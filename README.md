@@ -48,12 +48,12 @@ Also available via **Scoop**, an **installer**, or a **portable ZIP** from the
 <td width="50%" valign="top">
 <img src="docs/images/markdown-preview.png" alt="Markdown source and rendered preview side by side"><br>
 <b>Markdown, live</b><br>
-Source, split, preview or a live view that renders as you type. Mermaid diagrams, tables and task lists included.
+Source, split, preview or a live view that renders as you type. Mermaid diagrams, tables, task lists and front matter as a Properties panel.
 </td>
 <td width="50%" valign="top">
-<img src="docs/images/notebook.png" alt="The notebook sidebar with a note open"><br>
+<img src="docs/images/notebook.png" alt="Two notebooks in the sidebar and a note open in Live view"><br>
 <b>Notes and notebooks</b><br>
-Any folder becomes a notebook. Plain files, <code>[[wikilinks]]</code>, <code>#tags</code>, backlinks and daily notes.
+Any folder becomes a notebook, and several open side by side. Plain files, <code>[[wikilinks]]</code>, <code>#tags</code>, backlinks and daily notes.
 </td>
 </tr>
 <tr>
@@ -75,16 +75,28 @@ Every command and setting, a few keystrokes away.
 Validate and format JSON; highlighting for Rust, Python, C#, YAML, PowerShell and more.
 </td>
 <td width="50%" valign="top">
-<img src="docs/images/themes.png" alt="Light, dark and Catppuccin themes"><br>
+<img src="docs/images/themes.png" alt="Light, Dark, Catppuccin Mocha and Paper themes"><br>
 <b>Themes</b><br>
 Light, dark, system, Catppuccin and Paper/Lamp, with day/night switching.
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<img src="docs/images/fastdraw.png" alt="A FastDraw diagram's text beside its drawing"><br>
+<b>Diagrams as text</b><br>
+<code>.fdraw</code> files draw as you type, offline, and show up inside your notes.
+</td>
+<td width="50%" valign="top">
+<img src="docs/images/image-preview.png" alt="An SVG's source beside its rendered preview"><br>
+<b>Images and SVG</b><br>
+Zoom and pan pictures; SVGs open as text with the drawing beside them.
 </td>
 </tr>
 </table>
 
 **And also:** quick capture from anywhere (`Ctrl+Alt+N`) · paste screenshots straight into notes ·
-picks up changes made by other programs or AI agents · session restore · image and SVG preview ·
-encodings preserved · safe atomic saves.
+select many notes and move them in one go · picks up changes made by other programs or AI agents ·
+session restore · read-only mode · encodings preserved · safe atomic saves.
 
 → **[Read the full feature guide](docs/features.md)**
 
