@@ -49,7 +49,11 @@ pub fn classify_link(dest: &str, document_dir: Option<&Path>) -> LinkAction {
 }
 
 pub fn resolve_image_path(dest: &str, document_dir: Option<&Path>) -> Option<PathBuf> {
-    local_path(dest.trim(), document_dir)
+    let dest = dest.trim();
+    if is_absolute_local_dest(dest) {
+        return None;
+    }
+    local_path(dest, document_dir)
 }
 
 fn local_path(dest: &str, document_dir: Option<&Path>) -> Option<PathBuf> {
@@ -72,6 +76,14 @@ fn local_path(dest: &str, document_dir: Option<&Path>) -> Option<PathBuf> {
     } else {
         Some(document_dir?.join(path))
     }
+}
+
+/// Absolute paths from note text are not auto-loaded as images (same-user file disclosure).
+/// Relative `../` stays allowed so vault layouts such as Obsidian `../attachments/` keep working.
+fn is_absolute_local_dest(dest: &str) -> bool {
+    let without_suffix = dest.split(['#', '?']).next().unwrap_or_default();
+    let normalized = percent_decode(without_suffix).replace('/', "\\");
+    PathBuf::from(normalized).is_absolute()
 }
 
 /// Whether the HTML sanitizer keeps a link or image reference: web and mail links, fragments, and
@@ -273,6 +285,11 @@ mod tests {
             resolve_image_path("img/a%20b.png", Some(&dir)),
             Some(PathBuf::from(r"C:\docs\img\a b.png"))
         );
+        assert_eq!(
+            resolve_image_path("../attachments/a.png", Some(&dir)),
+            Some(dir.join(r"..\attachments\a.png"))
+        );
+        assert_eq!(resolve_image_path(r"C:\secrets\a.png", Some(&dir)), None);
         assert_eq!(resolve_image_path("https://x.dev/a.png", Some(&dir)), None);
         assert_eq!(
             resolve_image_path("data:image/png;base64,AAAA", Some(&dir)),
