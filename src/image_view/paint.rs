@@ -327,7 +327,7 @@ fn draw_toolbar(
         };
         let (text, format) = if button == Button::Percent {
             (
-                format!("{}%", (state.scale * 100.0).round() as u32),
+                format!("{}%", (super::zoom_level(state) * 100.0).round() as u32),
                 state.body_format.as_ref(),
             )
         } else {

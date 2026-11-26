@@ -434,7 +434,7 @@ impl ImageView {
     fn zoom_by(&self, step: fn(f32) -> f32) {
         self.with(|state| {
             let (width, height) = client_size(state.hwnd);
-            let new = step(state.scale);
+            let new = step(zoom_level(state));
             set_zoom(state, Zoom::Scale(new), (width / 2.0, height / 2.0));
         });
         finish(self.hwnd);
@@ -674,7 +674,7 @@ fn status_of(state: &ViewState) -> ImageViewStatus {
             .as_ref()
             .map(|image| (image.natural_width, image.natural_height)),
         format: state.image.as_ref().map(|image| image.format),
-        zoom_percent: ready.then(|| (state.scale * 100.0).round() as u32),
+        zoom_percent: ready.then(|| (zoom_level(state) * 100.0).round() as u32),
         failed: state.error.is_some(),
     }
 }
@@ -1099,6 +1099,21 @@ fn accept_rendered(state: &mut ViewState, rendered: Rendered) {
     refresh_vector(state);
 }
 
+/// The device pixels one picture unit takes at 100%: a photo's 100% is its own pixels, while an
+/// SVG's or a diagram's units are points, so it is the display scale, as a browser draws them.
+fn unit(state: &ViewState) -> f32 {
+    if shows_vector(state) {
+        dpi_scale(state.hwnd)
+    } else {
+        1.0
+    }
+}
+
+/// The zoom as people read it (1.0 = 100%): `scale` over `unit`.
+fn zoom_level(state: &ViewState) -> f32 {
+    state.scale / unit(state)
+}
+
 /// Applies the zoom to the current client size: sets `scale` and clamps `offset`.
 fn recompute(state: &mut ViewState) {
     let Some(image) = &state.image else {
@@ -1106,11 +1121,7 @@ fn recompute(state: &mut ViewState) {
     };
     let natural = (image.natural_width as f32, image.natural_height as f32);
     let (width, height) = client_size(state.hwnd);
-    state.scale = match state.zoom {
-        Zoom::Fit => zoom::fit_scale(natural, (width, height)),
-        Zoom::FillWidth => zoom::fill_width_scale(natural, (width, height)),
-        Zoom::Scale(scale) => scale,
-    };
+    state.scale = zoom::device_scale(state.zoom, natural, (width, height), unit(state));
     state.offset = (
         zoom::clamp_axis(state.offset.0, natural.0 * state.scale, width),
         zoom::clamp_axis(state.offset.1, natural.1 * state.scale, height),
@@ -1147,11 +1158,7 @@ fn recompute_scale_only(state: &mut ViewState) {
         return;
     };
     let natural = (image.natural_width as f32, image.natural_height as f32);
-    state.scale = match state.zoom {
-        Zoom::Fit => zoom::fit_scale(natural, client_size(state.hwnd)),
-        Zoom::FillWidth => zoom::fill_width_scale(natural, client_size(state.hwnd)),
-        Zoom::Scale(scale) => scale,
-    };
+    state.scale = zoom::device_scale(state.zoom, natural, client_size(state.hwnd), unit(state));
 }
 
 /// The image's displayed size in client pixels, or `None` with nothing to show.
@@ -1209,7 +1216,10 @@ fn accessible_texts(state: &ViewState) -> (String, String) {
                 "{name}, image, {} by {} pixels",
                 image.natural_width, image.natural_height
             ),
-            format!("Zoom {} percent", (state.scale * 100.0).round() as u32),
+            format!(
+                "Zoom {} percent",
+                (zoom_level(state) * 100.0).round() as u32
+            ),
         ),
         (None, None) if state.loading => (format!("{name}, image, loading"), String::new()),
         (None, None) => (format!("{name}, image"), String::new()),
@@ -1509,9 +1519,9 @@ unsafe extern "system" fn image_proc(
                 unsafe { ScreenToClient(hwnd, &mut point) };
                 with_state(hwnd, |state| {
                     let new = if delta > 0.0 {
-                        zoom::step_in(state.scale)
+                        zoom::step_in(zoom_level(state))
                     } else {
-                        zoom::step_out(state.scale)
+                        zoom::step_out(zoom_level(state))
                     };
                     set_zoom(state, Zoom::Scale(new), (point.x as f32, point.y as f32));
                 });
@@ -1634,9 +1644,9 @@ unsafe extern "system" fn image_proc(
                 let out = (wparam as u32) & MK_CONTROL != 0;
                 with_state(hwnd, |state| {
                     let new = if out {
-                        zoom::step_out(state.scale)
+                        zoom::step_out(zoom_level(state))
                     } else {
-                        zoom::step_in(state.scale)
+                        zoom::step_in(zoom_level(state))
                     };
                     set_zoom(state, Zoom::Scale(new), (x as f32, y as f32));
                 });

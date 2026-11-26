@@ -1223,3 +1223,21 @@ fn a_double_click_on_a_diagram_keeps_the_first_click_line() {
     pump_pending();
     assert_eq!(selection(&main), line_range(&main, 1));
 }
+
+#[test]
+fn a_diagram_at_100_percent_takes_a_point_per_unit_and_reads_100() {
+    // Break caught: a diagram at 100% drawn one unit per physical pixel, smaller than VS Code
+    // and a browser draw it on a scaled display, or the label reading the display scale.
+    use image_view::zoom::Zoom;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-points", TWO_BOXES);
+    view.set_zoom(Zoom::Scale(1.0));
+    pump_pending();
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(view.hwnd()) } as f32 / 96.0;
+    assert!((view.stats().scale - dpi).abs() < 1e-4, "{} vs {dpi}", view.stats().scale);
+    assert_eq!(view.status().zoom_percent, Some(100));
+    view.zoom_in();
+    assert_eq!(view.zoom(), Zoom::Scale(1.5));
+    assert_eq!(view.status().zoom_percent, Some(150));
+}

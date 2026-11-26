@@ -165,7 +165,7 @@ pub(crate) fn open_picker(hwnd: HWND) {
                 Zoom::FillWidth => {
                     1 + nearest(
                         &picture_percents(),
-                        (view.stats().scale * 100.0).round() as u32,
+                        view.status().zoom_percent.unwrap_or(100),
                     )
                 }
                 Zoom::Scale(scale) => {

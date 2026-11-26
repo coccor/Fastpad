@@ -31,6 +31,20 @@ pub fn fill_width_scale(image: (f32, f32), view: (f32, f32)) -> f32 {
     (view.0 / image.0).clamp(STEPS[0] / 100.0, STEPS[STEPS.len() - 1])
 }
 
+/// The device pixels per picture unit that `zoom` asks for. `unit` is the device pixels one
+/// unit takes at 100%: 1 for a photo, whose 100% is its own pixels, and the display scale for a
+/// drawing (SVG, diagram), whose units are points as a browser draws them. Fit's 100% cap and the
+/// zoom steps are in those 100%s.
+pub fn device_scale(zoom: Zoom, natural: (f32, f32), view: (f32, f32), unit: f32) -> f32 {
+    let shown = (natural.0 * unit, natural.1 * unit);
+    let level = match zoom {
+        Zoom::Fit => fit_scale(shown, view),
+        Zoom::FillWidth => fill_width_scale(shown, view),
+        Zoom::Scale(scale) => scale,
+    };
+    level * unit
+}
+
 pub fn step_in(current: f32) -> f32 {
     STEPS
         .iter()
@@ -123,6 +137,41 @@ mod tests {
         assert_eq!(clamp_axis(-5000.0, 2000.0, 800.0), -1200.0);
         assert_eq!(clamp_axis(300.0, 2000.0, 800.0), 0.0);
         assert_eq!(clamp_axis(-40.0, 200.0, 800.0), 300.0);
+    }
+
+    #[test]
+    fn a_drawing_at_100_percent_takes_one_point_per_unit_on_a_scaled_display() {
+        // Break caught: diagrams and SVGs drawn at 80% of their size on a 125% display, because
+        // 100% meant one unit per physical pixel as it does for photos.
+        let view = (2000.0, 1500.0);
+        assert_eq!(
+            device_scale(Zoom::Scale(1.0), (200.0, 100.0), view, 1.25),
+            1.25
+        );
+        assert_eq!(
+            device_scale(Zoom::Scale(2.0), (200.0, 100.0), view, 1.25),
+            2.5
+        );
+        // Fit stops at 100%, which is now a point per unit.
+        assert_eq!(device_scale(Zoom::Fit, (200.0, 100.0), view, 1.25), 1.25);
+        // A large drawing still fits the view exactly.
+        assert_eq!(device_scale(Zoom::Fit, (4000.0, 1000.0), view, 1.25), 0.5);
+        // Fill makes the drawing exactly as wide as the view.
+        assert_eq!(
+            device_scale(Zoom::FillWidth, (500.0, 100.0), view, 1.25),
+            4.0
+        );
+    }
+
+    #[test]
+    fn a_photo_keeps_one_pixel_per_screen_pixel() {
+        // Break caught: a photo at 100% blurred up to the display scale.
+        let view = (2000.0, 1500.0);
+        assert_eq!(
+            device_scale(Zoom::Scale(1.0), (200.0, 100.0), view, 1.0),
+            1.0
+        );
+        assert_eq!(device_scale(Zoom::Fit, (200.0, 100.0), view, 1.0), 1.0);
     }
 
     #[test]
