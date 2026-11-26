@@ -10,7 +10,8 @@ use windows::Win32::Graphics::Direct2D::Common::{
 use windows::Win32::Graphics::Direct2D::{
     D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_BRUSH_PROPERTIES,
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-    D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_EXTEND_MODE_WRAP, ID2D1RenderTarget,
+    D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_EXTEND_MODE_WRAP, D2D1_ROUNDED_RECT,
+    ID2D1RenderTarget,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL,
@@ -256,6 +257,89 @@ fn draw_marks(
     Ok(())
 }
 
+/// The toolbar's icon size in device-independent pixels.
+const ICON_SIZE: f32 = 14.0;
+
+/// The diagram toolbar in the view's top-right corner: a rounded strip, the zoom mode in use shown
+/// pressed, the hovered and pressed buttons tinted, and the percent as text.
+fn draw_toolbar(
+    state: &mut ViewState,
+    target: &ID2D1RenderTarget,
+    width: f32,
+    dpi: f32,
+) -> windows::core::Result<()> {
+    use super::toolbar::{Button, glyph, layout, strip};
+    if state.icon_format.is_none() {
+        let format = state
+            .graphics
+            .text_format(
+                crate::window::design::faces::current().icons,
+                ICON_SIZE * dpi,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+            )
+            .map_err(com_error)?;
+        unsafe {
+            format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+        }
+        state.icon_format = Some(format);
+    }
+    if state.body_format.is_none() {
+        state.body_format = Some(text_format(state, DWRITE_FONT_WEIGHT_NORMAL)?);
+    }
+    let colors = state.colors;
+    let radius = 4.0 * dpi;
+    let rounded = |rect: RectF| D2D1_ROUNDED_RECT {
+        rect: rect.to_d2d(),
+        radiusX: radius,
+        radiusY: radius,
+    };
+    let back = strip(width, dpi);
+    unsafe {
+        let fill_brush = target.CreateSolidColorBrush(&color_f(colors.background), None)?;
+        let border = target.CreateSolidColorBrush(&color_f(colors.border), None)?;
+        target.FillRoundedRectangle(&rounded(back), &fill_brush);
+        target.DrawRoundedRectangle(&rounded(back), &border, dpi, None);
+    }
+    for (button, rect) in layout(width, dpi) {
+        let on = matches!(
+            (button, state.zoom),
+            (Button::Fit, super::Zoom::Fit) | (Button::Fill, super::Zoom::FillWidth)
+        );
+        let tint = if state.bar.pressed == Some(button) || on {
+            Some(colors.selection)
+        } else if state.bar.hovered == Some(button) {
+            Some(colors.code_background)
+        } else {
+            None
+        };
+        if let Some(tint) = tint {
+            unsafe {
+                let brush = target.CreateSolidColorBrush(&color_f(tint), None)?;
+                target.FillRoundedRectangle(&rounded(rect), &brush);
+            }
+        }
+        let ink = if on {
+            colors.selection_text
+        } else {
+            colors.text
+        };
+        let (text, format) = if button == Button::Percent {
+            (
+                format!("{}%", (state.scale * 100.0).round() as u32),
+                state.body_format.as_ref(),
+            )
+        } else {
+            (glyph(button).to_owned(), state.icon_format.as_ref())
+        };
+        if let Some(format) = format {
+            draw_text(target, &text, format, rect, ink)?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn paint(state: &mut ViewState) -> windows::core::Result<()> {
     let hwnd = state.hwnd;
     let (width, height) = client_size(hwnd);
@@ -392,6 +476,9 @@ pub(super) fn paint(state: &mut ViewState) -> windows::core::Result<()> {
                 state.colors.text,
             )?;
         }
+    }
+    if super::shows_toolbar(state) {
+        draw_toolbar(state, &target, width, scale)?;
     }
     if focused(hwnd) {
         let ring = RectF::new(1.5, 1.5, width - 1.5, height - 1.5);

@@ -1050,3 +1050,82 @@ fn w_does_nothing_on_a_plain_image() {
     pump_pending();
     assert_eq!(view.zoom(), Zoom::Fit);
 }
+
+// ---- FastDraw: the diagram toolbar ----
+
+fn press(view: image_view::ImageView, button: image_view::toolbar::Button) {
+    click_at(view, view.button_point(button));
+    pump_pending();
+}
+
+#[test]
+fn the_toolbar_buttons_set_the_zoom() {
+    // Break caught: a button doing another's job, or Percent not returning to 100%.
+    use image_view::toolbar::Button;
+    use image_view::zoom::Zoom;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-toolbar", TWO_BOXES);
+    press(view, Button::Fill);
+    assert_eq!(view.zoom(), Zoom::FillWidth);
+    press(view, Button::Fit);
+    assert_eq!(view.zoom(), Zoom::Fit);
+    press(view, Button::Percent);
+    assert_eq!(view.zoom(), Zoom::Scale(1.0));
+    press(view, Button::ZoomIn);
+    assert_eq!(view.zoom(), Zoom::Scale(1.5));
+    press(view, Button::ZoomOut);
+    press(view, Button::ZoomOut);
+    assert_eq!(view.zoom(), Zoom::Scale(0.67));
+}
+
+#[test]
+fn the_open_button_opens_the_diagram_in_fastdraw() {
+    // Break caught: the button moved off the top toolbar but wired to nothing.
+    use image_view::toolbar::Button;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-toolbar-open", TWO_BOXES);
+    let _ = window::preview_host::take_opened();
+    press(view, Button::OpenInFastDraw);
+    pump_pending();
+    let opened = window::preview_host::take_opened();
+    assert_eq!(opened.len(), 1, "{opened:?}");
+    assert!(opened[0].contains("fastdraw.dev"), "{opened:?}");
+}
+
+#[test]
+fn a_toolbar_click_does_not_reach_the_diagram() {
+    // Break caught: pressing Fit over a box also selecting the box's line, or starting a pan.
+    use crate::preview::ViewMode;
+    use image_view::toolbar::Button;
+    use image_view::zoom::Zoom;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let one = "a: rect \"A\" at 0,0\n";
+    let view = open_drawn(&main, "fdraw-toolbar-over", one);
+    // At 16x the one box covers the whole view, the toolbar's corner included.
+    view.set_zoom(Zoom::Scale(16.0));
+    pump_pending();
+    let at = view.button_point(Button::Fit);
+    assert_eq!(view.hit_line(at), Some(1), "the box lies under the button");
+    press(view, Button::Fit);
+    assert_eq!(view.zoom(), Zoom::Fit);
+    assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Preview);
+}
+
+#[test]
+fn a_plain_image_has_no_toolbar() {
+    // Break caught: the diagram's toolbar swallowing clicks on photos.
+    use image_view::toolbar::Button;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let dir = scratch("toolbar-bmp");
+    let path = dir.join("small.bmp");
+    write_bmp(&path, 64, 32);
+    main.open(&path).unwrap();
+    let view = main.image_view();
+    assert_eq!(main.wait_ready().scale, 1.0);
+    click_at(view, view.button_point(Button::Fit));
+    assert_eq!(view.stats().scale, 1.5, "the click zooms as on any image");
+}

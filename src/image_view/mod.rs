@@ -10,6 +10,7 @@ mod cursor;
 pub mod decode;
 pub(crate) mod effects;
 mod paint;
+pub mod toolbar;
 mod vector;
 pub mod zoom;
 
@@ -36,25 +37,26 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Graphics::Gdi::{InvalidateRect, ScreenToClient, ValidateRect};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Accessibility::NotifyWinEvent;
-use windows_sys::Win32::UI::Controls::SetScrollInfo;
+use windows_sys::Win32::UI::Controls::{SetScrollInfo, WM_MOUSELEAVE};
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_DOWN, VK_END,
-    VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_UP,
+    GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT,
+    TrackMouseEvent, VK_CONTROL, VK_DOWN, VK_END, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RIGHT,
+    VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CHILDID_SELF, CS_DBLCLKS, CreateWindowExW, DLGC_WANTARROWS, DefWindowProcW, DestroyWindow,
     EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_VALUECHANGE, GWLP_USERDATA, GetClientRect, GetCursorPos,
-    GetScrollInfo, GetSystemMetrics, GetWindowLongPtrW, HCURSOR, HTCLIENT, IDC_ARROW, IDC_SIZEALL,
-    KillTimer, LoadCursorW, MSG, OBJID_CLIENT, PM_REMOVE, PeekMessageW, PostMessageW,
+    GetScrollInfo, GetSystemMetrics, GetWindowLongPtrW, HCURSOR, HTCLIENT, IDC_ARROW, IDC_HAND,
+    IDC_SIZEALL, KillTimer, LoadCursorW, MSG, OBJID_CLIENT, PM_REMOVE, PeekMessageW, PostMessageW,
     PostQuitMessage, RegisterClassW, SB_BOTTOM, SB_HORZ, SB_LINEDOWN, SB_LINEUP, SB_PAGEDOWN,
     SB_PAGEUP, SB_THUMBPOSITION, SB_THUMBTRACK, SB_TOP, SB_VERT, SCROLLINFO, SIF_PAGE, SIF_POS,
     SIF_RANGE, SIF_TRACKPOS, SM_CXDRAG, SM_CYDRAG, SetCursor, SetTimer, SetWindowLongPtrW,
-    WM_CAPTURECHANGED, WM_DPICHANGED_AFTERPARENT, WM_ERASEBKGND, WM_GETDLGCODE, WM_GETOBJECT,
-    WM_HSCROLL, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_QUIT, WM_SETCURSOR,
-    WM_SETFOCUS, WM_SIZE, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS, WS_HSCROLL,
-    WS_TABSTOP, WS_VSCROLL, WindowFromPoint,
+    WM_CAPTURECHANGED, WM_COMMAND, WM_DPICHANGED_AFTERPARENT, WM_ERASEBKGND, WM_GETDLGCODE,
+    WM_GETOBJECT, WM_HSCROLL, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_QUIT,
+    WM_SETCURSOR, WM_SETFOCUS, WM_SIZE, WM_TIMER, WM_VSCROLL, WNDCLASSW, WS_CHILD, WS_CLIPSIBLINGS,
+    WS_HSCROLL, WS_TABSTOP, WS_VSCROLL, WindowFromPoint,
 };
 use zoom::Zoom;
 
@@ -176,6 +178,10 @@ struct ViewState {
     hits_fresh: bool,
     /// The 1-based line whose diagram elements are outlined.
     marked_line: Option<u32>,
+    /// The pointer over the diagram toolbar, and its tooltip.
+    bar: toolbar::Pointer,
+    /// The toolbar's icon font, made at its first paint.
+    icon_format: Option<IDWriteTextFormat>,
     max_side: u32,
     decodes: u32,
     paint_retried: bool,
@@ -241,6 +247,8 @@ impl ImageView {
             moved: false,
             hits_fresh: false,
             marked_line: None,
+            bar: toolbar::Pointer::default(),
+            icon_format: None,
             max_side: DEFAULT_MAX_SIDE,
             decodes: 0,
             paint_retried: false,
@@ -375,6 +383,7 @@ impl ImageView {
             drop_device_resources(state);
             state.title_format = None;
             state.body_format = None;
+            state.icon_format = None;
             state.drag = None;
             state.press = None;
             state.tile_timer = false;
@@ -496,6 +505,22 @@ impl ImageView {
             _ => None,
         })
         .flatten()
+    }
+
+    /// The centre of the diagram toolbar's `button`, in client pixels.
+    #[cfg(test)]
+    pub fn button_point(&self, button: toolbar::Button) -> (i32, i32) {
+        let (width, _) = client_size(self.hwnd);
+        toolbar::layout(width, dpi_scale(self.hwnd))
+            .into_iter()
+            .find(|(b, _)| *b == button)
+            .map(|(_, rect)| {
+                (
+                    ((rect.left + rect.right) / 2.0) as i32,
+                    ((rect.top + rect.bottom) / 2.0) as i32,
+                )
+            })
+            .unwrap_or_default()
     }
 
     /// Where scene point `scene` of the shown diagram is drawn, in client pixels.
@@ -729,6 +754,124 @@ fn schedule_tile(state: &mut ViewState) {
     if !state.tile_timer && shows_vector(state) && wanted_tile(state).is_some() {
         state.tile_timer = true;
         unsafe { SetTimer(state.hwnd, TILE_TIMER, TILE_DELAY_MS, None) };
+    }
+}
+
+/// Whether the view shows the diagram toolbar: on a FastDraw diagram, never on an image or SVG.
+fn shows_toolbar(state: &ViewState) -> bool {
+    matches!(state.shown, Some(Shown::FastDraw { .. }))
+}
+
+/// Whether client point `point` is on the diagram toolbar, while it shows.
+fn on_toolbar(state: &ViewState, point: (i32, i32)) -> bool {
+    shows_toolbar(state)
+        && toolbar::on_strip(
+            client_size(state.hwnd).0,
+            dpi_scale(state.hwnd),
+            (point.0 as f32, point.1 as f32),
+        )
+}
+
+/// The toolbar button under client point `point`, while the toolbar shows.
+fn toolbar_button(state: &ViewState, point: (i32, i32)) -> Option<toolbar::Button> {
+    shows_toolbar(state)
+        .then(|| {
+            toolbar::button_at(
+                client_size(state.hwnd).0,
+                dpi_scale(state.hwnd),
+                (point.0 as f32, point.1 as f32),
+            )
+        })
+        .flatten()
+}
+
+/// Does what toolbar `button` does. Open in FastDraw is the main window's command, which reads the
+/// diagram's text from its editor.
+fn press_toolbar(hwnd: HWND, button: toolbar::Button) {
+    use toolbar::Button;
+    let zoom = match button {
+        Button::Fit => Some(Zoom::Fit),
+        Button::Fill => Some(Zoom::FillWidth),
+        Button::Percent => Some(Zoom::Scale(1.0)),
+        Button::ZoomIn | Button::ZoomOut => None,
+        Button::OpenInFastDraw => {
+            unsafe {
+                PostMessageW(
+                    crate::platform::win32::root_window(hwnd),
+                    WM_COMMAND,
+                    crate::window::commands::CommandId::OpenInFastDraw as usize,
+                    0,
+                )
+            };
+            return;
+        }
+    };
+    let view = ImageView { hwnd };
+    match (zoom, button) {
+        (Some(zoom), _) => view.set_zoom(zoom),
+        (None, Button::ZoomIn) => view.zoom_in(),
+        (None, _) => view.zoom_out(),
+    }
+}
+
+/// Follows the pointer over the toolbar: the hovered button, the leave tracking that clears it,
+/// and the tooltip, made at the first hover and laid out again when the view's width changes.
+fn track_toolbar(hwnd: HWND, point: (i32, i32), message: u32, wparam: WPARAM, lparam: LPARAM) {
+    let Some((changed, track, tooltip)) = with_state(hwnd, |state| {
+        let hovered = if state.press.is_some() {
+            None
+        } else {
+            toolbar_button(state, point)
+        };
+        let changed = std::mem::replace(&mut state.bar.hovered, hovered) != hovered;
+        let track = shows_toolbar(state) && !state.bar.tracking;
+        state.bar.tracking |= track;
+        let width = client_size(hwnd).0;
+        let wanted = shows_toolbar(state)
+            && !state.bar.tooltip_failed
+            && (state.bar.tooltip.is_none() || state.bar.tooltip_width != width);
+        (changed, track, wanted.then_some(width))
+    }) else {
+        return;
+    };
+    if track {
+        let mut leave = TRACKMOUSEEVENT {
+            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: hwnd,
+            dwHoverTime: 0,
+        };
+        unsafe { TrackMouseEvent(&mut leave) };
+    }
+    if let Some(width) = tooltip {
+        // Made with no state borrowed: creating the control sends messages.
+        let existing = with_state(hwnd, |state| state.bar.tooltip).flatten();
+        let made = existing.or_else(|| crate::window::tooltip::Tooltip::create(hwnd));
+        with_state(hwnd, |state| {
+            state.bar.tooltip = made;
+            state.bar.tooltip_failed = made.is_none();
+            state.bar.tooltip_width = width;
+        });
+        if let Some(tip) = made {
+            for (index, (button, rect)) in toolbar::layout(width, dpi_scale(hwnd))
+                .into_iter()
+                .enumerate()
+            {
+                let rect = windows_sys::Win32::Foundation::RECT {
+                    left: rect.left as i32,
+                    top: rect.top as i32,
+                    right: rect.right as i32,
+                    bottom: rect.bottom as i32,
+                };
+                tip.set_tool(index, rect, toolbar::tooltip(button));
+            }
+            if existing.is_none() {
+                tip.relay(message, wparam, lparam);
+            }
+        }
+    }
+    if changed {
+        invalidate(hwnd);
     }
 }
 
@@ -1177,7 +1320,12 @@ unsafe extern "system" fn image_proc(
         WM_NCDESTROY => {
             let pointer = unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) } as *mut ViewState;
             if !pointer.is_null() {
-                drop(unsafe { Box::from_raw(pointer) });
+                let state = unsafe { Box::from_raw(pointer) };
+                // A child window's tooltip popup is not destroyed with it.
+                if let Some(tooltip) = state.bar.tooltip {
+                    tooltip.destroy();
+                }
+                drop(state);
             }
             // A decode that landed after the last message was read would leak its pixels.
             let mut queued = MSG::default();
@@ -1265,6 +1413,7 @@ unsafe extern "system" fn image_proc(
             with_state(hwnd, |state| {
                 state.title_format = None;
                 state.body_format = None;
+                state.icon_format = None;
                 recompute(state);
             });
             finish(hwnd);
@@ -1346,15 +1495,30 @@ unsafe extern "system" fn image_proc(
             unsafe { SetFocus(hwnd) };
             let point = point_from(lparam);
             with_state(hwnd, |state| {
+                // A press on the diagram toolbar is the button's alone: it starts no click or pan.
+                if on_toolbar(state, point) {
+                    state.bar.pressed = toolbar_button(state, point);
+                    return;
+                }
                 state.press = Some(point);
                 state.moved = false;
                 state.drag = draggable(state).then_some((point, state.offset));
             });
             unsafe { SetCapture(hwnd) };
+            invalidate(hwnd);
+            0
+        }
+        WM_MOUSELEAVE => {
+            with_state(hwnd, |state| {
+                state.bar.tracking = false;
+                state.bar.hovered = None;
+            });
+            invalidate(hwnd);
             0
         }
         WM_MOUSEMOVE => {
             let (x, y) = point_from(lparam);
+            track_toolbar(hwnd, (x, y), message, wparam, lparam);
             let slop = drag_slop();
             let (panned, started) = with_state(hwnd, |state| {
                 let Some((press_x, press_y)) = state.press else {
@@ -1384,6 +1548,22 @@ unsafe extern "system" fn image_proc(
         }
         WM_LBUTTONUP => {
             let (x, y) = point_from(lparam);
+            // A toolbar button acts when released over the button it was pressed on.
+            let pressed =
+                with_state(hwnd, |state| {
+                    state.bar.pressed.take().map(|button| {
+                        (toolbar_button(state, (x, y)) == Some(button)).then_some(button)
+                    })
+                })
+                .flatten();
+            if let Some(released) = pressed {
+                unsafe { ReleaseCapture() };
+                if let Some(button) = released {
+                    press_toolbar(hwnd, button);
+                }
+                invalidate(hwnd);
+                return 0;
+            }
             let clicked = with_state(hwnd, |state| {
                 let clicked = state.press.take().is_some() && !state.moved;
                 state.drag = None;
@@ -1429,6 +1609,7 @@ unsafe extern "system" fn image_proc(
                 state.drag = None;
                 state.press = None;
                 state.moved = false;
+                state.bar.pressed = None;
             });
             0
         }
@@ -1515,19 +1696,32 @@ unsafe extern "system" fn image_proc(
 /// The pointer over the view: the move arrows while a press pans, the magnifier over a picture
 /// (a minus while Ctrl is down), else the arrow.
 fn pointer(hwnd: HWND) -> HCURSOR {
-    let (panning, ready) = with_state(hwnd, |state| {
+    let (panning, ready, diagram) = with_state(hwnd, |state| {
         (
             state.moved && state.drag.is_some(),
             phase(state) == Phase::Ready,
+            shows_toolbar(state),
         )
     })
-    .unwrap_or((false, false));
+    .unwrap_or((false, false, false));
     let stock = |id| unsafe { LoadCursorW(std::ptr::null_mut(), id) };
     if panning {
         return stock(IDC_SIZEALL);
     }
     if !ready {
         return stock(IDC_ARROW);
+    }
+    // A diagram's click finds an element's line instead of zooming: a hand over an element, an
+    // arrow elsewhere and over the toolbar.
+    if diagram {
+        let mut point = POINT { x: 0, y: 0 };
+        unsafe {
+            GetCursorPos(&mut point);
+            ScreenToClient(hwnd, &mut point);
+        }
+        let over = with_state(hwnd, |state| on_toolbar(state, (point.x, point.y))).unwrap_or(true);
+        let element = !over && (ImageView { hwnd }).hit_line((point.x, point.y)).is_some();
+        return stock(if element { IDC_HAND } else { IDC_ARROW });
     }
     let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL)) } < 0;
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
