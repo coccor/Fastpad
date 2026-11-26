@@ -1235,7 +1235,11 @@ fn a_diagram_at_100_percent_takes_a_point_per_unit_and_reads_100() {
     view.set_zoom(Zoom::Scale(1.0));
     pump_pending();
     let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(view.hwnd()) } as f32 / 96.0;
-    assert!((view.stats().scale - dpi).abs() < 1e-4, "{} vs {dpi}", view.stats().scale);
+    assert!(
+        (view.stats().scale - dpi).abs() < 1e-4,
+        "{} vs {dpi}",
+        view.stats().scale
+    );
     assert_eq!(view.status().zoom_percent, Some(100));
     view.zoom_in();
     assert_eq!(view.zoom(), Zoom::Scale(1.5));
