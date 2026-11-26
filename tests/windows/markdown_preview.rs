@@ -1409,3 +1409,30 @@ fn a_resize_keeps_the_selection_and_an_edit_clears_it() {
         || view.selection().is_none(),
     );
 }
+
+#[test]
+fn typing_a_query_shades_its_matches_in_the_preview() {
+    // Break caught: the find bar's matches never reaching the preview when the query is typed
+    // into the bar and counted on its timer, or Enter not moving the preview's current match,
+    // with the preview showing alone (#127).
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    main.make_markdown("alpha beta\n\nalpha gamma\n");
+    main.command(CommandId::MarkdownViewPreview);
+    let view = main.view().unwrap();
+    pump_until("initial render", Duration::from_secs(3), || {
+        view.stats().block_count == 2
+    });
+    main.command(CommandId::Find);
+    let query = main.with_app(|app| app.find_bar().unwrap().query_hwnd());
+    type_text(query, "alpha");
+    // The count waits for a pause in typing, then reaches the preview.
+    pump_until("the preview's matches", Duration::from_secs(3), || {
+        view.find_hits().0.len() == 2
+    });
+    assert_eq!(view.find_hits().1, None);
+    unsafe { SendMessageW(query, WM_KEYDOWN, VK_RETURN as usize, 0) };
+    pump_until("the current match", Duration::from_secs(3), || {
+        view.find_hits().1 == Some(0)
+    });
+}
