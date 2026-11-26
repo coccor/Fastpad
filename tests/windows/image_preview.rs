@@ -1129,3 +1129,97 @@ fn a_plain_image_has_no_toolbar() {
     click_at(view, view.button_point(Button::Fit));
     assert_eq!(view.stats().scale, 1.5, "the click zooms as on any image");
 }
+
+// ---- Final review fixes ----
+
+#[test]
+fn an_svg_shown_after_a_diagram_keeps_none_of_its_toolbar_tips() {
+    // Break caught: the diagram toolbar's tooltips left on the group's SVG view, showing
+    // "Fit the whole diagram (F)" over a plain SVG's corner.
+    use image_view::toolbar::Button;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-tips", TWO_BOXES);
+    let (x, y) = view.button_point(Button::Fit);
+    unsafe { SendMessageW(view.hwnd(), WM_MOUSEMOVE, 0, lparam_of(x, y)) };
+    pump_pending();
+    assert!(
+        view.has_toolbar_tooltip(),
+        "hovering the toolbar makes its tips"
+    );
+    let svg = scratch("fdraw-tips-svg").join("p.svg");
+    std::fs::write(
+        &svg,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="40" height="20"/></svg>"#,
+    )
+    .unwrap();
+    main.open(&svg).unwrap();
+    pump_pending();
+    let shown = main
+        .with_app(|app| app.active_group().unwrap().preview.svg_view)
+        .expect("svg view");
+    assert_eq!(shown, view, "the group's one picture view shows the SVG");
+    assert!(shown.diagram_text().is_none(), "the view shows the SVG now");
+    assert!(!shown.has_toolbar_tooltip());
+}
+
+#[test]
+fn an_edit_hides_the_outline_until_its_drawing_lands() {
+    // Break caught: inserting a line above a box leaves the old drawing's lines in force, so the
+    // caret's new line outlines the box that used to be written there.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-mark-stale", TWO_BOXES);
+    main.command(CommandId::MarkdownViewSplit);
+    caret_to_line(&main, 1);
+    pump_until("line 2 outlined", Duration::from_secs(5), || {
+        view.stats().marked == 1
+    });
+    // B moves to line 3; line 2 is now empty.
+    main.set_text("a: rect \"A\" at 0,0\n\nb: rect \"B\" at 200,0\n");
+    caret_to_line(&main, 1);
+    pump_pending();
+    assert_eq!(
+        view.stats().marked,
+        0,
+        "the old drawing's line 2 is not this text's"
+    );
+    caret_to_line(&main, 2);
+    pump_until(
+        "the new drawing outlines B on line 3",
+        FDRAW_DRAW_TIMEOUT,
+        || {
+            let stats = view.stats();
+            stats.marked_line == Some(3) && stats.marked == 1
+        },
+    );
+}
+
+#[test]
+fn a_double_click_on_a_diagram_keeps_the_first_click_line() {
+    // Break caught: the second press of a double-click landing on the Split layout the first
+    // click made, and selecting whichever element now lies under the pointer.
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONDBLCLK;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-dblclick", TWO_BOXES);
+    click_at(view, view.client_point(centre_of(TWO_BOXES, 2)));
+    pump_pending();
+    assert_eq!(selection(&main), line_range(&main, 1));
+    pump_until("the Split drawing", FDRAW_DRAW_TIMEOUT, || {
+        view.stats().phase == image_view::Phase::Ready
+    });
+    let (x, y) = view.client_point(centre_of(TWO_BOXES, 1));
+    assert_eq!(
+        view.hit_line((x, y)),
+        Some(1),
+        "box A lies under the second press"
+    );
+    unsafe {
+        SendMessageW(view.hwnd(), WM_LBUTTONDBLCLK, 1, lparam_of(x, y));
+        SendMessageW(view.hwnd(), WM_LBUTTONUP, 0, lparam_of(x, y));
+    }
+    pump_pending();
+    assert_eq!(selection(&main), line_range(&main, 1));
+}

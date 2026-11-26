@@ -1209,10 +1209,12 @@ pub(crate) fn record_edit(hwnd: HWND, id: GroupId, notification: &ScintillaNotif
         inserted,
         notification.lines_added,
     );
+    let mut edited_picture = None;
     let recorded = with_group_host(hwnd, id, |host| {
         // The SVG preview renders the whole text again after the pause; it keeps no edit log.
         if host.svg_document.is_some() {
             host.flush_pending = true;
+            edited_picture = host.svg_view;
             return true;
         }
         if host.view.is_none() || host.document.is_none() {
@@ -1223,6 +1225,11 @@ pub(crate) fn record_edit(hwnd: HWND, id: GroupId, notification: &ScintillaNotif
         true
     })
     .unwrap_or(false);
+    // A diagram's drawing no longer matches its text until the pause redraws it: its elements'
+    // lines are the old text's.
+    if let Some(view) = edited_picture {
+        view.diagram_edited();
+    }
     if recorded {
         unsafe { SetTimer(hwnd, PREVIEW_TIMER_ID, PREVIEW_UPDATE_DELAY_MS, None) };
     }

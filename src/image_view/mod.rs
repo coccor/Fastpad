@@ -176,6 +176,8 @@ struct ViewState {
     /// The shown diagram's hits are those of the text last asked for: false from an edit until its
     /// drawing lands, so a click on the old picture never selects a line of the new text.
     hits_fresh: bool,
+    /// The diagram's text was edited since it was last asked to draw it.
+    edited: bool,
     /// The 1-based line whose diagram elements are outlined.
     marked_line: Option<u32>,
     /// The pointer over the diagram toolbar, and its tooltip.
@@ -246,6 +248,7 @@ impl ImageView {
             press: None,
             moved: false,
             hits_fresh: false,
+            edited: false,
             marked_line: None,
             bar: toolbar::Pointer::default(),
             icon_format: None,
@@ -273,9 +276,33 @@ impl ImageView {
         with_state(self.hwnd, action)
     }
 
+    /// Forgets the diagram toolbar's pointer state and destroys its tooltip, whose tips would
+    /// otherwise go on showing over the picture that replaces the diagram.
+    fn drop_toolbar(&self) {
+        let tooltip = self
+            .with(|state| std::mem::take(&mut state.bar).tooltip)
+            .flatten();
+        // Destroyed with nothing of the state borrowed: it sends messages.
+        if let Some(tooltip) = tooltip {
+            tooltip.destroy();
+        }
+    }
+
+    /// The text of the diagram shown changed in its editor: until it is drawn again, the drawing's
+    /// lines are not the text's, so clicks select nothing and nothing is outlined.
+    pub fn diagram_edited(&self) {
+        let changed = self
+            .with(|state| !std::mem::replace(&mut state.edited, true))
+            .unwrap_or(false);
+        if changed {
+            invalidate(self.hwnd);
+        }
+    }
+
     /// Shows the image file at `path`. Asking again for the same file and stamp keeps what is
     /// shown; a new stamp decodes again and keeps the zoom, a new file starts at fit.
     pub fn show_file(&self, path: &Path, stamp: Option<DiskStamp>, name: &str) {
+        self.drop_toolbar();
         self.with(|state| {
             state.name = name.to_owned();
             let wanted = Shown::File {
@@ -306,6 +333,7 @@ impl ImageView {
     /// until the new one lands; a `new_document` starts at fit with nothing shown, so its first
     /// failure shows the failed state rather than another document's picture.
     pub fn show_svg(&self, text: Arc<str>, name: &str, new_document: bool) {
+        self.drop_toolbar();
         self.with(|state| {
             state.name = name.to_owned();
             if !new_document && matches!(&state.shown, Some(Shown::Svg(shown)) if **shown == *text)
@@ -334,6 +362,7 @@ impl ImageView {
     ) {
         self.with(|state| {
             state.name = name.to_owned();
+            state.edited = false;
             if !new_document
                 && matches!(&state.shown, Some(Shown::FastDraw { text: shown, file: shown_file })
                     if **shown == *text && *shown_file == file)
@@ -505,6 +534,13 @@ impl ImageView {
             _ => None,
         })
         .flatten()
+    }
+
+    /// Whether the view holds the diagram toolbar's tooltip control.
+    #[cfg(test)]
+    pub fn has_toolbar_tooltip(&self) -> bool {
+        self.with(|state| state.bar.tooltip.is_some())
+            .unwrap_or(false)
     }
 
     /// The centre of the diagram toolbar's `button`, in client pixels.
@@ -899,7 +935,9 @@ fn diagram_hits(state: &ViewState) -> Option<&crate::preview::fastdraw_hits::Hit
 fn marked_shapes(
     state: &ViewState,
 ) -> impl Iterator<Item = &crate::preview::fastdraw_hits::HitShape> {
-    let hits = state.hits_fresh.then(|| diagram_hits(state)).flatten();
+    let hits = (state.hits_fresh && !state.edited)
+        .then(|| diagram_hits(state))
+        .flatten();
     let line = state.marked_line.unwrap_or(0);
     hits.into_iter()
         .flat_map(move |hits| crate::preview::fastdraw_hits::on_line(hits, line))
@@ -908,7 +946,7 @@ fn marked_shapes(
 /// The line under `client` (pixels), with connectors hit within `tolerance` pixels; `None` while
 /// the picture is an older text's.
 fn hit_line(state: &ViewState, client: (i32, i32), tolerance: f32) -> Option<u32> {
-    if !state.hits_fresh || state.scale <= 0.0 {
+    if !state.hits_fresh || state.edited || state.scale <= 0.0 {
         return None;
     }
     let hits = diagram_hits(state)?;
@@ -1500,7 +1538,10 @@ unsafe extern "system" fn image_proc(
                     state.bar.pressed = toolbar_button(state, point);
                     return;
                 }
-                state.press = Some(point);
+                // On a diagram the first press of a double-click already selected its line and laid
+                // the tab out again: the second, landing on the new layout, is no click.
+                let second = message == WM_LBUTTONDBLCLK && shows_toolbar(state);
+                state.press = (!second).then_some(point);
                 state.moved = false;
                 state.drag = draggable(state).then_some((point, state.offset));
             });
