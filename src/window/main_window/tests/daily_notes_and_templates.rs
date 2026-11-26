@@ -226,6 +226,14 @@ fn a_new_note_from_a_template_fills_it_in_where_the_folder_menu_asked() {
     assert_eq!(std::fs::read_to_string(&bob).unwrap(), text);
     assert_eq!(active_path(window.hwnd).as_deref(), Some(bob.as_path()));
     assert_eq!(caret(&editor), text.len() - 1);
+    app_mut(window.hwnd)
+        .tabs
+        .set_active_language(crate::document::Language::Markdown);
+    assert_eq!(
+        crate::window::preview_host::mode(window.hwnd),
+        crate::preview::ViewMode::Source,
+        "a note just made from a template opens for editing (#126)"
+    );
 }
 
 #[test]

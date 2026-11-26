@@ -29,7 +29,8 @@ pub(crate) fn create_new_document(hwnd: HWND) -> Result<()> {
     };
 
     remember_active_view(hwnd);
-    let document = Document::untitled(id, recovery_id, editor.create_document()?);
+    let mut document = Document::untitled(id, recovery_id, editor.create_document()?);
+    document.for_writing = true;
     document
         .expect_text()
         .and_then(|handle| editor.use_document(handle))?;

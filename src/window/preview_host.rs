@@ -318,13 +318,34 @@ pub(crate) fn group_mode(hwnd: HWND, id: GroupId) -> ViewMode {
             _ => ViewMode::Source,
         }
     });
-    let mode = chosen.unwrap_or(default);
+    let mode = chosen.unwrap_or_else(|| writing_default(hwnd, document, default));
     // The default skips a file over the Live limit silently; a choice was checked when made.
     if available(hwnd, id, language, mode) {
         mode
     } else {
         ViewMode::Source
     }
+}
+
+/// The view a tab opens in when `default` is its language's setting: Source in place of the
+/// preview alone for a note made to be written in (`Document::for_writing`, #126).
+fn default_view(for_writing: bool, default: ViewMode) -> ViewMode {
+    if for_writing && default == ViewMode::Preview {
+        ViewMode::Source
+    } else {
+        default
+    }
+}
+
+/// `default_view` for the tab `document`.
+fn writing_default(hwnd: HWND, document: DocumentId, default: ViewMode) -> ViewMode {
+    let for_writing = unsafe { host_window::app_ptr(hwnd) }.is_some_and(|app| {
+        unsafe { app.as_ref() }
+            .tabs
+            .document(document)
+            .is_some_and(|document| document.for_writing)
+    });
+    default_view(for_writing, default)
 }
 
 /// Whether the FastDraw tab `document` in group `id` has a file and some text.
@@ -414,11 +435,11 @@ pub(crate) fn keep_open_modes(hwnd: HWND, language: Language, default: ViewMode)
             .group_documents(id)
             .into_iter()
             .filter(|document| document.language == language)
-            .map(|document| document.id)
+            .map(|document| (document.id, default_view(document.for_writing, default)))
             .collect::<Vec<_>>();
         if let Some(group) = app.group_mut(id) {
-            for document in matching {
-                group.preview.modes.entry(document).or_insert(default);
+            for (document, shown) in matching {
+                group.preview.modes.entry(document).or_insert(shown);
             }
         }
     }
@@ -727,6 +748,24 @@ pub(crate) fn set_mode(hwnd: HWND, next: ViewMode) {
     if let Some(target) = focus {
         unsafe { SetFocus(target) };
     }
+}
+
+/// The active tab is a note just created to be written in (#126): its default view never shows
+/// the preview alone (`Document::for_writing`). Its language may still be on its way (detection is
+/// deferred), so the flag is what decides, whenever the language arrives. A preview already shown
+/// closes, and the focus it held goes to the editor.
+pub(crate) fn open_for_writing(hwnd: HWND) {
+    let Some(mut app) = (unsafe { host_window::app_ptr(hwnd) }) else {
+        return;
+    };
+    let Some(document) = unsafe { app.as_mut() }.tabs.active_mut() else {
+        return;
+    };
+    document.for_writing = true;
+    if !mode(hwnd).shows_preview() {
+        close_view(hwnd);
+    }
+    sync_visibility(hwnd);
 }
 
 fn close_view(hwnd: HWND) {

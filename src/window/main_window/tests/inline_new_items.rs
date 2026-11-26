@@ -537,6 +537,19 @@ fn enter_on_a_new_note_creates_the_file_and_opens_it_with_focus_in_the_editor() 
     assert_eq!(active.path.as_deref(), Some(todo.as_path()));
     assert!(!active.preview);
     assert_eq!(unsafe { GetFocus() }, editor.hwnd());
+    // Detection makes it Markdown after the open (deferred); with Markdown opening in Preview, the
+    // new note still opens for writing (#126).
+    assert_eq!(
+        app_mut(window.hwnd).settings.markdown_view,
+        crate::preview::ViewMode::Preview
+    );
+    app_mut(window.hwnd)
+        .tabs
+        .set_active_language(crate::document::Language::Markdown);
+    assert_eq!(
+        crate::window::preview_host::mode(window.hwnd),
+        crate::preview::ViewMode::Source
+    );
     row_of(window.hwnd, &RowKind::Note("todo.md".into()));
 
     crate::window::inline_name::new_note(
