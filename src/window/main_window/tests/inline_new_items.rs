@@ -89,7 +89,16 @@ fn new_folder_here_drafts_inside_that_folder_and_a_taken_name_keeps_the_field_op
     let scratch = LibraryScratch::new("inline-new-folder-here");
     std::fs::create_dir_all(scratch.folder().join("sub")).unwrap();
     scratch.note(r"sub\a.md", "a");
-    std::fs::write(scratch.folder().join(r"sub\notes.bin"), "x").unwrap();
+    // Every file is listed but a hidden one (#128).
+    let unlisted = scratch.folder().join(r"sub\notes.bin");
+    std::fs::write(&unlisted, "x").unwrap();
+    let wide = crate::platform::wide_null(&unlisted.to_string_lossy());
+    unsafe {
+        windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(
+            wide.as_ptr(),
+            windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN,
+        );
+    }
     let (window, _editor) = notebook_window(&scratch);
     crate::window::library_host::set_expanded(window.hwnd, std::path::Path::new("sub"), false);
     crate::window::notebook_view::rebuild(window.hwnd);

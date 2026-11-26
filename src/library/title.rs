@@ -22,24 +22,19 @@ pub fn is_note_extension(extension: &str) -> bool {
             || crate::languages::is_language_extension(extension))
 }
 
-/// A note: a file with a note extension, or one a language claims by its whole name (`.env`,
-/// `Cargo.lock`), unless it has an image extension.
+/// A note: every file the notebook lists except an image (#128). A file of no known type opens as
+/// plain text; one that isn't text is skipped by a text search and refused, with a notice, when
+/// opened.
 pub fn is_note_path(path: &Path) -> bool {
-    match path.extension() {
-        Some(extension) if is_image_extension(&extension.to_string_lossy()) => false,
-        Some(extension) if is_note_extension(&extension.to_string_lossy()) => true,
-        _ => path
-            .file_name()
-            .is_some_and(|name| crate::languages::is_language_file_name(&name.to_string_lossy())),
-    }
-}
-
-/// A file the notebook lists: a note or an image.
-pub fn is_listed_path(path: &Path) -> bool {
-    is_note_path(path)
-        || path
+    is_listed_path(path)
+        && !path
             .extension()
             .is_some_and(|extension| is_image_extension(&extension.to_string_lossy()))
+}
+
+/// A file the notebook lists: every file, whatever its extension or with none (#128).
+pub fn is_listed_path(path: &Path) -> bool {
+    path.file_name().is_some()
 }
 
 /// Image files the notebook lists and FastPad shows (image preview spec §4). SVG is listed but
@@ -382,18 +377,36 @@ mod tests {
         ] {
             assert!(is_listed_path(Path::new(name)), "{name}");
         }
-        for name in ["setup.exe", "yarn.lock", "README", "archive.zip", ""] {
-            assert!(!is_listed_path(Path::new(name)), "{name}");
+        // Every file is listed, a type FastPad doesn't know included (#128).
+        for name in [
+            "query.kql",
+            "setup.exe",
+            "yarn.lock",
+            "README",
+            "archive.zip",
+        ] {
+            assert!(is_listed_path(Path::new(name)), "{name}");
         }
+        assert!(!is_listed_path(Path::new("")));
     }
 
     #[test]
     fn notes_are_every_listed_file_except_images() {
-        // Break caught: a text search reading PNG bytes, or skipping `.env` and `deploy.ps1`.
-        for name in [".env", "deploy.ps1", "Cargo.lock", "a.md", "b.log"] {
+        // Break caught: a text search reading PNG bytes, or skipping `.env`, `deploy.ps1` or a
+        // file of a type FastPad doesn't know (#128).
+        for name in [
+            ".env",
+            "deploy.ps1",
+            "Cargo.lock",
+            "a.md",
+            "b.log",
+            "query.kql",
+            "README",
+            "setup.exe",
+        ] {
             assert!(is_note_path(Path::new(name)), "{name}");
         }
-        for name in ["a.png", "logo.svg", "setup.exe", "README"] {
+        for name in ["a.png", "logo.svg", "PHOTO.JPG", ""] {
             assert!(!is_note_path(Path::new(name)), "{name}");
         }
     }

@@ -493,7 +493,6 @@ fn apply(hwnd: HWND, mut done: CopyDone) {
     {
         notices.push(tree_copy::dirty_notice(&name));
     }
-    let mut hidden = Vec::new();
     let mut rescan = false;
     let mut listed = Vec::new();
     for item in &done.items {
@@ -510,14 +509,8 @@ fn apply(hwnd: HWND, mut done: CopyDone) {
             listed.push(RowKind::Folder(relative));
             continue;
         }
-        if library::title::is_listed_path(&item.destination) {
-            listed.push(RowKind::Note(relative));
-        } else {
-            hidden.push(name);
-        }
-    }
-    if !hidden.is_empty() {
-        notices.push(tree_copy::hidden_notice(&hidden));
+        // Every copied file has a row (#128).
+        listed.push(RowKind::Note(relative));
     }
     // The notebook that owns the root takes the copies. A notebook closed since leaves nothing
     // to update, and the files are still on disk.

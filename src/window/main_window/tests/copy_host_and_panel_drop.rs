@@ -3,10 +3,10 @@
 use super::*;
 
 #[test]
-fn copy_host_copies_files_and_folders_indexes_notes_and_says_what_is_hidden() {
+fn copy_host_copies_files_and_folders_and_lists_every_copied_file() {
     // Break caught: a copied note missing from the tree until a rescan, a copied folder not
-    // listed, a file that is neither a note nor an image copied silently, or the single
-    // copied row not selected (open editors spec §4.5, §4.6; image preview spec §9).
+    // listed, a file that is neither a note nor an image left out of the tree, or the single
+    // copied row not selected (open editors spec §4.5, §4.6; image preview spec §9; #128).
     let _scintilla = load_native_scintilla();
     let scratch = LibraryScratch::new("copy-into");
     std::fs::create_dir_all(scratch.folder().join("work")).unwrap();
@@ -40,10 +40,11 @@ fn copy_host_copies_files_and_folders_indexes_notes_and_says_what_is_hidden() {
     crate::window::copy_host::wait_for_copies(window.hwnd);
     assert!(scratch.folder().join(r"pics\deep\x.png").exists());
     assert!(scratch.folder().join("archive.zip").exists());
+    row_of(window.hwnd, &RowKind::Note("archive.zip".into()));
     assert!(
+        notices(window.hwnd).is_empty(),
+        "{:?}",
         notices(window.hwnd)
-            .iter()
-            .any(|notice| notice.contains("isn't shown") || notice.contains("aren't shown"))
     );
 }
 

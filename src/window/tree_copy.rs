@@ -111,23 +111,6 @@ pub(crate) fn replace_question(name: &str, folder: &str) -> String {
     format!("{name} already exists in {folder}. Replace it?")
 }
 
-/// The notice for copied files the tree doesn't list; `names` holds at least one.
-pub(crate) fn hidden_notice(names: &[String]) -> String {
-    match names {
-        [one] => format!("{one} was copied but isn't shown: the notebook lists text notes only."),
-        _ => {
-            let mut listed = names.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
-            if names.len() > 3 {
-                listed.push_str(", …");
-            }
-            format!(
-                "{} files were copied but aren't shown: {listed}",
-                names.len()
-            )
-        }
-    }
-}
-
 pub(crate) fn dirty_notice(name: &str) -> String {
     format!("Copied the saved version of {name}. Your unsaved changes are still in its tab.")
 }
@@ -357,19 +340,6 @@ mod tests {
         assert_eq!(
             replace_question("a.md", "work"),
             "a.md already exists in work. Replace it?"
-        );
-        assert_eq!(
-            hidden_notice(&["photo.png".into()]),
-            "photo.png was copied but isn't shown: the notebook lists text notes only."
-        );
-        assert_eq!(
-            hidden_notice(&[
-                "a.png".into(),
-                "b.png".into(),
-                "c.png".into(),
-                "d.png".into()
-            ]),
-            "4 files were copied but aren't shown: a.png, b.png, c.png, …"
         );
         assert_eq!(
             dirty_notice("draft.txt"),
