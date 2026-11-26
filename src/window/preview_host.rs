@@ -748,6 +748,27 @@ pub(crate) fn set_mode(hwnd: HWND, next: ViewMode) {
     if let Some(target) = focus {
         unsafe { SetFocus(target) };
     }
+    mark_caret_line(hwnd);
+}
+
+/// The caret in group `group`'s editor moved: a FastDraw diagram beside it outlines the elements
+/// on the caret's line.
+pub(crate) fn caret_moved(hwnd: HWND, group: GroupId) {
+    in_group(group, || mark_caret_line(hwnd));
+}
+
+/// Outlines the caret line's elements in the target group's diagram while it shows beside the
+/// text (Split), as the VS Code preview does; any other mode outlines nothing.
+fn mark_caret_line(hwnd: HWND) {
+    let Some(view) = svg_view(hwnd) else {
+        return;
+    };
+    let line = (active_is_fastdraw(hwnd) && mode(hwnd) == ViewMode::Split)
+        .then(|| editor(hwnd))
+        .flatten()
+        .and_then(|editor| editor.line_from_position(editor.caret().ok()?).ok())
+        .map(|line| line as u32 + 1);
+    view.set_marked_line(line);
 }
 
 /// The active tab is a note just created to be written in (#126): its default view never shows
@@ -1188,10 +1209,12 @@ pub(crate) fn record_edit(hwnd: HWND, id: GroupId, notification: &ScintillaNotif
         inserted,
         notification.lines_added,
     );
+    let mut edited_picture = None;
     let recorded = with_group_host(hwnd, id, |host| {
         // The SVG preview renders the whole text again after the pause; it keeps no edit log.
         if host.svg_document.is_some() {
             host.flush_pending = true;
+            edited_picture = host.svg_view;
             return true;
         }
         if host.view.is_none() || host.document.is_none() {
@@ -1202,6 +1225,11 @@ pub(crate) fn record_edit(hwnd: HWND, id: GroupId, notification: &ScintillaNotif
         true
     })
     .unwrap_or(false);
+    // A diagram's drawing no longer matches its text until the pause redraws it: its elements'
+    // lines are the old text's.
+    if let Some(view) = edited_picture {
+        view.diagram_edited();
+    }
     if recorded {
         unsafe { SetTimer(hwnd, PREVIEW_TIMER_ID, PREVIEW_UPDATE_DELAY_MS, None) };
     }
@@ -1511,6 +1539,37 @@ pub(crate) fn shell_open(hwnd: HWND, url: &str) -> bool {
         )
     };
     result as isize > 32
+}
+
+/// A click on the element of a FastDraw diagram that 1-based `line` writes, in image view `view`:
+/// its tab shows the text beside the diagram (Split, from Preview) with that line selected and the
+/// keyboard in the editor, as the VS Code preview reveals a clicked element's line.
+pub(crate) fn diagram_clicked(hwnd: HWND, view: HWND, line: u32) {
+    let Some(id) = unsafe { host_window::app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.group_containing(view))
+    else {
+        return;
+    };
+    in_group(id, || {
+        if line == 0 || !active_is_fastdraw(hwnd) {
+            return;
+        }
+        let Some(editor) = editor(hwnd) else {
+            return;
+        };
+        // An edit reaches the diagram after the preview delay: until then the picture is the old
+        // text's, and its lines may no longer be the element's.
+        let drawn = svg_view(hwnd).and_then(|view| view.diagram_text());
+        if drawn.as_deref() != editor.text().ok().as_deref() {
+            return;
+        }
+        if mode(hwnd) == ViewMode::Preview {
+            set_mode(hwnd, ViewMode::Split);
+        }
+        if editor.select_line(line as usize - 1).is_ok() {
+            unsafe { SetFocus(editor.hwnd()) };
+        }
+    });
 }
 
 /// An editor link longer than this is not opened: ShellExecute passes it on a command line, which

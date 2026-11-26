@@ -653,6 +653,14 @@ pub(super) unsafe extern "system" fn main_window_proc(
                     invalidate_status_bar(hwnd);
                     return 0;
                 }
+                crate::window::WM_FASTPAD_DIAGRAM_CLICKED => {
+                    crate::window::preview_host::diagram_clicked(
+                        hwnd,
+                        wparam as HWND,
+                        lparam as u32,
+                    );
+                    return 0;
+                }
                 crate::window::WM_FASTPAD_PREVIEW_LINK => {
                     match group_of_child(hwnd, wparam as HWND) {
                         Some(id) => crate::window::preview_host::follow_link(hwnd, id, lparam),
@@ -792,6 +800,9 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
             && markdown
         {
             crate::window::markdown_host::selection_changed(hwnd, group);
+        }
+        if update.updated as u32 & crate::editor::scintilla_constants::SC_UPDATE_SELECTION != 0 {
+            crate::window::preview_host::caret_moved(hwnd, group);
         }
         // The text or the lines on screen changed: the links there get their underlines
         // (second brain phase 1 spec §7.3).

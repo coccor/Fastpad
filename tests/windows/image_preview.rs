@@ -763,3 +763,485 @@ fn launching_with_a_text_file_loads_no_preview_graphics_library() {
     process.close().unwrap();
     let _ = std::fs::remove_dir_all(root);
 }
+
+// ---- FastDraw: click an element to select its line ----
+
+const TWO_BOXES: &str = "a: rect \"A\" at 0,0\nb: rect \"B\" at 200,0\n";
+
+/// The centre of the element that `line` writes, in scene units, as the renderer lays it out.
+fn centre_of(text: &str, line: u32) -> (f64, f64) {
+    let hits = crate::preview::fastdraw::draw(text, None, false).hits;
+    let hit = hits
+        .items
+        .iter()
+        .find(|hit| hit.line == line)
+        .expect("an element on that line");
+    match hit.shape {
+        crate::preview::fastdraw_hits::HitShape::Box { x, y, w, h } => (x + w / 2.0, y + h / 2.0),
+        crate::preview::fastdraw_hits::HitShape::Line(ref points) => points[0],
+    }
+}
+
+fn lparam_of(x: i32, y: i32) -> isize {
+    ((y as isize) << 16) | (x as isize & 0xFFFF)
+}
+
+/// A press and release at client `(x, y)` on `view`.
+fn click_at(view: image_view::ImageView, (x, y): (i32, i32)) {
+    unsafe {
+        SendMessageW(view.hwnd(), WM_LBUTTONDOWN, 1, lparam_of(x, y));
+        SendMessageW(view.hwnd(), WM_LBUTTONUP, 0, lparam_of(x, y));
+    }
+}
+
+/// The editor's selection as `(start, end)`.
+fn selection(main: &TestMain) -> (usize, usize) {
+    use crate::editor::scintilla_constants::{SCI_GETSELECTIONEND, SCI_GETSELECTIONSTART};
+    unsafe {
+        (
+            SendMessageW(main.editor, SCI_GETSELECTIONSTART, 0, 0) as usize,
+            SendMessageW(main.editor, SCI_GETSELECTIONEND, 0, 0) as usize,
+        )
+    }
+}
+
+/// The 0-based `line`'s text range, without its end of line.
+fn line_range(main: &TestMain, line: usize) -> (usize, usize) {
+    use crate::editor::scintilla_constants::{SCI_GETLINEENDPOSITION, SCI_POSITIONFROMLINE};
+    unsafe {
+        (
+            SendMessageW(main.editor, SCI_POSITIONFROMLINE, line, 0) as usize,
+            SendMessageW(main.editor, SCI_GETLINEENDPOSITION, line, 0) as usize,
+        )
+    }
+}
+
+/// Opens `text` as `d.fdraw` in its own scratch folder and waits for the drawing.
+fn open_drawn(main: &TestMain, name: &str, text: &str) -> image_view::ImageView {
+    let dir = scratch(name);
+    let path = dir.join("d.fdraw");
+    std::fs::write(&path, text).unwrap();
+    main.open(&path).unwrap();
+    pump_pending();
+    let view = main
+        .with_app(|app| app.active_group().unwrap().preview.svg_view)
+        .expect("svg view");
+    pump_until("fdraw drawn", FDRAW_DRAW_TIMEOUT, || {
+        view.stats().phase == image_view::Phase::Ready
+    });
+    view
+}
+
+#[test]
+fn clicking_a_diagram_box_opens_split_with_its_line_selected() {
+    // Break caught: a click zooming the diagram, landing on the wrong line, or leaving Preview.
+    use crate::preview::ViewMode;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-click", TWO_BOXES);
+    assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Preview);
+    let scale = view.stats().scale;
+    click_at(view, view.client_point(centre_of(TWO_BOXES, 2)));
+    pump_pending();
+    assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Split);
+    assert_eq!(selection(&main), line_range(&main, 1));
+    assert_eq!(
+        unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() },
+        main.editor
+    );
+    assert_eq!(view.stats().scale, scale, "a diagram click does not zoom");
+}
+
+#[test]
+fn clicking_a_box_at_200_percent_still_selects_its_line() {
+    // Break caught: the click mapped through the fit scale or without the pan offset.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-click-zoomed", TWO_BOXES);
+    view.set_zoom(image_view::zoom::Zoom::Scale(2.0));
+    pump_pending();
+    click_at(view, view.client_point(centre_of(TWO_BOXES, 1)));
+    pump_pending();
+    assert_eq!(selection(&main), line_range(&main, 0));
+}
+
+#[test]
+fn a_click_on_empty_canvas_changes_nothing() {
+    // Break caught: a click beside the boxes selecting the nearest line or switching to Split.
+    use crate::preview::ViewMode;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-click-empty", TWO_BOXES);
+    let before = selection(&main);
+    // Between the two boxes, inside the drawing.
+    let a = centre_of(TWO_BOXES, 1);
+    let b = centre_of(TWO_BOXES, 2);
+    click_at(view, view.client_point(((a.0 + b.0) / 2.0, a.1)));
+    pump_pending();
+    assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Preview);
+    assert_eq!(selection(&main), before);
+}
+
+#[test]
+fn a_drag_from_an_element_pans_and_selects_nothing() {
+    // Break caught: the end of a pan read as a click on the box it started on.
+    use crate::preview::ViewMode;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-drag", TWO_BOXES);
+    view.set_zoom(image_view::zoom::Zoom::Scale(4.0));
+    pump_pending();
+    let (x, y) = view.client_point(centre_of(TWO_BOXES, 2));
+    let offset = view.stats().offset;
+    unsafe {
+        SendMessageW(view.hwnd(), WM_LBUTTONDOWN, 1, lparam_of(x, y));
+        SendMessageW(view.hwnd(), WM_MOUSEMOVE, 1, lparam_of(x + 50, y));
+        SendMessageW(view.hwnd(), WM_LBUTTONUP, 0, lparam_of(x + 50, y));
+    }
+    pump_pending();
+    assert_ne!(view.stats().offset, offset);
+    assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Preview);
+}
+
+#[test]
+fn a_click_while_an_edit_redraws_selects_nothing() {
+    // Break caught: the old picture's elements mapped onto the edited text's lines.
+    use crate::preview::ViewMode;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-click-stale", TWO_BOXES);
+    let point = view.client_point(centre_of(TWO_BOXES, 2));
+    // Line 2 now writes nothing: box B moved to line 3.
+    main.set_text("a: rect \"A\" at 0,0\n\nb: rect \"B\" at 200,0\n");
+    let before = selection(&main);
+    click_at(view, point);
+    pump_pending();
+    assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Preview);
+    assert_eq!(selection(&main), before);
+}
+
+// ---- FastDraw: the caret's line outlines its elements ----
+
+/// Puts the caret at the start of 0-based `line`.
+fn caret_to_line(main: &TestMain, line: usize) {
+    use crate::editor::scintilla_constants::{SCI_GOTOPOS, SCI_POSITIONFROMLINE};
+    unsafe {
+        let position = SendMessageW(main.editor, SCI_POSITIONFROMLINE, line, 0);
+        SendMessageW(main.editor, SCI_GOTOPOS, position as usize, 0);
+    }
+}
+
+fn pump_for(duration: Duration) {
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        pump_pending();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn the_caret_line_outlines_its_element_in_split() {
+    // Break caught: no outline in Split, or the outline staying on the line the caret left.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-mark", TWO_BOXES);
+    main.command(CommandId::MarkdownViewSplit);
+    caret_to_line(&main, 1);
+    pump_until("line 2 outlined", Duration::from_secs(5), || {
+        let stats = view.stats();
+        stats.marked_line == Some(2) && stats.marked == 1
+    });
+    caret_to_line(&main, 0);
+    pump_until("line 1 outlined", Duration::from_secs(5), || {
+        let stats = view.stats();
+        stats.marked_line == Some(1) && stats.marked == 1
+    });
+}
+
+#[test]
+fn no_outline_in_preview_or_on_a_line_with_no_element() {
+    // Break caught: Preview outlining the line of a caret nobody can see, or an empty line
+    // outlining something.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-mark-none", TWO_BOXES);
+    caret_to_line(&main, 1);
+    pump_for(Duration::from_millis(200));
+    assert_eq!(view.stats().marked, 0);
+    main.command(CommandId::MarkdownViewSplit);
+    // The empty line after the last box.
+    caret_to_line(&main, 2);
+    pump_until("line 3 followed", Duration::from_secs(5), || {
+        view.stats().marked_line == Some(3)
+    });
+    assert_eq!(view.stats().marked, 0);
+    main.command(CommandId::MarkdownViewPreview);
+    pump_pending();
+    assert_eq!(view.stats().marked_line, None);
+}
+
+// ---- FastDraw: Fill ----
+
+fn key(view: image_view::ImageView, key: u16) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+    unsafe { SendMessageW(view.hwnd(), WM_KEYDOWN, key as usize, 0) };
+}
+
+/// The view's client width in pixels.
+fn client_width(view: image_view::ImageView) -> f32 {
+    let mut rect = windows_sys::Win32::Foundation::RECT::default();
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(view.hwnd(), &mut rect) };
+    rect.right as f32
+}
+
+#[test]
+fn w_fills_the_width_and_f_fits_a_fdraw() {
+    // Break caught: W doing nothing, filling the height, or F not returning to Fit.
+    use image_view::zoom::Zoom;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-fill", TWO_BOXES);
+    let natural = view.status().size.expect("drawn size").0 as f32;
+    key(view, b'W'.into());
+    pump_pending();
+    assert_eq!(view.zoom(), Zoom::FillWidth);
+    let expected = (client_width(view) / natural).min(16.0);
+    assert!(
+        (view.stats().scale - expected).abs() < 0.01,
+        "{} vs {expected}",
+        view.stats().scale
+    );
+    key(view, b'F'.into());
+    pump_pending();
+    assert_eq!(view.zoom(), Zoom::Fit);
+}
+
+#[test]
+fn fill_survives_an_edit_of_the_diagram() {
+    // Break caught: every keystroke in Split throwing the diagram back to Fit.
+    use image_view::zoom::Zoom;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-fill-edit", TWO_BOXES);
+    key(view, b'W'.into());
+    pump_pending();
+    let decodes = view.stats().decodes;
+    main.set_text("a: rect \"A\" at 0,0\nb: rect \"B\" at 400,0\n");
+    pump_until("fdraw redrawn", FDRAW_DRAW_TIMEOUT, || {
+        view.stats().decodes > decodes && view.stats().phase == image_view::Phase::Ready
+    });
+    assert_eq!(view.zoom(), Zoom::FillWidth);
+}
+
+#[test]
+fn w_does_nothing_on_a_plain_image() {
+    // Break caught: the diagram keys reaching photos, whose zoom keys stay + - 0.
+    use image_view::zoom::Zoom;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let dir = scratch("fill-bmp");
+    let path = dir.join("small.bmp");
+    write_bmp(&path, 64, 32);
+    main.open(&path).unwrap();
+    let view = main.image_view();
+    main.wait_ready();
+    key(view, b'W'.into());
+    pump_pending();
+    assert_eq!(view.zoom(), Zoom::Fit);
+}
+
+// ---- FastDraw: the diagram toolbar ----
+
+fn press(view: image_view::ImageView, button: image_view::toolbar::Button) {
+    click_at(view, view.button_point(button));
+    pump_pending();
+}
+
+#[test]
+fn the_toolbar_buttons_set_the_zoom() {
+    // Break caught: a button doing another's job, or Percent not returning to 100%.
+    use image_view::toolbar::Button;
+    use image_view::zoom::Zoom;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-toolbar", TWO_BOXES);
+    press(view, Button::Fill);
+    assert_eq!(view.zoom(), Zoom::FillWidth);
+    press(view, Button::Fit);
+    assert_eq!(view.zoom(), Zoom::Fit);
+    press(view, Button::Percent);
+    assert_eq!(view.zoom(), Zoom::Scale(1.0));
+    press(view, Button::ZoomIn);
+    assert_eq!(view.zoom(), Zoom::Scale(1.5));
+    press(view, Button::ZoomOut);
+    press(view, Button::ZoomOut);
+    assert_eq!(view.zoom(), Zoom::Scale(0.67));
+}
+
+#[test]
+fn the_open_button_opens_the_diagram_in_fastdraw() {
+    // Break caught: the button moved off the top toolbar but wired to nothing.
+    use image_view::toolbar::Button;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-toolbar-open", TWO_BOXES);
+    let _ = window::preview_host::take_opened();
+    press(view, Button::OpenInFastDraw);
+    pump_pending();
+    let opened = window::preview_host::take_opened();
+    assert_eq!(opened.len(), 1, "{opened:?}");
+    assert!(opened[0].contains("fastdraw.dev"), "{opened:?}");
+}
+
+#[test]
+fn a_toolbar_click_does_not_reach_the_diagram() {
+    // Break caught: pressing Fit over a box also selecting the box's line, or starting a pan.
+    use crate::preview::ViewMode;
+    use image_view::toolbar::Button;
+    use image_view::zoom::Zoom;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let one = "a: rect \"A\" at 0,0\n";
+    let view = open_drawn(&main, "fdraw-toolbar-over", one);
+    // At 16x the one box covers the whole view, the toolbar's corner included.
+    view.set_zoom(Zoom::Scale(16.0));
+    pump_pending();
+    let at = view.button_point(Button::Fit);
+    assert_eq!(view.hit_line(at), Some(1), "the box lies under the button");
+    press(view, Button::Fit);
+    assert_eq!(view.zoom(), Zoom::Fit);
+    assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Preview);
+}
+
+#[test]
+fn a_plain_image_has_no_toolbar() {
+    // Break caught: the diagram's toolbar swallowing clicks on photos.
+    use image_view::toolbar::Button;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let dir = scratch("toolbar-bmp");
+    let path = dir.join("small.bmp");
+    write_bmp(&path, 64, 32);
+    main.open(&path).unwrap();
+    let view = main.image_view();
+    assert_eq!(main.wait_ready().scale, 1.0);
+    click_at(view, view.button_point(Button::Fit));
+    assert_eq!(view.stats().scale, 1.5, "the click zooms as on any image");
+}
+
+// ---- Final review fixes ----
+
+#[test]
+fn an_svg_shown_after_a_diagram_keeps_none_of_its_toolbar_tips() {
+    // Break caught: the diagram toolbar's tooltips left on the group's SVG view, showing
+    // "Fit the whole diagram (F)" over a plain SVG's corner.
+    use image_view::toolbar::Button;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-tips", TWO_BOXES);
+    let (x, y) = view.button_point(Button::Fit);
+    unsafe { SendMessageW(view.hwnd(), WM_MOUSEMOVE, 0, lparam_of(x, y)) };
+    pump_pending();
+    assert!(
+        view.has_toolbar_tooltip(),
+        "hovering the toolbar makes its tips"
+    );
+    let svg = scratch("fdraw-tips-svg").join("p.svg");
+    std::fs::write(
+        &svg,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="40" height="20"/></svg>"#,
+    )
+    .unwrap();
+    main.open(&svg).unwrap();
+    pump_pending();
+    let shown = main
+        .with_app(|app| app.active_group().unwrap().preview.svg_view)
+        .expect("svg view");
+    assert_eq!(shown, view, "the group's one picture view shows the SVG");
+    assert!(shown.diagram_text().is_none(), "the view shows the SVG now");
+    assert!(!shown.has_toolbar_tooltip());
+}
+
+#[test]
+fn an_edit_hides_the_outline_until_its_drawing_lands() {
+    // Break caught: inserting a line above a box leaves the old drawing's lines in force, so the
+    // caret's new line outlines the box that used to be written there.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-mark-stale", TWO_BOXES);
+    main.command(CommandId::MarkdownViewSplit);
+    caret_to_line(&main, 1);
+    pump_until("line 2 outlined", Duration::from_secs(5), || {
+        view.stats().marked == 1
+    });
+    // B moves to line 3; line 2 is now empty.
+    main.set_text("a: rect \"A\" at 0,0\n\nb: rect \"B\" at 200,0\n");
+    caret_to_line(&main, 1);
+    pump_pending();
+    assert_eq!(
+        view.stats().marked,
+        0,
+        "the old drawing's line 2 is not this text's"
+    );
+    caret_to_line(&main, 2);
+    pump_until(
+        "the new drawing outlines B on line 3",
+        FDRAW_DRAW_TIMEOUT,
+        || {
+            let stats = view.stats();
+            stats.marked_line == Some(3) && stats.marked == 1
+        },
+    );
+}
+
+#[test]
+fn a_double_click_on_a_diagram_keeps_the_first_click_line() {
+    // Break caught: the second press of a double-click landing on the Split layout the first
+    // click made, and selecting whichever element now lies under the pointer.
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONDBLCLK;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-dblclick", TWO_BOXES);
+    click_at(view, view.client_point(centre_of(TWO_BOXES, 2)));
+    pump_pending();
+    assert_eq!(selection(&main), line_range(&main, 1));
+    pump_until("the Split drawing", FDRAW_DRAW_TIMEOUT, || {
+        view.stats().phase == image_view::Phase::Ready
+    });
+    let (x, y) = view.client_point(centre_of(TWO_BOXES, 1));
+    assert_eq!(
+        view.hit_line((x, y)),
+        Some(1),
+        "box A lies under the second press"
+    );
+    unsafe {
+        SendMessageW(view.hwnd(), WM_LBUTTONDBLCLK, 1, lparam_of(x, y));
+        SendMessageW(view.hwnd(), WM_LBUTTONUP, 0, lparam_of(x, y));
+    }
+    pump_pending();
+    assert_eq!(selection(&main), line_range(&main, 1));
+}
+
+#[test]
+fn a_diagram_at_100_percent_takes_a_point_per_unit_and_reads_100() {
+    // Break caught: a diagram at 100% drawn one unit per physical pixel, smaller than VS Code
+    // and a browser draw it on a scaled display, or the label reading the display scale.
+    use image_view::zoom::Zoom;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-points", TWO_BOXES);
+    view.set_zoom(Zoom::Scale(1.0));
+    pump_pending();
+    let dpi = unsafe { windows_sys::Win32::UI::HiDpi::GetDpiForWindow(view.hwnd()) } as f32 / 96.0;
+    assert!(
+        (view.stats().scale - dpi).abs() < 1e-4,
+        "{} vs {dpi}",
+        view.stats().scale
+    );
+    assert_eq!(view.status().zoom_percent, Some(100));
+    view.zoom_in();
+    assert_eq!(view.zoom(), Zoom::Scale(1.5));
+    assert_eq!(view.status().zoom_percent, Some(150));
+}
