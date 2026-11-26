@@ -2,8 +2,11 @@
 //! read only by a relative path, a renderer panic becomes an error instead of taking FastPad down,
 //! and the fonts a diagram names are registered with the SVG rasterizer.
 
+use crate::preview::fastdraw_hits::{Hits, hits_of};
 use crate::preview::images::DecodedImage;
 use fastdraw_render::{Level, Source};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
 use std::io::Read;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -24,6 +27,39 @@ pub struct Drawn {
     pub show: bool,
     /// The diagram's own look file as read, for the share link.
     pub look: Option<fastdraw_render::LookFile>,
+    /// Where each element sits and its line, in the SVG's units; empty when nothing is shown.
+    pub hits: Arc<Hits>,
+}
+
+/// The hits of the last drawing, keyed on its text and SVG: the same text drawing the same picture
+/// has the same elements, so zooming and resizing, which draw again, do not build them again.
+static LAST_HITS: Mutex<HitsCache> = Mutex::new(HitsCache(None));
+
+/// The last drawing's hits and the hash of its text and SVG.
+struct HitsCache(Option<(u64, Arc<Hits>)>);
+
+impl HitsCache {
+    /// `source`'s hits, built from the same source `render` drew `svg` from, or the kept ones.
+    fn get(&mut self, source: &Source, svg: &str) -> Arc<Hits> {
+        let key = {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            (source.text, svg).hash(&mut hasher);
+            hasher.finish()
+        };
+        if let Some((_, hits)) = self.0.as_ref().filter(|(k, _)| *k == key) {
+            return Arc::clone(hits);
+        }
+        let hits = Arc::new(hits_of(&fastdraw_render::drawn_scene(source)));
+        self.0 = Some((key, Arc::clone(&hits)));
+        hits
+    }
+}
+
+fn cached_hits(source: &Source, svg: &str) -> Arc<Hits> {
+    LAST_HITS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(source, svg)
 }
 
 /// Whether FastPad refuses to read a look file named `look`: an absolute path, a network path, or
@@ -208,6 +244,7 @@ fn guarded(draw: impl FnOnce() -> Drawn) -> Drawn {
         errors: vec![PANIC_TEXT.to_owned()],
         show: false,
         look: None,
+        hits: Arc::default(),
     })
 }
 
@@ -222,7 +259,8 @@ fn draw_unguarded(text: &str, file: Option<&Path>, dark: bool) -> Drawn {
         .and_then(|file| read_look(text, file))
         .and_then(|look| dark_values(&look.text).into_iter().find(|v| refused(v)));
     let dark = dark && refused_dark.is_none();
-    let drawing = fastdraw_render::render(&Source { text, file, dark });
+    let source = Source { text, file, dark };
+    let drawing = fastdraw_render::render(&source);
     crate::preview::svg::add_fastdraw_fonts();
     crate::preview::svg::add_font_files(&drawing.font_files);
 
@@ -243,7 +281,13 @@ fn draw_unguarded(text: &str, file: Option<&Path>, dark: bool) -> Drawn {
         errors.push(format!("Line {}: {message}", issue.line));
     }
     let [r, g, b] = drawing.paper;
+    let hits = if show {
+        cached_hits(&source, &drawing.svg)
+    } else {
+        Arc::default()
+    };
     Drawn {
+        hits,
         svg: drawing.svg,
         paper: u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b),
         errors,
@@ -347,6 +391,72 @@ fn read_text(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The four numbers of the SVG's viewBox.
+    fn view_box(svg: &str) -> [f64; 4] {
+        let start = svg.find("viewBox=\"").expect("viewBox") + "viewBox=\"".len();
+        let end = start + svg[start..].find('"').unwrap();
+        let numbers: Vec<f64> = svg[start..end]
+            .split_whitespace()
+            .map(|n| n.parse().unwrap())
+            .collect();
+        [numbers[0], numbers[1], numbers[2], numbers[3]]
+    }
+
+    fn frame(hits: &crate::preview::fastdraw_hits::Hits) -> [f64; 4] {
+        [hits.origin.0, hits.origin.1, hits.size.0, hits.size.1]
+    }
+
+    #[test]
+    fn a_drawing_carries_a_hit_for_each_element_with_its_line() {
+        let d = draw("a: rect \"A\" at 0,0\nb: rect \"B\" at 200,0\n", None, false);
+        let lines: Vec<u32> = d.hits.items.iter().map(|hit| hit.line).collect();
+        assert_eq!(lines, [1, 2]);
+    }
+
+    #[test]
+    fn the_hits_share_the_svg_viewbox() {
+        let d = draw("a: rect \"A\" at 0,0\nb: rect \"B\" at 200,40\n", None, true);
+        assert_eq!(frame(&d.hits), view_box(&d.svg));
+    }
+
+    #[test]
+    fn a_refused_look_hits_the_drawing_it_shows() {
+        let d = draw(
+            "look \"//server/x.look\"\na: rect \"A\" at 0,0\n",
+            Some(Path::new(r"C:\t\d.fdraw")),
+            false,
+        );
+        assert!(d.show);
+        assert_eq!(d.hits.items.len(), 1);
+        assert_eq!(d.hits.items[0].line, 2);
+        assert_eq!(frame(&d.hits), view_box(&d.svg));
+    }
+
+    #[test]
+    fn a_hidden_drawing_has_no_hits() {
+        let d = draw("a: rect \"A\" at 0,0\nc: nosuchkind \"C\" at 0,0\n", None, false);
+        assert!(!d.show);
+        assert!(d.hits.items.is_empty());
+    }
+
+    #[test]
+    fn drawing_the_same_source_twice_reuses_the_hits() {
+        // A cache of its own: the shared one is replaced by every test that draws in parallel.
+        let text = "a: rect \"A\" at 0,0\nb: rect \"B\" at 300,0\n";
+        let source = Source {
+            text,
+            file: None,
+            dark: false,
+        };
+        let svg = draw(text, None, false).svg;
+        let mut cache = HitsCache(None);
+        let first = cache.get(&source, &svg);
+        let second = cache.get(&source, &svg);
+        assert!(Arc::ptr_eq(&first, &second));
+        let other = cache.get(&source, "<svg/>");
+        assert!(!Arc::ptr_eq(&first, &other));
+    }
 
     #[test]
     fn network_absolute_and_drive_look_paths_are_refused() {

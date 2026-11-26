@@ -138,12 +138,14 @@ pub(crate) fn tile_area(
 }
 
 /// What the view needs to know about a drawn diagram.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DiagramFacts {
     /// The look's paper colour, `0x00RRGGBB`, painted behind the picture instead of a checkerboard.
     pub paper: u32,
     /// The error the band shows over a drawing that is still shown (a refused look file).
     pub band: Option<String>,
+    /// Where the drawing's elements sit and their lines, so a click finds its line.
+    pub hits: Arc<crate::preview::fastdraw_hits::Hits>,
 }
 
 /// A tile to render with a decode or render: its zoom and area.
@@ -610,6 +612,7 @@ fn fastdraw_source(
     image.diagram = Some(DiagramFacts {
         paper: drawn.paper,
         band,
+        hits: drawn.hits,
     });
     Ok((image, tile))
 }
