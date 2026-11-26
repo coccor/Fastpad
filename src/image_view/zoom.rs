@@ -55,6 +55,36 @@ pub fn zoom_about(offset: (f32, f32), old: f32, new: f32, anchor: (f32, f32)) ->
     )
 }
 
+/// The point of a drawn SVG under client point `client`, in the SVG's own units. `scale` is
+/// device pixels per SVG unit (the SVG's natural size is its viewBox) and `origin` is the viewBox's
+/// top-left corner.
+pub fn to_scene(
+    client: (f32, f32),
+    offset: (f32, f32),
+    scale: f32,
+    origin: (f64, f64),
+) -> (f64, f64) {
+    let scale = f64::from(scale);
+    (
+        f64::from(client.0 - offset.0) / scale + origin.0,
+        f64::from(client.1 - offset.1) / scale + origin.1,
+    )
+}
+
+/// `to_scene`'s inverse: where SVG point `point` is drawn in client pixels.
+pub fn from_scene(
+    point: (f64, f64),
+    offset: (f32, f32),
+    scale: f32,
+    origin: (f64, f64),
+) -> (f32, f32) {
+    let scale = f64::from(scale);
+    (
+        ((point.0 - origin.0) * scale) as f32 + offset.0,
+        ((point.1 - origin.1) * scale) as f32 + offset.1,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +112,36 @@ mod tests {
         assert_eq!(clamp_axis(-5000.0, 2000.0, 800.0), -1200.0);
         assert_eq!(clamp_axis(300.0, 2000.0, 800.0), 0.0);
         assert_eq!(clamp_axis(-40.0, 200.0, 800.0), 300.0);
+    }
+
+    #[test]
+    fn scene_point_round_trips_at_any_zoom_and_offset() {
+        // Break caught: a click on a zoomed or panned diagram finding the element beside it.
+        let origin = (-12.5, 8.0);
+        for scale in [0.1_f32, 1.0, 2.0, 16.0] {
+            for offset in [(0.0, 0.0), (-300.0, 40.0)] {
+                let client = from_scene((40.0, 70.0), offset, scale, origin);
+                let back = to_scene(client, offset, scale, origin);
+                let tolerance = 1.0 / f64::from(scale);
+                assert!(
+                    (back.0 - 40.0).abs() <= tolerance,
+                    "{scale} {offset:?} {back:?}"
+                );
+                assert!(
+                    (back.1 - 70.0).abs() <= tolerance,
+                    "{scale} {offset:?} {back:?}"
+                );
+            }
+        }
+        // The scene's corner sits at the picture's offset.
+        assert_eq!(
+            to_scene((-300.0, 40.0), (-300.0, 40.0), 2.0, origin),
+            origin
+        );
+        assert_eq!(
+            to_scene((-298.0, 40.0), (-300.0, 40.0), 2.0, origin),
+            (-11.5, 8.0)
+        );
     }
 
     #[test]

@@ -35,12 +35,18 @@ pub fn hits_of(scene: &Scene) -> Hits {
         line,
         shape: HitShape::Box { x, y, w, h },
     };
-    let shapes = scene.shapes.iter().map(|s| boxed(s.line, s.x, s.y, s.w, s.h));
+    let shapes = scene
+        .shapes
+        .iter()
+        .map(|s| boxed(s.line, s.x, s.y, s.w, s.h));
     let conns = scene.conns.iter().map(|c| Hit {
         line: c.line,
         shape: HitShape::Line(c.pts.iter().map(|p| (p.x, p.y)).collect()),
     });
-    let texts = scene.texts.iter().map(|t| boxed(t.line, t.x, t.y, t.w, t.h));
+    let texts = scene
+        .texts
+        .iter()
+        .map(|t| boxed(t.line, t.x, t.y, t.w, t.h));
     Hits {
         origin: (scene.x, scene.y),
         size: (scene.w, scene.h),
@@ -64,9 +70,7 @@ pub fn hit_at(hits: &Hits, point: (f64, f64), tolerance: f64) -> Option<u32> {
 
 fn contains(shape: &HitShape, (x, y): (f64, f64), tolerance: f64) -> bool {
     match shape {
-        HitShape::Box { x: bx, y: by, w, h } => {
-            x >= *bx && x <= bx + w && y >= *by && y <= by + h
-        }
+        HitShape::Box { x: bx, y: by, w, h } => x >= *bx && x <= bx + w && y >= *by && y <= by + h,
         HitShape::Line(points) if points.len() == 1 => {
             (points[0].0 - x).hypot(points[0].1 - y) <= tolerance
         }

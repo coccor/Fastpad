@@ -348,6 +348,24 @@ impl Editor {
         Ok(())
     }
 
+    /// Selects 0-based `line`'s text, without its line end, and scrolls it into view. A line past
+    /// the end selects the end of the document.
+    #[cfg(windows)]
+    pub fn select_line(&self, line: usize) -> Result<()> {
+        let start = self.line_start(line)?;
+        let end = self.line_end(line)?.max(start);
+        self.set_selection(start..end)?;
+        self.scroll_caret_into_view();
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    pub fn select_line(&self, _line: usize) -> Result<()> {
+        Err(FastPadError::Invariant(
+            "Scintilla editor is only supported on Windows",
+        ))
+    }
+
     #[cfg(not(windows))]
     pub fn go_to_line(&self, _line: usize) -> Result<()> {
         Err(FastPadError::Invariant(

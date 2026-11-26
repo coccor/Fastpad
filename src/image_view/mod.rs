@@ -18,7 +18,9 @@ use crate::library::DiskStamp;
 use crate::platform::{last_error, wide_null};
 use crate::preview::colors::PreviewColors;
 use crate::preview::dwrite::Graphics;
-use crate::window::{WM_FASTPAD_IMAGE_DECODED, WM_FASTPAD_IMAGE_STATUS};
+use crate::window::{
+    WM_FASTPAD_DIAGRAM_CLICKED, WM_FASTPAD_IMAGE_DECODED, WM_FASTPAD_IMAGE_STATUS,
+};
 use accessible::AccessibleText;
 use decode::{Decoded, Delivery, FullImage, ImageError, Rendered, Source, Tile, TileJob};
 use std::path::{Path, PathBuf};
@@ -160,10 +162,14 @@ struct ViewState {
     /// Pointer position and offset when a drag started.
     drag: Option<((i32, i32), (f32, f32))>,
     /// Where the left button went down, until it comes up: released without moving past the drag
-    /// distance, the press is a click that zooms.
+    /// distance, the press is a click: it zooms a picture, and on a diagram selects the line of the
+    /// element under it.
     press: Option<(i32, i32)>,
     /// The press moved past the drag distance, so it pans instead of zooming.
     moved: bool,
+    /// The shown diagram's hits are those of the text last asked for: false from an edit until its
+    /// drawing lands, so a click on the old picture never selects a line of the new text.
+    hits_fresh: bool,
     max_side: u32,
     decodes: u32,
     paint_retried: bool,
@@ -227,6 +233,7 @@ impl ImageView {
             drag: None,
             press: None,
             moved: false,
+            hits_fresh: false,
             max_side: DEFAULT_MAX_SIDE,
             decodes: 0,
             paint_retried: false,
@@ -326,6 +333,7 @@ impl ImageView {
                 state.band = None;
             }
             state.shown = Some(Shown::FastDraw { text, file });
+            state.hits_fresh = false;
             start_svg_decode(state);
         });
         finish(self.hwnd);
@@ -450,6 +458,34 @@ impl ImageView {
                 .map(|image| (image.width, image.height)),
             tile: state.tile.as_ref().map(|tile| (tile.scale, tile.area)),
             vector: drawn_by_gpu(state),
+        })
+        .unwrap_or_default()
+    }
+
+    /// The 1-based line of the diagram element under client point `client`, if the shown drawing
+    /// is the current text's.
+    pub fn hit_line(&self, client: (i32, i32)) -> Option<u32> {
+        let tolerance = HIT_TOLERANCE_DIP * dpi_scale(self.hwnd);
+        self.with(|state| hit_line(state, client, tolerance))
+            .flatten()
+    }
+
+    /// The diagram text the view was last asked to draw; `None` when it shows no diagram.
+    pub fn diagram_text(&self) -> Option<Arc<str>> {
+        self.with(|state| match &state.shown {
+            Some(Shown::FastDraw { text, .. }) => Some(Arc::clone(text)),
+            _ => None,
+        })
+        .flatten()
+    }
+
+    /// Where scene point `scene` of the shown diagram is drawn, in client pixels.
+    #[cfg(test)]
+    pub fn client_point(&self, scene: (f64, f64)) -> (i32, i32) {
+        self.with(|state| {
+            let origin = diagram_hits(state).map_or((0.0, 0.0), |hits| hits.origin);
+            let (x, y) = zoom::from_scene(scene, state.offset, state.scale, origin);
+            (x.round() as i32, y.round() as i32)
         })
         .unwrap_or_default()
     }
@@ -677,6 +713,38 @@ fn schedule_tile(state: &mut ViewState) {
     }
 }
 
+/// How near a connector a click counts as on it, in device-independent pixels (VS Code's 6).
+const HIT_TOLERANCE_DIP: f32 = 6.0;
+
+/// The shown diagram's elements, whatever text they were drawn from.
+fn diagram_hits(state: &ViewState) -> Option<&crate::preview::fastdraw_hits::Hits> {
+    if !matches!(state.shown, Some(Shown::FastDraw { .. })) {
+        return None;
+    }
+    state
+        .image
+        .as_ref()?
+        .diagram
+        .as_ref()
+        .map(|facts| &*facts.hits)
+}
+
+/// The line under `client` (pixels), with connectors hit within `tolerance` pixels; `None` while
+/// the picture is an older text's.
+fn hit_line(state: &ViewState, client: (i32, i32), tolerance: f32) -> Option<u32> {
+    if !state.hits_fresh || state.scale <= 0.0 {
+        return None;
+    }
+    let hits = diagram_hits(state)?;
+    let point = zoom::to_scene(
+        (client.0 as f32, client.1 as f32),
+        state.offset,
+        state.scale,
+        hits.origin,
+    );
+    crate::preview::fastdraw_hits::hit_at(hits, point, f64::from(tolerance / state.scale))
+}
+
 fn clear_picture(state: &mut ViewState) {
     state.image = None;
     state.scene = None;
@@ -764,6 +832,7 @@ fn accept_decoded(state: &mut ViewState, decoded: Decoded) {
             if resized && !svg {
                 state.zoom = Zoom::Fit;
             }
+            state.hits_fresh = image.diagram.is_some();
             state.image = Some(image);
             state.scene = None;
             state.bitmap = None;
@@ -1234,7 +1303,8 @@ unsafe extern "system" fn image_proc(
             finish(hwnd);
             0
         }
-        // A click zooms in about the pointer and Ctrl+click zooms out; a press that moves past the
+        // A click zooms in about the pointer and Ctrl+click zooms out (on a diagram, a click selects
+        // the line of the element under it instead); a press that moves past the
         // drag distance pans a picture larger than the view instead. The second press of a
         // double-click is another click.
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
@@ -1287,7 +1357,24 @@ unsafe extern "system" fn image_proc(
             })
             .unwrap_or(false);
             unsafe { ReleaseCapture() };
-            if clicked {
+            let diagram = with_state(hwnd, |state| {
+                matches!(state.shown, Some(Shown::FastDraw { .. }))
+            })
+            .unwrap_or(false);
+            if clicked && diagram {
+                // A diagram click finds the line that writes the element under it; empty canvas
+                // does nothing.
+                if let Some(line) = (ImageView { hwnd }).hit_line((x, y)) {
+                    unsafe {
+                        PostMessageW(
+                            crate::platform::win32::root_window(hwnd),
+                            WM_FASTPAD_DIAGRAM_CLICKED,
+                            hwnd as usize,
+                            line as isize,
+                        )
+                    };
+                }
+            } else if clicked {
                 let out = (wparam as u32) & MK_CONTROL != 0;
                 with_state(hwnd, |state| {
                     let new = if out {

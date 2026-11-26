@@ -1513,6 +1513,37 @@ pub(crate) fn shell_open(hwnd: HWND, url: &str) -> bool {
     result as isize > 32
 }
 
+/// A click on the element of a FastDraw diagram that 1-based `line` writes, in image view `view`:
+/// its tab shows the text beside the diagram (Split, from Preview) with that line selected and the
+/// keyboard in the editor, as the VS Code preview reveals a clicked element's line.
+pub(crate) fn diagram_clicked(hwnd: HWND, view: HWND, line: u32) {
+    let Some(id) = unsafe { host_window::app_ptr(hwnd) }
+        .and_then(|app| unsafe { app.as_ref() }.group_containing(view))
+    else {
+        return;
+    };
+    in_group(id, || {
+        if line == 0 || !active_is_fastdraw(hwnd) {
+            return;
+        }
+        let Some(editor) = editor(hwnd) else {
+            return;
+        };
+        // An edit reaches the diagram after the preview delay: until then the picture is the old
+        // text's, and its lines may no longer be the element's.
+        let drawn = svg_view(hwnd).and_then(|view| view.diagram_text());
+        if drawn.as_deref() != editor.text().ok().as_deref() {
+            return;
+        }
+        if mode(hwnd) == ViewMode::Preview {
+            set_mode(hwnd, ViewMode::Split);
+        }
+        if editor.select_line(line as usize - 1).is_ok() {
+            unsafe { SetFocus(editor.hwnd()) };
+        }
+    });
+}
+
 /// An editor link longer than this is not opened: ShellExecute passes it on a command line, which
 /// holds at most 32,767 characters.
 const MAX_EDITOR_LINK_CHARS: usize = 32_000;

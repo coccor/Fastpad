@@ -763,3 +763,160 @@ fn launching_with_a_text_file_loads_no_preview_graphics_library() {
     process.close().unwrap();
     let _ = std::fs::remove_dir_all(root);
 }
+
+// ---- FastDraw: click an element to select its line ----
+
+const TWO_BOXES: &str = "a: rect \"A\" at 0,0\nb: rect \"B\" at 200,0\n";
+
+/// The centre of the element that `line` writes, in scene units, as the renderer lays it out.
+fn centre_of(text: &str, line: u32) -> (f64, f64) {
+    let hits = crate::preview::fastdraw::draw(text, None, false).hits;
+    let hit = hits
+        .items
+        .iter()
+        .find(|hit| hit.line == line)
+        .expect("an element on that line");
+    match hit.shape {
+        crate::preview::fastdraw_hits::HitShape::Box { x, y, w, h } => (x + w / 2.0, y + h / 2.0),
+        crate::preview::fastdraw_hits::HitShape::Line(ref points) => points[0],
+    }
+}
+
+fn lparam_of(x: i32, y: i32) -> isize {
+    ((y as isize) << 16) | (x as isize & 0xFFFF)
+}
+
+/// A press and release at client `(x, y)` on `view`.
+fn click_at(view: image_view::ImageView, (x, y): (i32, i32)) {
+    unsafe {
+        SendMessageW(view.hwnd(), WM_LBUTTONDOWN, 1, lparam_of(x, y));
+        SendMessageW(view.hwnd(), WM_LBUTTONUP, 0, lparam_of(x, y));
+    }
+}
+
+/// The editor's selection as `(start, end)`.
+fn selection(main: &TestMain) -> (usize, usize) {
+    use crate::editor::scintilla_constants::{SCI_GETSELECTIONEND, SCI_GETSELECTIONSTART};
+    unsafe {
+        (
+            SendMessageW(main.editor, SCI_GETSELECTIONSTART, 0, 0) as usize,
+            SendMessageW(main.editor, SCI_GETSELECTIONEND, 0, 0) as usize,
+        )
+    }
+}
+
+/// The 0-based `line`'s text range, without its end of line.
+fn line_range(main: &TestMain, line: usize) -> (usize, usize) {
+    use crate::editor::scintilla_constants::{SCI_GETLINEENDPOSITION, SCI_POSITIONFROMLINE};
+    unsafe {
+        (
+            SendMessageW(main.editor, SCI_POSITIONFROMLINE, line, 0) as usize,
+            SendMessageW(main.editor, SCI_GETLINEENDPOSITION, line, 0) as usize,
+        )
+    }
+}
+
+/// Opens `text` as `d.fdraw` in its own scratch folder and waits for the drawing.
+fn open_drawn(main: &TestMain, name: &str, text: &str) -> image_view::ImageView {
+    let dir = scratch(name);
+    let path = dir.join("d.fdraw");
+    std::fs::write(&path, text).unwrap();
+    main.open(&path).unwrap();
+    pump_pending();
+    let view = main
+        .with_app(|app| app.active_group().unwrap().preview.svg_view)
+        .expect("svg view");
+    pump_until("fdraw drawn", FDRAW_DRAW_TIMEOUT, || {
+        view.stats().phase == image_view::Phase::Ready
+    });
+    view
+}
+
+#[test]
+fn clicking_a_diagram_box_opens_split_with_its_line_selected() {
+    // Break caught: a click zooming the diagram, landing on the wrong line, or leaving Preview.
+    use crate::preview::ViewMode;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-click", TWO_BOXES);
+    assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Preview);
+    let scale = view.stats().scale;
+    click_at(view, view.client_point(centre_of(TWO_BOXES, 2)));
+    pump_pending();
+    assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Split);
+    assert_eq!(selection(&main), line_range(&main, 1));
+    assert_eq!(
+        unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() },
+        main.editor
+    );
+    assert_eq!(view.stats().scale, scale, "a diagram click does not zoom");
+}
+
+#[test]
+fn clicking_a_box_at_200_percent_still_selects_its_line() {
+    // Break caught: the click mapped through the fit scale or without the pan offset.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-click-zoomed", TWO_BOXES);
+    view.set_zoom(image_view::zoom::Zoom::Scale(2.0));
+    pump_pending();
+    click_at(view, view.client_point(centre_of(TWO_BOXES, 1)));
+    pump_pending();
+    assert_eq!(selection(&main), line_range(&main, 0));
+}
+
+#[test]
+fn a_click_on_empty_canvas_changes_nothing() {
+    // Break caught: a click beside the boxes selecting the nearest line or switching to Split.
+    use crate::preview::ViewMode;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-click-empty", TWO_BOXES);
+    let before = selection(&main);
+    // Between the two boxes, inside the drawing.
+    let a = centre_of(TWO_BOXES, 1);
+    let b = centre_of(TWO_BOXES, 2);
+    click_at(view, view.client_point(((a.0 + b.0) / 2.0, a.1)));
+    pump_pending();
+    assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Preview);
+    assert_eq!(selection(&main), before);
+}
+
+#[test]
+fn a_drag_from_an_element_pans_and_selects_nothing() {
+    // Break caught: the end of a pan read as a click on the box it started on.
+    use crate::preview::ViewMode;
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_MOUSEMOVE;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-drag", TWO_BOXES);
+    view.set_zoom(image_view::zoom::Zoom::Scale(4.0));
+    pump_pending();
+    let (x, y) = view.client_point(centre_of(TWO_BOXES, 2));
+    let offset = view.stats().offset;
+    unsafe {
+        SendMessageW(view.hwnd(), WM_LBUTTONDOWN, 1, lparam_of(x, y));
+        SendMessageW(view.hwnd(), WM_MOUSEMOVE, 1, lparam_of(x + 50, y));
+        SendMessageW(view.hwnd(), WM_LBUTTONUP, 0, lparam_of(x + 50, y));
+    }
+    pump_pending();
+    assert_ne!(view.stats().offset, offset);
+    assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Preview);
+}
+
+#[test]
+fn a_click_while_an_edit_redraws_selects_nothing() {
+    // Break caught: the old picture's elements mapped onto the edited text's lines.
+    use crate::preview::ViewMode;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-click-stale", TWO_BOXES);
+    let point = view.client_point(centre_of(TWO_BOXES, 2));
+    // Line 2 now writes nothing: box B moved to line 3.
+    main.set_text("a: rect \"A\" at 0,0\n\nb: rect \"B\" at 200,0\n");
+    let before = selection(&main);
+    click_at(view, point);
+    pump_pending();
+    assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Preview);
+    assert_eq!(selection(&main), before);
+}

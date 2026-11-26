@@ -6,10 +6,10 @@ use crate::preview::fastdraw_hits::{Hits, hits_of};
 use crate::preview::images::DecodedImage;
 use fastdraw_render::{Level, Source};
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex};
 use std::io::Read;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 /// What FastPad shows when the renderer panics.
@@ -409,14 +409,22 @@ mod tests {
 
     #[test]
     fn a_drawing_carries_a_hit_for_each_element_with_its_line() {
-        let d = draw("a: rect \"A\" at 0,0\nb: rect \"B\" at 200,0\n", None, false);
+        let d = draw(
+            "a: rect \"A\" at 0,0\nb: rect \"B\" at 200,0\n",
+            None,
+            false,
+        );
         let lines: Vec<u32> = d.hits.items.iter().map(|hit| hit.line).collect();
         assert_eq!(lines, [1, 2]);
     }
 
     #[test]
     fn the_hits_share_the_svg_viewbox() {
-        let d = draw("a: rect \"A\" at 0,0\nb: rect \"B\" at 200,40\n", None, true);
+        let d = draw(
+            "a: rect \"A\" at 0,0\nb: rect \"B\" at 200,40\n",
+            None,
+            true,
+        );
         assert_eq!(frame(&d.hits), view_box(&d.svg));
     }
 
@@ -435,7 +443,11 @@ mod tests {
 
     #[test]
     fn a_hidden_drawing_has_no_hits() {
-        let d = draw("a: rect \"A\" at 0,0\nc: nosuchkind \"C\" at 0,0\n", None, false);
+        let d = draw(
+            "a: rect \"A\" at 0,0\nc: nosuchkind \"C\" at 0,0\n",
+            None,
+            false,
+        );
         assert!(!d.show);
         assert!(d.hits.items.is_empty());
     }

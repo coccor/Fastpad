@@ -104,6 +104,10 @@ pub const WM_FASTPAD_MOVE_DONE: u32 = WM_APP + 0x62;
 /// Ctrl+wheel over a Markdown preview; wparam is 1 to zoom in, 0 to zoom out. Posted to the main
 /// window, which zooms the previews. Not part of the deferred chain.
 pub const WM_FASTPAD_PREVIEW_ZOOM: u32 = WM_APP + 0x63;
+/// A click on a FastDraw diagram element; wparam is the image view and lparam the element's
+/// 1-based line. Posted to the main window, which shows the text beside the diagram with that line
+/// selected. Not part of the deferred chain.
+pub const WM_FASTPAD_DIAGRAM_CLICKED: u32 = WM_APP + 0x64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DeferredAction {
