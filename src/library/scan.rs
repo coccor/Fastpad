@@ -215,15 +215,20 @@ mod tests {
     }
 
     #[test]
-    fn images_are_listed_next_to_notes_and_other_files_are_not() {
-        // Break caught: images missing from the tree, or executables and archives appearing in it.
+    fn images_are_listed_next_to_notes_and_so_is_every_other_file() {
+        // Break caught: images missing from the tree, or a file of a type FastPad doesn't know
+        // (an executable, a `.kql` query) left out of it (#128).
         let scratch = Scratch::new("images");
         scratch.file("a.md", "a");
         scratch.file(r"pics\b.PNG", "x");
         scratch.file("c.svg", "<svg/>");
         scratch.file("d.exe", "x");
+        scratch.file("e.kql", "x");
         let scan = scan(&scratch.0, NOTE_LIMIT).unwrap();
-        assert_eq!(paths(&scan), ["a.md", "c.svg", r"pics\b.PNG"]);
+        assert_eq!(
+            paths(&scan),
+            ["a.md", "c.svg", "d.exe", "e.kql", r"pics\b.PNG"]
+        );
     }
 
     #[test]
@@ -239,7 +244,13 @@ mod tests {
         let scan = scan(&scratch.0, NOTE_LIMIT).unwrap();
         assert_eq!(
             paths(&scan),
-            [".env", "Cargo.lock", "deploy.ps1", r"src\lib.rs"]
+            [
+                ".env",
+                "Cargo.lock",
+                "deploy.ps1",
+                r"src\lib.rs",
+                "yarn.lock"
+            ]
         );
     }
 
@@ -302,9 +313,9 @@ mod tests {
     }
 
     #[test]
-    fn notes_are_found_in_subfolders_and_other_files_and_folders_are_skipped() {
-        // Break caught: a repo folder listing node_modules, build output or binaries, or an
-        // image left out of the tree (image preview spec §9).
+    fn files_are_found_in_subfolders_and_skipped_folders_are_left_out() {
+        // Break caught: a repo folder listing node_modules or build output, or an image or a
+        // file of a type FastPad doesn't know left out of the tree (image preview spec §9, #128).
         let scratch = Scratch::new("rules");
         scratch.file("a.md", "a");
         scratch.file(r"sub\deeper\b.TXT", "bb");
@@ -323,7 +334,10 @@ mod tests {
             );
         }
         let scan = scan(&scratch.0, NOTE_LIMIT).unwrap();
-        assert_eq!(paths(&scan), [r"a.md", r"picture.png", r"sub\deeper\b.TXT"]);
+        assert_eq!(
+            paths(&scan),
+            [r"a.md", "archive.zip", r"picture.png", r"sub\deeper\b.TXT"]
+        );
         let b = scan
             .entries
             .iter()

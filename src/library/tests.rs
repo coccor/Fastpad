@@ -955,10 +955,12 @@ fn a_rescan_that_found_a_renamed_folder_gone_keeps_its_notes_under_the_new_name(
     std::fs::write(folder.join(r"sub\a.md"), "a").unwrap();
     std::fs::write(folder.join("top.md"), "t").unwrap();
     let mut previous = load(&folder, &scratch.local(), 100).unwrap();
-    // What that rescan saw: the folder, and nothing in it.
-    std::fs::rename(folder.join(r"sub\a.md"), folder.join("a.parked")).unwrap();
+    // What that rescan saw: the folder, and nothing in it. The note waits outside the notebook,
+    // where no scan lists it.
+    let parked = scratch.0.join("a.parked");
+    std::fs::rename(folder.join(r"sub\a.md"), &parked).unwrap();
     let emptied = load(&folder, &scratch.local(), 101).unwrap();
-    std::fs::rename(folder.join("a.parked"), folder.join(r"sub\a.md")).unwrap();
+    std::fs::rename(&parked, folder.join(r"sub\a.md")).unwrap();
     std::fs::rename(folder.join("sub"), folder.join("Moved")).unwrap();
     previous.rename_folder(Path::new("sub"), Path::new("Moved"));
 

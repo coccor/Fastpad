@@ -367,12 +367,14 @@ fn renaming_to_the_prefilled_name_keeps_a_non_note_or_extensionless_file_as_it_i
     let scratch = LibraryScratch::new("rename-kinds");
     let window = ProductionWindow::new(make_app());
     let _editor = install_test_editor(&window);
+    // Both are listed (#128), so Rename names them in the tree's field.
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
     for name in ["script.lua", "README"] {
         let path = open_note(&window, &scratch, name, "x");
         execute_command(window.hwnd, CommandId::NoteRename);
-        assert_eq!(app_mut(window.hwnd).name_box.as_ref().unwrap().text(), name);
-        crate::window::library_host::name_box_submit(window.hwnd);
-        assert!(!name_box_visible(window.hwnd));
+        assert_eq!(field_text(window.hwnd), name);
+        field_key(window.hwnd, VK_RETURN);
+        assert!(!inline_open(window.hwnd));
         assert!(path.exists(), "{name} is left alone");
         assert_eq!(
             app_mut(window.hwnd).tabs.active().unwrap().path.as_deref(),
@@ -388,8 +390,8 @@ fn renaming_to_the_prefilled_name_keeps_a_non_note_or_extensionless_file_as_it_i
     assert_eq!(names, ["README", "script.lua"]);
 
     execute_command(window.hwnd, CommandId::NoteRename);
-    type_into_name_box(window.hwnd, "tool");
-    crate::window::library_host::name_box_submit(window.hwnd);
+    type_into_field(window.hwnd, "tool");
+    field_key(window.hwnd, VK_RETURN);
     assert!(
         scratch.folder().join("tool").exists(),
         "no extension is added"
