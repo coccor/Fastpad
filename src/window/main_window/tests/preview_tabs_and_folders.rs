@@ -784,16 +784,29 @@ fn the_tab_menu_offers_open_in_fastdraw_only_on_fastdraw_tabs() {
 }
 
 #[test]
-fn the_toolbar_has_the_open_button_only_on_fastdraw_tabs() {
-    // Break caught: the button on an SVG tab, missing on a diagram, or a hit test that ignores
-    // the button's rectangle.
+fn open_in_fastdraw_is_on_the_top_toolbar_only_in_source() {
+    // Break caught: the button on an SVG tab, missing from a diagram's Source view, doubled
+    // beside the diagram's own toolbar in Split or Preview, or a hit test that ignores the
+    // button's rectangle.
+    use crate::preview::ViewMode;
     use crate::window::editor_toolbar::{button_at, button_rect, has_button, hwnd};
     let _scintilla = load_native_scintilla();
     let window = ProductionWindow::new(make_app());
     let _editor = install_test_editor(&window);
     open_diagram(&window, "flow.fdraw", DIAGRAM);
-    crate::window::main_window::group_layout::layout_editor_and_find_bar(window.hwnd);
     let toolbar = hwnd(window.hwnd).unwrap();
+    for (mode, shown) in [
+        (ViewMode::Preview, false),
+        (ViewMode::Split, false),
+        (ViewMode::Source, true),
+        (ViewMode::Preview, false),
+    ] {
+        crate::window::preview_host::set_mode(window.hwnd, mode);
+        crate::window::main_window::group_layout::layout_editor_and_find_bar(window.hwnd);
+        assert_eq!(has_button(window.hwnd, toolbar), shown, "{mode:?}");
+    }
+    crate::window::preview_host::set_mode(window.hwnd, ViewMode::Source);
+    crate::window::main_window::group_layout::layout_editor_and_find_bar(window.hwnd);
     assert!(has_button(window.hwnd, toolbar));
     let rect = button_rect(toolbar, crate::preview::ViewMode::SVG.len());
     assert!(button_at(

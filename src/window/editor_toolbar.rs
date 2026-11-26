@@ -336,8 +336,11 @@ pub(crate) fn layout(main: HWND, group: HWND, id: GroupId, top: i32, width: i32,
         return 0;
     };
     let segments = segments_for(main, id);
+    // Beside or instead of the text, the diagram's own toolbar holds Open in FastDraw; only the
+    // Source view, which hides the diagram, keeps it here.
     let button = crate::window::preview_host::group_document(main, id)
-        .is_some_and(|(_, language, _)| language == crate::document::Language::FastDraw);
+        .is_some_and(|(_, language, _)| language == crate::document::Language::FastDraw)
+        && crate::window::preview_host::group_mode(main, id) == crate::preview::ViewMode::Source;
     // Other segments mean other tooltip rectangles: the tooltip is made again on the next hover.
     let stale = crate::window::main_window::with_group_id(main, id, |state| {
         let control = &mut state.toolbar;
