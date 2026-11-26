@@ -840,7 +840,9 @@ fn clicking_a_diagram_box_opens_split_with_its_line_selected() {
     let main = TestMain::new();
     let view = open_drawn(&main, "fdraw-click", TWO_BOXES);
     assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Preview);
-    let scale = view.stats().scale;
+    // Split halves the diagram's pane, so Fit's scale may change; a click that zoomed would
+    // leave Fit for a fixed scale.
+    let zoom = view.zoom();
     click_at(view, view.client_point(centre_of(TWO_BOXES, 2)));
     pump_pending();
     assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Split);
@@ -849,7 +851,7 @@ fn clicking_a_diagram_box_opens_split_with_its_line_selected() {
         unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() },
         main.editor
     );
-    assert_eq!(view.stats().scale, scale, "a diagram click does not zoom");
+    assert_eq!(view.zoom(), zoom, "a diagram click does not zoom");
 }
 
 #[test]
