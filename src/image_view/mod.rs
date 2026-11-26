@@ -732,6 +732,10 @@ fn schedule_tile(state: &mut ViewState) {
     }
 }
 
+/// The virtual keys of F (Fit) and W (Fill the width) on a diagram.
+const KEY_FIT: u16 = b'F' as u16;
+const KEY_FILL: u16 = b'W' as u16;
+
 /// How near a connector a click counts as on it, in device-independent pixels (VS Code's 6).
 const HIT_TOLERANCE_DIP: f32 = 6.0;
 
@@ -923,6 +927,7 @@ fn recompute(state: &mut ViewState) {
     let (width, height) = client_size(state.hwnd);
     state.scale = match state.zoom {
         Zoom::Fit => zoom::fit_scale(natural, (width, height)),
+        Zoom::FillWidth => zoom::fill_width_scale(natural, (width, height)),
         Zoom::Scale(scale) => scale,
     };
     state.offset = (
@@ -963,6 +968,7 @@ fn recompute_scale_only(state: &mut ViewState) {
     let natural = (image.natural_width as f32, image.natural_height as f32);
     state.scale = match state.zoom {
         Zoom::Fit => zoom::fit_scale(natural, client_size(state.hwnd)),
+        Zoom::FillWidth => zoom::fill_width_scale(natural, client_size(state.hwnd)),
         Zoom::Scale(scale) => scale,
     };
 }
@@ -1460,6 +1466,19 @@ unsafe extern "system" fn image_proc(
                     VK_END => {
                         state.offset.1 = f32::MIN;
                         recompute(state);
+                    }
+                    // A diagram's toolbar keys: F fits the whole diagram, W fills the width.
+                    KEY_FIT | KEY_FILL
+                        if matches!(state.shown, Some(Shown::FastDraw { .. }))
+                            && unsafe { GetKeyState(i32::from(VK_CONTROL)) } >= 0 =>
+                    {
+                        let (width, _) = client_size(hwnd);
+                        let zoom = if key == KEY_FIT {
+                            Zoom::Fit
+                        } else {
+                            Zoom::FillWidth
+                        };
+                        set_zoom(state, zoom, (width / 2.0, height / 2.0));
                     }
                     _ => return false,
                 }

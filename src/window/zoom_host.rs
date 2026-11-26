@@ -162,6 +162,12 @@ pub(crate) fn open_picker(hwnd: HWND) {
             };
             let initial = match view.zoom() {
                 Zoom::Fit => 0,
+                Zoom::FillWidth => {
+                    1 + nearest(
+                        &picture_percents(),
+                        (view.stats().scale * 100.0).round() as u32,
+                    )
+                }
                 Zoom::Scale(scale) => {
                     1 + nearest(&picture_percents(), (scale * 100.0).round() as u32)
                 }

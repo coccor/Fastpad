@@ -8,6 +8,8 @@ pub const STEPS: [f32; 11] = [0.10, 0.25, 0.50, 0.67, 1.0, 1.5, 2.0, 3.0, 4.0, 8
 pub enum Zoom {
     /// Fit the view, never above 100%.
     Fit,
+    /// Fill the view's width, scrolling down a tall picture; small pictures are enlarged.
+    FillWidth,
     Scale(f32),
 }
 
@@ -18,6 +20,15 @@ pub fn fit_scale(image: (f32, f32), view: (f32, f32)) -> f32 {
     (view.0 / image.0)
         .min(view.1 / image.1)
         .clamp(STEPS[0] / 100.0, 1.0)
+}
+
+/// The scale that makes `image` exactly as wide as `view`, from the smallest fit scale up to the
+/// largest step.
+pub fn fill_width_scale(image: (f32, f32), view: (f32, f32)) -> f32 {
+    if image.0 <= 0.0 || image.1 <= 0.0 {
+        return 1.0;
+    }
+    (view.0 / image.0).clamp(STEPS[0] / 100.0, STEPS[STEPS.len() - 1])
 }
 
 pub fn step_in(current: f32) -> f32 {
@@ -112,6 +123,26 @@ mod tests {
         assert_eq!(clamp_axis(-5000.0, 2000.0, 800.0), -1200.0);
         assert_eq!(clamp_axis(300.0, 2000.0, 800.0), 0.0);
         assert_eq!(clamp_axis(-40.0, 200.0, 800.0), 300.0);
+    }
+
+    #[test]
+    fn fill_width_enlarges_a_small_picture_past_100_percent() {
+        // Break caught: Fill capped at 100% like Fit, so the two buttons do the same.
+        assert_eq!(fill_width_scale((100.0, 50.0), (400.0, 300.0)), 4.0);
+    }
+
+    #[test]
+    fn fill_width_shrinks_a_wide_picture_to_the_width() {
+        // Break caught: Fill fitting the height too, leaving a wide diagram narrower than the pane.
+        assert_eq!(fill_width_scale((2000.0, 100.0), (500.0, 300.0)), 0.25);
+        assert_eq!(fill_width_scale((500.0, 4000.0), (500.0, 300.0)), 1.0);
+    }
+
+    #[test]
+    fn fill_width_is_capped_at_the_largest_step() {
+        // Break caught: a tiny diagram filled to a scale the zoom steps cannot come back from.
+        assert_eq!(fill_width_scale((10.0, 10.0), (1000.0, 10.0)), 16.0);
+        assert_eq!(fill_width_scale((0.0, 10.0), (1000.0, 10.0)), 1.0);
     }
 
     #[test]

@@ -980,3 +980,73 @@ fn no_outline_in_preview_or_on_a_line_with_no_element() {
     pump_pending();
     assert_eq!(view.stats().marked_line, None);
 }
+
+// ---- FastDraw: Fill ----
+
+fn key(view: image_view::ImageView, key: u16) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
+    unsafe { SendMessageW(view.hwnd(), WM_KEYDOWN, key as usize, 0) };
+}
+
+/// The view's client width in pixels.
+fn client_width(view: image_view::ImageView) -> f32 {
+    let mut rect = windows_sys::Win32::Foundation::RECT::default();
+    unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(view.hwnd(), &mut rect) };
+    rect.right as f32
+}
+
+#[test]
+fn w_fills_the_width_and_f_fits_a_fdraw() {
+    // Break caught: W doing nothing, filling the height, or F not returning to Fit.
+    use image_view::zoom::Zoom;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-fill", TWO_BOXES);
+    let natural = view.status().size.expect("drawn size").0 as f32;
+    key(view, b'W'.into());
+    pump_pending();
+    assert_eq!(view.zoom(), Zoom::FillWidth);
+    let expected = (client_width(view) / natural).min(16.0);
+    assert!(
+        (view.stats().scale - expected).abs() < 0.01,
+        "{} vs {expected}",
+        view.stats().scale
+    );
+    key(view, b'F'.into());
+    pump_pending();
+    assert_eq!(view.zoom(), Zoom::Fit);
+}
+
+#[test]
+fn fill_survives_an_edit_of_the_diagram() {
+    // Break caught: every keystroke in Split throwing the diagram back to Fit.
+    use image_view::zoom::Zoom;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-fill-edit", TWO_BOXES);
+    key(view, b'W'.into());
+    pump_pending();
+    let decodes = view.stats().decodes;
+    main.set_text("a: rect \"A\" at 0,0\nb: rect \"B\" at 400,0\n");
+    pump_until("fdraw redrawn", FDRAW_DRAW_TIMEOUT, || {
+        view.stats().decodes > decodes && view.stats().phase == image_view::Phase::Ready
+    });
+    assert_eq!(view.zoom(), Zoom::FillWidth);
+}
+
+#[test]
+fn w_does_nothing_on_a_plain_image() {
+    // Break caught: the diagram keys reaching photos, whose zoom keys stay + - 0.
+    use image_view::zoom::Zoom;
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let dir = scratch("fill-bmp");
+    let path = dir.join("small.bmp");
+    write_bmp(&path, 64, 32);
+    main.open(&path).unwrap();
+    let view = main.image_view();
+    main.wait_ready();
+    key(view, b'W'.into());
+    pump_pending();
+    assert_eq!(view.zoom(), Zoom::Fit);
+}
