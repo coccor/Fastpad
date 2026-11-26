@@ -1281,6 +1281,7 @@ fn commit_new_note(
         super::main_window::report_open_failure(hwnd, &path, &error);
         return;
     }
+    crate::window::preview_host::open_for_writing(hwnd);
     if let Some(filled) = filled {
         library_host::place_caret(hwnd, filled.cursor.unwrap_or(filled.text.len()));
     }

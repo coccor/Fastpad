@@ -136,6 +136,10 @@ pub struct Document {
     /// edits and Save leaves the file alone. Changes made outside FastPad still reload into it.
     /// Never set while the tab has unsaved edits.
     pub read_only: bool,
+    /// A note made for the user to write in: an untitled tab, or a note FastPad just created
+    /// (#126). Its default view never shows the preview alone: a blank page is nothing to read.
+    /// A view chosen for the tab still wins.
+    pub for_writing: bool,
 }
 
 impl PartialEq for Document {
@@ -194,6 +198,7 @@ impl Document {
             preview: false,
             save_folder: None,
             read_only: false,
+            for_writing: false,
         }
     }
 

@@ -167,3 +167,41 @@ fn a_new_markdown_view_default_reaches_new_tabs_and_leaves_open_ones_alone() {
     execute_command(window.hwnd, CommandId::PreviousTab);
     assert_eq!(group_mode(window.hwnd, group), ViewMode::Source);
 }
+
+#[test]
+fn a_tab_made_for_writing_opens_in_source_while_an_opened_note_opens_in_preview() {
+    // Break caught: Ctrl+N then a first save as Markdown switching the note to a blank Preview,
+    // or the rule reaching notes opened from disk, which keep the Preview default (#126).
+    use crate::preview::ViewMode;
+    use crate::window::preview_host::mode;
+    let _scintilla = load_native_scintilla();
+    let scratch = LibraryScratch::new("for-writing-view");
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    assert_eq!(
+        app_mut(window.hwnd).settings.markdown_view,
+        ViewMode::Preview
+    );
+
+    execute_command(window.hwnd, CommandId::New);
+    // A first save as .md: its detection makes the tab Markdown.
+    app_mut(window.hwnd)
+        .tabs
+        .set_active_language(Language::Markdown);
+    assert_eq!(mode(window.hwnd), ViewMode::Source, "a new tab");
+
+    open_note(&window, &scratch, "old.md", "# old\n");
+    app_mut(window.hwnd)
+        .tabs
+        .set_active_language(Language::Markdown);
+    assert_eq!(mode(window.hwnd), ViewMode::Preview, "a note from disk");
+
+    // A new default keeps what each open tab shows.
+    super::super::apply_settings_action(
+        window.hwnd,
+        crate::window::settings_model::SettingsAction::SetMarkdownView(ViewMode::Split),
+    );
+    assert_eq!(mode(window.hwnd), ViewMode::Preview);
+    execute_command(window.hwnd, CommandId::PreviousTab);
+    assert_eq!(mode(window.hwnd), ViewMode::Source);
+}

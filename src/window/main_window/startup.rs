@@ -205,7 +205,8 @@ where
         ))?;
     let initial = editor.create_document()?;
     editor.use_document(&initial)?;
-    let document = Document::untitled(DocumentId(1), recovery_id, initial);
+    let mut document = Document::untitled(DocumentId(1), recovery_id, initial);
+    document.for_writing = true;
     if let Some(mut app) = unsafe { app_ptr(hwnd) } {
         unsafe { app.as_mut() }.document_host = Some(host);
     }

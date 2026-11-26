@@ -180,6 +180,7 @@ fn create_note(hwnd: HWND, id: NotebookId, path: &Path, filled: &Filled) -> Resu
         crate::window::main_window::report_open_failure(hwnd, path, &error);
         return Ok(());
     }
+    crate::window::preview_host::open_for_writing(hwnd);
     place_caret(hwnd, filled.cursor.unwrap_or(filled.text.len()));
     Ok(())
 }
