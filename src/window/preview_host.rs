@@ -748,6 +748,27 @@ pub(crate) fn set_mode(hwnd: HWND, next: ViewMode) {
     if let Some(target) = focus {
         unsafe { SetFocus(target) };
     }
+    mark_caret_line(hwnd);
+}
+
+/// The caret in group `group`'s editor moved: a FastDraw diagram beside it outlines the elements
+/// on the caret's line.
+pub(crate) fn caret_moved(hwnd: HWND, group: GroupId) {
+    in_group(group, || mark_caret_line(hwnd));
+}
+
+/// Outlines the caret line's elements in the target group's diagram while it shows beside the
+/// text (Split), as the VS Code preview does; any other mode outlines nothing.
+fn mark_caret_line(hwnd: HWND) {
+    let Some(view) = svg_view(hwnd) else {
+        return;
+    };
+    let line = (active_is_fastdraw(hwnd) && mode(hwnd) == ViewMode::Split)
+        .then(|| editor(hwnd))
+        .flatten()
+        .and_then(|editor| editor.line_from_position(editor.caret().ok()?).ok())
+        .map(|line| line as u32 + 1);
+    view.set_marked_line(line);
 }
 
 /// The active tab is a note just created to be written in (#126): its default view never shows

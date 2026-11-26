@@ -801,6 +801,9 @@ fn handle_editor_notification(hwnd: HWND, lparam: LPARAM) {
         {
             crate::window::markdown_host::selection_changed(hwnd, group);
         }
+        if update.updated as u32 & crate::editor::scintilla_constants::SC_UPDATE_SELECTION != 0 {
+            crate::window::preview_host::caret_moved(hwnd, group);
+        }
         // The text or the lines on screen changed: the links there get their underlines
         // (second brain phase 1 spec §7.3).
         if update.updated as u32 & !crate::editor::scintilla_constants::SC_UPDATE_SELECTION != 0

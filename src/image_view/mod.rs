@@ -98,6 +98,10 @@ pub struct ImageStats {
     pub tile: Option<(f32, decode::TileArea)>,
     /// The picture is drawn by Direct2D at every paint, at any zoom, with no pixels rendered.
     pub vector: bool,
+    /// The diagram line whose elements are outlined (the caret's, in Split).
+    pub marked_line: Option<u32>,
+    /// How many elements that outline draws.
+    pub marked: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -170,6 +174,8 @@ struct ViewState {
     /// The shown diagram's hits are those of the text last asked for: false from an edit until its
     /// drawing lands, so a click on the old picture never selects a line of the new text.
     hits_fresh: bool,
+    /// The 1-based line whose diagram elements are outlined.
+    marked_line: Option<u32>,
     max_side: u32,
     decodes: u32,
     paint_retried: bool,
@@ -234,6 +240,7 @@ impl ImageView {
             press: None,
             moved: false,
             hits_fresh: false,
+            marked_line: None,
             max_side: DEFAULT_MAX_SIDE,
             decodes: 0,
             paint_retried: false,
@@ -458,6 +465,8 @@ impl ImageView {
                 .map(|image| (image.width, image.height)),
             tile: state.tile.as_ref().map(|tile| (tile.scale, tile.area)),
             vector: drawn_by_gpu(state),
+            marked_line: state.marked_line,
+            marked: marked_shapes(state).count(),
         })
         .unwrap_or_default()
     }
@@ -468,6 +477,16 @@ impl ImageView {
         let tolerance = HIT_TOLERANCE_DIP * dpi_scale(self.hwnd);
         self.with(|state| hit_line(state, client, tolerance))
             .flatten()
+    }
+
+    /// Outlines the diagram elements written on 1-based `line`, or none.
+    pub fn set_marked_line(&self, line: Option<u32>) {
+        let changed = self
+            .with(|state| std::mem::replace(&mut state.marked_line, line) != line)
+            .unwrap_or(false);
+        if changed {
+            invalidate(self.hwnd);
+        }
     }
 
     /// The diagram text the view was last asked to draw; `None` when it shows no diagram.
@@ -727,6 +746,16 @@ fn diagram_hits(state: &ViewState) -> Option<&crate::preview::fastdraw_hits::Hit
         .diagram
         .as_ref()
         .map(|facts| &*facts.hits)
+}
+
+/// The outlines of the elements on the marked line, while the drawing is the current text's.
+fn marked_shapes(
+    state: &ViewState,
+) -> impl Iterator<Item = &crate::preview::fastdraw_hits::HitShape> {
+    let hits = state.hits_fresh.then(|| diagram_hits(state)).flatten();
+    let line = state.marked_line.unwrap_or(0);
+    hits.into_iter()
+        .flat_map(move |hits| crate::preview::fastdraw_hits::on_line(hits, line))
 }
 
 /// The line under `client` (pixels), with connectors hit within `tolerance` pixels; `None` while

@@ -920,3 +920,63 @@ fn a_click_while_an_edit_redraws_selects_nothing() {
     assert_eq!(window::preview_host::mode(main.hwnd), ViewMode::Preview);
     assert_eq!(selection(&main), before);
 }
+
+// ---- FastDraw: the caret's line outlines its elements ----
+
+/// Puts the caret at the start of 0-based `line`.
+fn caret_to_line(main: &TestMain, line: usize) {
+    use crate::editor::scintilla_constants::{SCI_GOTOPOS, SCI_POSITIONFROMLINE};
+    unsafe {
+        let position = SendMessageW(main.editor, SCI_POSITIONFROMLINE, line, 0);
+        SendMessageW(main.editor, SCI_GOTOPOS, position as usize, 0);
+    }
+}
+
+fn pump_for(duration: Duration) {
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        pump_pending();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn the_caret_line_outlines_its_element_in_split() {
+    // Break caught: no outline in Split, or the outline staying on the line the caret left.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-mark", TWO_BOXES);
+    main.command(CommandId::MarkdownViewSplit);
+    caret_to_line(&main, 1);
+    pump_until("line 2 outlined", Duration::from_secs(5), || {
+        let stats = view.stats();
+        stats.marked_line == Some(2) && stats.marked == 1
+    });
+    caret_to_line(&main, 0);
+    pump_until("line 1 outlined", Duration::from_secs(5), || {
+        let stats = view.stats();
+        stats.marked_line == Some(1) && stats.marked == 1
+    });
+}
+
+#[test]
+fn no_outline_in_preview_or_on_a_line_with_no_element() {
+    // Break caught: Preview outlining the line of a caret nobody can see, or an empty line
+    // outlining something.
+    let _scintilla = support::win32::WindowHarness::new().unwrap();
+    let main = TestMain::new();
+    let view = open_drawn(&main, "fdraw-mark-none", TWO_BOXES);
+    caret_to_line(&main, 1);
+    pump_for(Duration::from_millis(200));
+    assert_eq!(view.stats().marked, 0);
+    main.command(CommandId::MarkdownViewSplit);
+    // The empty line after the last box.
+    caret_to_line(&main, 2);
+    pump_until("line 3 followed", Duration::from_secs(5), || {
+        view.stats().marked_line == Some(3)
+    });
+    assert_eq!(view.stats().marked, 0);
+    main.command(CommandId::MarkdownViewPreview);
+    pump_pending();
+    assert_eq!(view.stats().marked_line, None);
+}

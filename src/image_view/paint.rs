@@ -1,7 +1,8 @@
 //! Painting: background, checkerboard under the image's rectangle, the bitmap (linear below
 //! 100%, nearest-neighbor above), a focus ring, and the loading, failed and SVG-error text.
 
-use super::{DEFAULT_MAX_SIDE, ViewState, client_size, dpi_scale, focused};
+use super::{DEFAULT_MAX_SIDE, ViewState, client_size, dpi_scale, focused, marked_shapes};
+use crate::preview::fastdraw_hits::HitShape;
 use crate::preview::render::{RectF, color_f, create_hwnd_target};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT,
@@ -18,7 +19,7 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::core::Error;
-use windows_numerics::Matrix3x2;
+use windows_numerics::{Matrix3x2, Vector2};
 
 const CHECKER_CELL: f32 = 8.0;
 const TEXT_SIZE: f32 = 15.0;
@@ -215,6 +216,46 @@ fn draw_vector(
     Ok(())
 }
 
+/// How far an outline stands off its element, and how thick it is, in device-independent pixels.
+const MARK_GAP: f32 = 2.0;
+const MARK_WIDTH: f32 = 2.0;
+
+/// Outlines the diagram elements on the marked line in the accent colour, over the picture.
+fn draw_marks(
+    state: &ViewState,
+    target: &ID2D1RenderTarget,
+    dpi: f32,
+) -> windows::core::Result<()> {
+    let Some(origin) = super::diagram_hits(state).map(|hits| hits.origin) else {
+        return Ok(());
+    };
+    let mut shapes = marked_shapes(state).peekable();
+    if shapes.peek().is_none() {
+        return Ok(());
+    }
+    let brush = unsafe { target.CreateSolidColorBrush(&color_f(state.colors.find_match), None)? };
+    let at = |point: (f64, f64)| {
+        let (x, y) = super::zoom::from_scene(point, state.offset, state.scale, origin);
+        Vector2 { X: x, Y: y }
+    };
+    let (gap, width) = (MARK_GAP * dpi, MARK_WIDTH * dpi);
+    for shape in shapes {
+        match shape {
+            HitShape::Box { x, y, w, h } => {
+                let (a, b) = (at((*x, *y)), at((x + w, y + h)));
+                let rect = RectF::new(a.X - gap, a.Y - gap, b.X + gap, b.Y + gap);
+                unsafe { target.DrawRectangle(&rect.to_d2d(), &brush, width, None) };
+            }
+            HitShape::Line(points) => {
+                for pair in points.windows(2) {
+                    unsafe { target.DrawLine(at(pair[0]), at(pair[1]), &brush, width, None) };
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn paint(state: &mut ViewState) -> windows::core::Result<()> {
     let hwnd = state.hwnd;
     let (width, height) = client_size(hwnd);
@@ -294,6 +335,7 @@ pub(super) fn paint(state: &mut ViewState) -> windows::core::Result<()> {
             unsafe { target.DrawBitmap(bitmap, Some(&dest.to_d2d()), 1.0, mode, None) };
         }
         draw_tile(state, &target, dest)?;
+        draw_marks(state, &target, scale)?;
     }
     let line = LINE_HEIGHT * scale;
     let middle = height / 2.0;
