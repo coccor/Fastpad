@@ -62,12 +62,15 @@ fn cached_hits(source: &Source, svg: &str) -> Arc<Hits> {
         .get(source, svg)
 }
 
-/// Whether FastPad refuses to read a look file named `look`: an absolute path, a network path, or
-/// one with a drive prefix (`C:x.look` included).
+/// Whether FastPad refuses to read a look file named `look`: an absolute path, a network path,
+/// a drive prefix (`C:x.look` included), or any `..` segment that could leave the diagram folder.
 pub fn refused(look: &str) -> bool {
     Path::new(look).is_absolute()
         || look.starts_with(['/', '\u{5c}'])
         || look.get(1..2) == Some(":")
+        || look
+            .split(['/', '\\'])
+            .any(|segment| segment == "..")
 }
 
 fn refusal(look: &str) -> String {
@@ -484,6 +487,9 @@ mod tests {
         }
         for p in ["./x.look", "x.look", "looks/x.look", "night"] {
             assert!(!refused(p), "{p}");
+        }
+        for p in ["../x.look", "looks/../x.look", r"..\x.look"] {
+            assert!(refused(p), "{p}");
         }
     }
 
