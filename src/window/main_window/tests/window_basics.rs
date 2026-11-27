@@ -272,6 +272,33 @@ fn closing_every_tab_hides_the_editor_until_the_empty_strip_opens_a_new_one() {
 }
 
 #[test]
+fn double_clicking_the_empty_space_under_the_strip_opens_a_tab_only_when_none_is_open() {
+    // Break caught: the empty editor area ignoring a double-click, or a double-click below the
+    // strip opening a second tab while one is already open.
+    use windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONDBLCLK;
+    let _scintilla = load_native_scintilla();
+    let window = ProductionWindow::new(make_app());
+    let _editor = install_test_editor(&window);
+    execute_command(window.hwnd, CommandId::CloseTab);
+    assert!(app_mut(window.hwnd).tabs.is_empty());
+
+    let group = super::super::group_hwnd(window.hwnd).unwrap();
+    let layout = super::super::strip_layout(window.hwnd).unwrap();
+    let below = client_lparam(layout.tabs.right / 2, layout.height + 100);
+    unsafe {
+        SendMessageW(group, WM_LBUTTONDBLCLK, 1, below);
+    }
+    assert_eq!(app_mut(window.hwnd).tabs.len(), 1);
+
+    // Group-window messages only reach this spot while the editor is hidden, but the rule
+    // holds even if one does.
+    unsafe {
+        SendMessageW(group, WM_LBUTTONDBLCLK, 1, below);
+    }
+    assert_eq!(app_mut(window.hwnd).tabs.len(), 1);
+}
+
+#[test]
 fn keyboard_shortcuts_reach_their_commands_through_the_accelerator_table() {
     // Break caught: every shortcut dead in the running app while command-level tests pass,
     // because nothing exercised the accelerator translation the message loop depends on.
