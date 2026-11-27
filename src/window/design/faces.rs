@@ -45,7 +45,7 @@ pub(crate) fn current() -> Faces {
 
 /// The OS build from `RtlGetVersion` (in ntdll, which every process has loaded), or `None` when it
 /// cannot be reached.
-fn os_build() -> Option<u32> {
+pub(crate) fn os_build() -> Option<u32> {
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
     #[repr(C)]
     struct VersionInfo {

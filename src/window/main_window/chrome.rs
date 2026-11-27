@@ -178,6 +178,7 @@ pub(super) fn apply_theme(hwnd: HWND) {
     }
     if frame_change {
         crate::window::titlebar::apply_frame_theme(hwnd, palette.dark_frame);
+        crate::window::titlebar::apply_menu_theme(palette.dark_frame);
         for editor in all_editors(hwnd) {
             crate::window::titlebar::apply_scrollbar_theme(editor.hwnd(), palette.dark_frame);
         }
