@@ -172,6 +172,14 @@ pub(crate) fn notebook_label(hwnd: HWND) -> String {
     }
 }
 
+/// Whether the bar-client point (`x`, `y`) is on the logo.
+fn on_logo(bar: HWND, x: i32, y: i32) -> bool {
+    let mut client = RECT::default();
+    unsafe { GetClientRect(bar, &mut client) };
+    let rect = logo_rect(client, unsafe { GetDpiForWindow(bar) }.max(96));
+    x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom
+}
+
 fn rects_for(bar: HWND) -> [RECT; BUTTONS] {
     let mut client = RECT::default();
     unsafe { GetClientRect(bar, &mut client) };
@@ -229,12 +237,15 @@ unsafe extern "system" fn bar_proc(
             0
         }
         WM_KEYDOWN if key_down(bar, wparam as u16) => 0,
-        // Above the first button the main window's caption hit test applies.
+        // Above the first button the main window's caption hit test applies, except on the logo,
+        // which opens the menu column.
         WM_NCHITTEST => {
             let (x, y) = point_of(lparam);
             let mut point = POINT { x, y };
             unsafe { ScreenToClient(bar, &mut point) };
-            if point.y < super::main_window::title_layout(main).height {
+            if point.y < super::main_window::title_layout(main).height
+                && !on_logo(bar, point.x, point.y)
+            {
                 HTTRANSPARENT as LRESULT
             } else {
                 unsafe { DefWindowProcW(bar, message, wparam, lparam) }
@@ -249,6 +260,11 @@ unsafe extern "system" fn bar_proc(
         WM_MOUSELEAVE => {
             with_bar_state(main, |state| state.tracking = false);
             hover(main, bar, None);
+            0
+        }
+        // The logo opens the menu column on the press, as a menu bar heading does.
+        WM_LBUTTONDOWN if on_logo(bar, point_of(lparam).0, point_of(lparam).1) => {
+            super::main_window::toggle_menu_column(main);
             0
         }
         WM_LBUTTONDOWN => {

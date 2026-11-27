@@ -69,6 +69,15 @@ pub(super) fn enter_menu_mode(hwnd: HWND, hot: usize) {
     }
 }
 
+/// The logo's click: shows the menu column, as a tapped Alt does, or hides it when it is up.
+pub(crate) fn toggle_menu_column(hwnd: HWND) {
+    if menu_mode(hwnd).is_some() {
+        exit_menu_mode(hwnd);
+    } else {
+        enter_menu_mode(hwnd, 0);
+    }
+}
+
 pub(super) fn exit_menu_mode(hwnd: HWND) {
     if menu_mode(hwnd).is_none() {
         return;

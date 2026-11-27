@@ -553,12 +553,13 @@ fn title_strip_owns_the_top_edge_and_its_caption_buttons_still_work() -> TestRes
 }
 
 #[test]
-fn the_activity_bar_draws_the_app_logo_above_the_first_button_and_the_square_stays_caption()
+fn the_activity_bar_draws_the_app_logo_above_the_first_button_and_the_logo_is_clickable()
 -> TestResult<()> {
     // Break caught: the corner staying empty forever (the deferred load never ran or never
-    // repainted), or something drawn there stealing the drag/caption hit test from the window.
+    // repainted), the logo dragging the window instead of taking the click that opens the menu
+    // column, or the strip beside it losing the drag/caption hit test.
     use windows_sys::Win32::Graphics::Gdi::{GetDC, GetPixel, ReleaseDC};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{HTCAPTION, HTTRANSPARENT};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{HTCAPTION, HTCLIENT, HTTRANSPARENT};
 
     let _dpi = DpiContext::per_monitor_v2()?;
     let mut process = FastPadProcess::spawn(["--new-window"])?;
@@ -592,14 +593,19 @@ fn the_activity_bar_draws_the_app_logo_above_the_first_button_and_the_square_sta
     let logo_x = (bar_client.right - bar_client.left) / 2;
     let logo_y = layout.height / 2;
 
-    // A hit test at the logo's centre still gives the caption: the bar answers HTTRANSPARENT and
-    // the main window answers HTCAPTION.
+    // The logo's centre is the bar's own client area (its click opens the menu column); the
+    // strip's corner beside it still gives the caption: the bar answers HTTRANSPARENT and the
+    // main window answers HTCAPTION.
     assert_eq!(
         hit_test(bar, bar_origin, Point::new(logo_x, logo_y)),
+        HTCLIENT as isize
+    );
+    assert_eq!(
+        hit_test(bar, bar_origin, Point::new(1, logo_y)),
         HTTRANSPARENT as isize
     );
     assert_eq!(
-        hit_test(hwnd, origin, Point::new(logo_x, logo_y)),
+        hit_test(hwnd, origin, Point::new(1, logo_y)),
         HTCAPTION as isize
     );
 

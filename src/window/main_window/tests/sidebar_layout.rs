@@ -282,17 +282,21 @@ fn the_sidebar_top_strip_and_panel_header_are_caption() {
 // binaries (`rustc-link-arg-bins`), not into this lib's own unit-test binary, so
 // `load_logo_icon` returns `None` here regardless of DPI. The two tests below cover what is
 // true either way: the load never runs before the deferred chrome step, and the square it
-// would draw into stays caption; `ensure_logo_icon`'s replace-on-a-different-DPI wiring is
+// would draw into is a click target that toggles the menu column, while the rest of the strip
+// stays caption; `ensure_logo_icon`'s replace-on-a-different-DPI wiring is
 // exercised with a synthetic icon standing in for a loaded one. The real load, the drawn
 // pixels and the destroy-on-drop are covered end to end by
-// `tests/windows/titlebar.rs`'s `the_activity_bar_draws_the_app_logo_above_the_first_button_and_the_square_stays_caption`
+// `tests/windows/titlebar.rs`'s `the_activity_bar_draws_the_app_logo_above_the_first_button_and_the_logo_is_clickable`
 // (a real `fastpad.exe`, which does have the resource) and by
 // `titlebar::tests::a_logo_icon_destroys_its_handle_on_drop`.
 #[test]
-fn the_deferred_chrome_step_is_the_first_to_touch_the_logo_and_its_square_stays_caption() {
-    // Break caught: the logo loaded before first paint (new startup latency), or its square
-    // stealing the caption hit test once something is drawn there.
-    use windows_sys::Win32::UI::WindowsAndMessaging::{HTCAPTION, HTTRANSPARENT, WM_NCHITTEST};
+fn the_deferred_chrome_step_is_the_first_to_touch_the_logo_and_a_click_on_it_toggles_the_menu() {
+    // Break caught: the logo loaded before first paint (new startup latency), a logo click that
+    // drags the window instead of opening the menu column, or the strip around the logo no
+    // longer dragging the window.
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        HTCAPTION, HTCLIENT, HTTRANSPARENT, WM_LBUTTONDOWN, WM_NCHITTEST,
+    };
     let _scintilla = load_native_scintilla();
     let window = ProductionWindow::new(make_app());
     let _editor = install_test_editor(&window);
@@ -314,11 +318,27 @@ fn the_deferred_chrome_step_is_the_first_to_touch_the_logo_and_its_square_stays_
     };
     let rect = crate::window::activity_bar::logo_rect(client, dpi);
     let (x, y) = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
-    let hit = |target: HWND| unsafe {
+    let hit = |target: HWND, x: i32, y: i32| unsafe {
         SendMessageW(target, WM_NCHITTEST, 0, screen_lparam(target, x, y))
     };
-    assert_eq!(hit(bar), HTTRANSPARENT as LRESULT);
-    assert_eq!(hit(window.hwnd), HTCAPTION as LRESULT);
+    assert_eq!(hit(bar, x, y), HTCLIENT as LRESULT);
+    // Beside the logo the strip is still caption.
+    assert!(rect.left > 1);
+    assert_eq!(hit(bar, 1, y), HTTRANSPARENT as LRESULT);
+    assert_eq!(hit(window.hwnd, 1, y), HTCAPTION as LRESULT);
+
+    let press = || unsafe { SendMessageW(bar, WM_LBUTTONDOWN, 1, client_lparam(x, y)) };
+    press();
+    assert_eq!(
+        super::super::menu_mode(window.hwnd).map(|mode| (mode.hot, mode.open)),
+        Some((0, false)),
+        "the logo shows the menu column, as a tapped Alt does"
+    );
+    press();
+    assert!(
+        super::super::menu_mode(window.hwnd).is_none(),
+        "a second click hides it"
+    );
 }
 
 #[test]

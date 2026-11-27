@@ -871,6 +871,59 @@ pub(crate) fn apply_scrollbar_theme(editor: HWND, dark: bool) {
     }
 }
 
+/// uxtheme's `PreferredAppMode` value for the theme: `ForceDark` or `ForceLight`. Forced, not
+/// `AllowDark`, because the app theme is the user's choice and need not match the system's.
+pub(crate) const fn preferred_app_mode(dark: bool) -> i32 {
+    if dark { 2 } else { 3 }
+}
+
+/// Whether uxtheme ordinal 135 is `SetPreferredAppMode` (Windows 10 1903, build 18362, and
+/// later). Before that it is `AllowDarkModeForApp`, which takes a `BOOL`; an unknown build is
+/// left alone.
+pub(crate) fn menu_theme_supported(build: Option<u32>) -> bool {
+    build.is_some_and(|build| build >= 18362)
+}
+
+/// Gives every native popup menu (the menu column's dropdowns, their submenus and the context
+/// menus) the dark or the light system look, through uxtheme's unexported
+/// `SetPreferredAppMode` (ordinal 135) and `FlushMenuThemes` (ordinal 136), as Explorer and
+/// Notepad do. Best effort: an older Windows, or missing exports, keeps the light menus.
+pub(crate) fn apply_menu_theme(dark: bool) {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetModuleHandleW, GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+    };
+    type SetPreferredAppMode = unsafe extern "system" fn(i32) -> i32;
+    type FlushMenuThemes = unsafe extern "system" fn();
+    if !menu_theme_supported(crate::window::design::faces::os_build()) {
+        return;
+    }
+    let name = crate::platform::wide_null("uxtheme.dll");
+    unsafe {
+        // Already loaded for `SetWindowTheme`; loaded otherwise and kept for the process.
+        let mut module = GetModuleHandleW(name.as_ptr());
+        if module.is_null() {
+            module = LoadLibraryExW(
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_SYSTEM32,
+            );
+        }
+        if module.is_null() {
+            return;
+        }
+        // An ordinal goes in the name's place, as MAKEINTRESOURCEA does.
+        let Some(set_mode) = GetProcAddress(module, 135usize as *const u8) else {
+            return;
+        };
+        let set_mode: SetPreferredAppMode = std::mem::transmute(set_mode);
+        set_mode(preferred_app_mode(dark));
+        if let Some(flush) = GetProcAddress(module, 136usize as *const u8) {
+            let flush: FlushMenuThemes = std::mem::transmute(flush);
+            flush();
+        }
+    }
+}
+
 pub(crate) unsafe fn fill(dc: HDC, rect: Rect, color: u32) {
     unsafe {
         SetDCBrushColor(dc, color);
@@ -941,6 +994,18 @@ pub(crate) unsafe fn draw_text(dc: HDC, text: &str, rect: Rect, format: u32) {
 mod tests {
     use super::{HitTarget, LogoIcon, PointerState, Rect, Size, TitleBarLayout, frame_client_rect};
     use windows_sys::Win32::UI::WindowsAndMessaging::{HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTTOP};
+
+    #[test]
+    fn menus_are_forced_to_the_app_theme_only_where_ordinal_135_takes_a_mode() {
+        // Break caught: dropdowns left light under a dark theme (or dark under a light one when
+        // the system is dark), or a mode passed to 1809's BOOL-taking ordinal 135.
+        assert_eq!(super::preferred_app_mode(true), 2);
+        assert_eq!(super::preferred_app_mode(false), 3);
+        assert!(super::menu_theme_supported(Some(18362)));
+        assert!(super::menu_theme_supported(Some(26100)));
+        assert!(!super::menu_theme_supported(Some(17763)));
+        assert!(!super::menu_theme_supported(None));
+    }
 
     #[test]
     fn a_logo_icon_destroys_its_handle_on_drop() {
