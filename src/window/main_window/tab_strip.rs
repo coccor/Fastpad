@@ -4,7 +4,7 @@
 use super::*;
 
 pub(super) const EMPTY_TABS_HINT: &str =
-    "No tabs are open.\nPress Ctrl+N or double-click the tab bar to start a new one.";
+    "No tabs are open.\nPress Ctrl+N or double-click here to start a new one.";
 
 pub(crate) fn tab_count(hwnd: HWND) -> usize {
     unsafe { app_ptr(hwnd) }
@@ -374,6 +374,13 @@ pub(crate) fn group_strip_message(
         // The class has CS_DBLCLKS, so a second click comes as a double-click: on empty strip it
         // opens a tab (VS Code style); anywhere else it is one more press.
         WM_LBUTTONDBLCLK if strip_target(hwnd, id, x, y) == Some(StripTarget::Empty) => {
+            execute_command(hwnd, CommandId::New);
+            Some(0)
+        }
+        // With no tab open, the empty space under the strip (where the hint sits) opens one too.
+        WM_LBUTTONDBLCLK
+            if strip_target(hwnd, id, x, y).is_none() && group_tab_count(hwnd, id) == 0 =>
+        {
             execute_command(hwnd, CommandId::New);
             Some(0)
         }
